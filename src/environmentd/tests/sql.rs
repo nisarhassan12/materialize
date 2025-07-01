@@ -503,6 +503,15 @@ fn test_subscribe_basic() {
 
     server.enable_feature_flags(&["enable_index_options", "enable_logical_compaction_window"]);
 
+    let mut sys_client = server.connect_internal(postgres::NoTls).unwrap();
+
+    sys_client
+        .execute(
+            "ALTER SYSTEM SET constraint_based_timestamp_selection = 'verify'",
+            &[],
+        )
+        .unwrap();
+
     // Create a table with disabled compaction.
     client_writes
         .batch_execute("CREATE TABLE t (data text) WITH (RETAIN HISTORY FOR '1000 hours')")
@@ -1393,7 +1402,7 @@ fn test_transactional_explain_timestamps() {
 // but please at least keep _something_ that tests that custom compaction windows are working.
 #[mz_ore::test(tokio::test(flavor = "multi_thread", worker_threads = 1))]
 #[cfg_attr(coverage, ignore)] // https://github.com/MaterializeInc/database-issues/issues/5600
-#[ignore] // TODO: Reenable when database-issues#8491 is fixed
+#[ignore] // TODO: Reenable when https://github.com/MaterializeInc/database-issues/issues/8491 is fixed
 async fn test_utilization_hold() {
     const THIRTY_DAYS_MS: u64 = 30 * 24 * 60 * 60 * 1000;
     // `mz_catalog_server` tests indexes, `quickstart` tests tables.
@@ -3265,7 +3274,7 @@ async fn test_explain_as_of() {
     let client = server.connect().await.unwrap();
 
     // Retry until we are able to explain plan and timestamp for a few seconds ago.
-    // mz_cluster_replica_statuses is a retained metrics table which is why a historical AS OF
+    // mz_object_dependencies is a retained metrics table which is why a historical AS OF
     // works.
     Retry::default()
         .clamp_backoff(Duration::from_secs(1))
@@ -3277,7 +3286,7 @@ async fn test_explain_as_of() {
                 .get(0);
             let now: u64 = now.parse().unwrap();
             let ts = now - 3000;
-            let query = format!("mz_internal.mz_cluster_replica_statuses AS OF {ts}");
+            let query = format!("mz_internal.mz_object_dependencies AS OF {ts}");
             let query_ts = try_get_explain_timestamp(&query, &client).await?;
             assert_eq!(ts, query_ts);
             client

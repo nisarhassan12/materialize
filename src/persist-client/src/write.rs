@@ -29,6 +29,7 @@ use proptest_derive::Arbitrary;
 use semver::Version;
 use serde::{Deserialize, Serialize};
 use timely::PartialOrder;
+use timely::order::TotalOrder;
 use timely::progress::{Antichain, Timestamp};
 use tokio::runtime::Handle;
 use tracing::{Instrument, debug_span, info, warn};
@@ -43,7 +44,7 @@ use crate::fetch::{EncodedPart, FetchBatchFilter, FetchedPart, PartDecodeFormat}
 use crate::internal::compact::{CompactConfig, Compactor};
 use crate::internal::encoding::{Schemas, check_data_version};
 use crate::internal::machine::{CompareAndAppendRes, ExpireFn, Machine};
-use crate::internal::metrics::Metrics;
+use crate::internal::metrics::{BatchWriteMetrics, Metrics, ShardMetrics};
 use crate::internal::state::{BatchPart, HandleDebugState, HollowBatch, RunOrder, RunPart};
 use crate::read::ReadHandle;
 use crate::schema::PartMigration;
@@ -136,7 +137,7 @@ impl<K, V, T, D> WriteHandle<K, V, T, D>
 where
     K: Debug + Codec,
     V: Debug + Codec,
-    T: Timestamp + Lattice + Codec64 + Sync,
+    T: Timestamp + TotalOrder + Lattice + Codec64 + Sync,
     D: Semigroup + Ord + Codec64 + Send + Sync,
 {
     pub(crate) fn new(
@@ -337,7 +338,7 @@ where
             .batch(updates, expected_upper.clone(), new_upper.clone())
             .await?;
         match self
-            .compare_and_append_batch(&mut [&mut batch], expected_upper, new_upper)
+            .compare_and_append_batch(&mut [&mut batch], expected_upper, new_upper, true)
             .await
         {
             ok @ Ok(Ok(())) => ok,
@@ -389,7 +390,7 @@ where
     {
         loop {
             let res = self
-                .compare_and_append_batch(&mut [&mut batch], lower.clone(), upper.clone())
+                .compare_and_append_batch(&mut [&mut batch], lower.clone(), upper.clone(), true)
                 .await?;
             match res {
                 Ok(()) => {
@@ -453,12 +454,21 @@ where
     ///
     /// The clunky multi-level Result is to enable more obvious error handling
     /// in the caller. See <http://sled.rs/errors.html> for details.
+    ///
+    /// If the `enforce_matching_batch_boundaries` flag is set to `false`:
+    /// We no longer validate that every batch covers the entire range between
+    /// the expected and new uppers, as we wish to allow combining batches that
+    /// cover different subsets of that range, including subsets of that range
+    /// that include no data at all. The caller is responsible for guaranteeing
+    /// that the set of batches provided collectively include all updates for
+    /// the entire range between the expected and new upper.
     #[instrument(level = "debug", fields(shard = %self.machine.shard_id()))]
     pub async fn compare_and_append_batch(
         &mut self,
         batches: &mut [&mut Batch<K, V, T, D>],
         expected_upper: Antichain<T>,
         new_upper: Antichain<T>,
+        enforce_matching_batch_boundaries: bool,
     ) -> Result<Result<(), UpperMismatch<T>>, InvalidUsage<T>>
     where
         D: Send + Sync,
@@ -504,7 +514,12 @@ where
             let mut key_storage = None;
             let mut val_storage = None;
             for batch in batches.iter() {
-                let () = validate_truncate_batch(&batch.batch, &desc, any_batch_rewrite)?;
+                let () = validate_truncate_batch(
+                    &batch.batch,
+                    &desc,
+                    any_batch_rewrite,
+                    enforce_matching_batch_boundaries,
+                )?;
                 for (run_meta, run) in batch.batch.runs() {
                     let start_index = parts.len();
                     for part in run {
@@ -529,6 +544,7 @@ where
                             .expect("schemas for inline user part");
 
                             let encoded_part = EncodedPart::from_inline(
+                                &crate::fetch::FetchConfig::from_persist_config(&self.cfg),
                                 &*self.metrics,
                                 self.metrics.read.compaction.clone(),
                                 desc.clone(),
@@ -736,44 +752,71 @@ where
     /// enough that we can reasonably chunk them up: O(KB) is definitely fine,
     /// O(MB) come talk to us.
     pub fn builder(&self, lower: Antichain<T>) -> BatchBuilder<K, V, T, D> {
-        let cfg = CompactConfig::new(&self.cfg, self.shard_id());
-        let parts = if let Some(max_runs) = cfg.batch.max_runs {
+        Self::builder_inner(
+            &self.cfg,
+            CompactConfig::new(&self.cfg, self.shard_id()),
+            Arc::clone(&self.metrics),
+            Arc::clone(&self.machine.applier.shard_metrics),
+            &self.metrics.user,
+            Arc::clone(&self.isolated_runtime),
+            Arc::clone(&self.blob),
+            self.shard_id(),
+            self.write_schemas.clone(),
+            lower,
+        )
+    }
+
+    /// Implementation of [Self::builder], so that we can share the
+    /// implementation in `PersistClient`.
+    pub(crate) fn builder_inner(
+        persist_cfg: &PersistConfig,
+        compact_cfg: CompactConfig,
+        metrics: Arc<Metrics>,
+        shard_metrics: Arc<ShardMetrics>,
+        user_batch_metrics: &BatchWriteMetrics,
+        isolated_runtime: Arc<IsolatedRuntime>,
+        blob: Arc<dyn Blob>,
+        shard_id: ShardId,
+        schemas: Schemas<K, V>,
+        lower: Antichain<T>,
+    ) -> BatchBuilder<K, V, T, D> {
+        let parts = if let Some(max_runs) = compact_cfg.batch.max_runs {
             BatchParts::new_compacting::<K, V, D>(
-                cfg,
+                compact_cfg,
                 Description::new(
                     lower.clone(),
                     Antichain::new(),
                     Antichain::from_elem(T::minimum()),
                 ),
                 max_runs,
-                Arc::clone(&self.metrics),
-                Arc::clone(&self.machine.applier.shard_metrics),
-                self.shard_id(),
-                Arc::clone(&self.blob),
-                Arc::clone(&self.isolated_runtime),
-                &self.metrics.user,
-                self.write_schemas.clone(),
+                Arc::clone(&metrics),
+                shard_metrics,
+                shard_id,
+                Arc::clone(&blob),
+                isolated_runtime,
+                user_batch_metrics,
+                schemas.clone(),
             )
         } else {
-            BatchParts::new_ordered(
-                cfg.batch,
+            BatchParts::new_ordered::<D>(
+                compact_cfg.batch,
                 RunOrder::Unordered,
-                Arc::clone(&self.metrics),
-                Arc::clone(&self.machine.applier.shard_metrics),
-                self.shard_id(),
-                Arc::clone(&self.blob),
-                Arc::clone(&self.isolated_runtime),
-                &self.metrics.user,
+                Arc::clone(&metrics),
+                shard_metrics,
+                shard_id,
+                Arc::clone(&blob),
+                isolated_runtime,
+                user_batch_metrics,
             )
         };
         let builder = BatchBuilderInternal::new(
-            BatchBuilderConfig::new(&self.cfg, self.shard_id()),
+            BatchBuilderConfig::new(persist_cfg, shard_id),
             parts,
-            Arc::clone(&self.metrics),
-            self.write_schemas.clone(),
-            Arc::clone(&self.blob),
-            self.machine.shard_id().clone(),
-            self.cfg.build_version.clone(),
+            metrics,
+            schemas,
+            blob,
+            shard_id,
+            persist_cfg.build_version.clone(),
         );
         BatchBuilder::new(
             builder,
@@ -907,6 +950,7 @@ where
             batches,
             Antichain::from_elem(expected_upper),
             Antichain::from_elem(new_upper),
+            true,
         )
         .await
         .expect("invalid usage")

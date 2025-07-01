@@ -19,12 +19,16 @@ use std::time::Duration;
 use anyhow::anyhow;
 use chrono::{DateTime, Utc};
 use futures::stream::{BoxStream, StreamExt};
-use mz_cluster_client::client::ClusterReplicaLocation;
+use mz_cluster_client::client::{ClusterReplicaLocation, TimelyConfig};
 use mz_compute_client::controller::ComputeControllerTimestamp;
 use mz_compute_client::logging::LogVariant;
 use mz_compute_client::service::{ComputeClient, ComputeGrpcClient};
 use mz_compute_types::config::{ComputeReplicaConfig, ComputeReplicaLogging};
-use mz_controller_types::dyncfgs::CONTROLLER_PAST_GENERATION_REPLICA_CLEANUP_RETRY_INTERVAL;
+use mz_controller_types::dyncfgs::{
+    ARRANGEMENT_EXERT_PROPORTIONALITY, CONTROLLER_PAST_GENERATION_REPLICA_CLEANUP_RETRY_INTERVAL,
+    ENABLE_TIMELY_INIT_AT_PROCESS_STARTUP, ENABLE_TIMELY_ZERO_COPY,
+    ENABLE_TIMELY_ZERO_COPY_LGALLOC, TIMELY_ZERO_COPY_LIMIT,
+};
 use mz_controller_types::{ClusterId, ReplicaId};
 use mz_orchestrator::NamespacedOrchestrator;
 use mz_orchestrator::{
@@ -72,6 +76,9 @@ pub struct ReplicaConfig {
 pub struct ReplicaAllocation {
     /// The memory limit for each process in the replica.
     pub memory_limit: Option<MemoryLimit>,
+    /// The memory limit for each process in the replica.
+    #[serde(default)]
+    pub memory_request: Option<MemoryLimit>,
     /// The CPU limit for each process in the replica.
     pub cpu_limit: Option<CpuLimit>,
     /// The disk limit for each process in the replica.
@@ -112,6 +119,7 @@ fn test_replica_allocation_deserialization() {
         {
             "cpu_limit": 1.0,
             "memory_limit": "10GiB",
+            "memory_request": "5GiB",
             "disk_limit": "100MiB",
             "scale": 16,
             "workers": 1,
@@ -132,6 +140,7 @@ fn test_replica_allocation_deserialization() {
             disk_limit: Some(DiskLimit(ByteSize::mib(100))),
             disabled: false,
             memory_limit: Some(MemoryLimit(ByteSize::gib(10))),
+            memory_request: Some(MemoryLimit(ByteSize::gib(5))),
             cpu_limit: Some(CpuLimit::from_millicpus(1000)),
             cpu_exclusive: false,
             is_cc: true,
@@ -166,6 +175,7 @@ fn test_replica_allocation_deserialization() {
             disk_limit: Some(DiskLimit(ByteSize::mib(0))),
             disabled: true,
             memory_limit: Some(MemoryLimit(ByteSize::gib(0))),
+            memory_request: None,
             cpu_limit: Some(CpuLimit::from_millicpus(0)),
             cpu_exclusive: true,
             is_cc: true,
@@ -628,6 +638,25 @@ where
         let aws_connection_role_arn = self.connection_context().aws_connection_role_arn.clone();
         let persist_pubsub_url = self.persist_pubsub_url.clone();
         let secrets_args = self.secrets_args.to_flags();
+
+        let mut storage_proto_timely_config = None;
+        let mut compute_proto_timely_config = None;
+        if ENABLE_TIMELY_INIT_AT_PROCESS_STARTUP.get(&self.dyncfg) {
+            // TODO(teskje): use the same values as for compute?
+            storage_proto_timely_config = Some(TimelyConfig {
+                arrangement_exert_proportionality: 1337,
+                ..Default::default()
+            });
+            compute_proto_timely_config = Some(TimelyConfig {
+                arrangement_exert_proportionality: ARRANGEMENT_EXERT_PROPORTIONALITY
+                    .get(&self.dyncfg),
+                enable_zero_copy: ENABLE_TIMELY_ZERO_COPY.get(&self.dyncfg),
+                enable_zero_copy_lgalloc: ENABLE_TIMELY_ZERO_COPY_LGALLOC.get(&self.dyncfg),
+                zero_copy_limit: TIMELY_ZERO_COPY_LIMIT.get(&self.dyncfg),
+                ..Default::default()
+            });
+        }
+
         let service = self.orchestrator.ensure_service(
             &service_name,
             ServiceConfig {
@@ -637,13 +666,16 @@ where
                     let mut args = vec![
                         format!(
                             "--storage-controller-listen-addr={}",
-                            assigned["storagectl"]
+                            assigned.listen_addrs["storagectl"]
                         ),
                         format!(
                             "--compute-controller-listen-addr={}",
-                            assigned["computectl"]
+                            assigned.listen_addrs["computectl"]
                         ),
-                        format!("--internal-http-listen-addr={}", assigned["internal-http"]),
+                        format!(
+                            "--internal-http-listen-addr={}",
+                            assigned.listen_addrs["internal-http"]
+                        ),
                         format!("--opentelemetry-resource=cluster_id={}", cluster_id),
                         format!("--opentelemetry-resource=replica_id={}", replica_id),
                         format!("--persist-pubsub-url={}", persist_pubsub_url),
@@ -676,6 +708,29 @@ where
 
                     args.extend(secrets_args.clone());
 
+                    if let Some(proto) = &storage_proto_timely_config {
+                        let storage_timely_config = TimelyConfig {
+                            workers: location.allocation.workers,
+                            addresses: assigned.peer_addresses("storage"),
+                            ..*proto
+                        };
+                        args.push(format!(
+                            "--storage-timely-config={}",
+                            storage_timely_config.to_string(),
+                        ));
+                    }
+                    if let Some(proto) = &compute_proto_timely_config {
+                        let compute_timely_config = TimelyConfig {
+                            workers: location.allocation.workers,
+                            addresses: assigned.peer_addresses("compute"),
+                            ..*proto
+                        };
+                        args.push(format!(
+                            "--compute-timely-config={}",
+                            compute_timely_config.to_string(),
+                        ));
+                    }
+
                     args
                 }),
                 ports: vec![
@@ -705,6 +760,7 @@ where
                 ],
                 cpu_limit: location.allocation.cpu_limit,
                 memory_limit: location.allocation.memory_limit,
+                memory_request: location.allocation.memory_request,
                 scale: location.allocation.scale,
                 labels: BTreeMap::from([
                     ("replica-id".into(), replica_id.to_string()),

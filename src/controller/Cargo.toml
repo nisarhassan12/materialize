@@ -18,6 +18,8 @@ mz-cluster-client = { path = "../cluster-client" }
 mz-compute-client = { path = "../compute-client" }
 mz-compute-types = { path = "../compute-types" }
 mz-controller-types = { path = "../controller-types" }
+mz-dyncfg = { path = "../dyncfg" }
+mz-dyncfgs = { path = "../dyncfgs" }
 mz-orchestrator = { path = "../orchestrator" }
 mz-persist-client = { path = "../persist-client" }
 mz-persist-types = { path = "../persist-types" }
@@ -32,7 +34,7 @@ mz-txn-wal = { path = "../txn-wal" }
 regex = "1.11.1"
 serde = { version = "1.0.219", features = ["derive"] }
 serde_json = "1.0.140"
-timely = "0.21.0"
+timely = "0.21.3"
 tokio = "1.44.1"
 tracing = "0.1.37"
 uuid = { version = "1.17.0" }

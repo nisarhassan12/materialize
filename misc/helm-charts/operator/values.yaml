@@ -13,7 +13,7 @@ operator:
     # -- The Docker repository for the operator image
     repository: materialize/orchestratord
     # -- The tag/version of the operator image to be used
-    tag: v0.145.0
+    tag: v0.148.0
     # -- Policy for pulling the image: "IfNotPresent" avoids unnecessary re-pulling of images
     pullPolicy: IfNotPresent
 
@@ -22,11 +22,6 @@ operator:
     # -- Log filtering settings for startup logs
     startupLogFilter: "INFO,mz_orchestratord=TRACE"
     enableInternalStatementLogging: true
-
-  features:
-    # -- Whether to enable environmentd rbac checks
-    # TODO: this is not yet supported in the helm chart
-    authentication: false
 
   # Cloud provider configuration
   cloudProvider:

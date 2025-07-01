@@ -10,9 +10,9 @@
 //! Implementation of the storage controller trait.
 
 use std::any::Any;
+use std::collections::btree_map;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::{Debug, Display};
-use std::num::NonZeroI64;
 use std::str::FromStr;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -36,7 +36,7 @@ use mz_ore::collections::CollectionExt;
 use mz_ore::metrics::MetricsRegistry;
 use mz_ore::now::{EpochMillis, NowFn};
 use mz_ore::task::AbortOnDropHandle;
-use mz_ore::{assert_none, instrument, soft_panic_or_log};
+use mz_ore::{assert_none, halt, instrument, soft_panic_or_log};
 use mz_persist_client::batch::ProtoBatch;
 use mz_persist_client::cache::PersistClientCache;
 use mz_persist_client::cfg::USE_CRITICAL_SINCE_SNAPSHOT;
@@ -65,7 +65,7 @@ use mz_storage_client::healthcheck::{
 };
 use mz_storage_client::metrics::StorageControllerMetrics;
 use mz_storage_client::statistics::{
-    SinkStatisticsUpdate, SourceStatisticsUpdate, WebhookStatistics,
+    ControllerSinkStatistics, ControllerSourceStatistics, WebhookStatistics,
 };
 use mz_storage_client::storage_collections::StorageCollections;
 use mz_storage_types::configuration::StorageConfiguration;
@@ -100,7 +100,6 @@ use crate::collection_mgmt::{
     AppendOnlyIntrospectionConfig, CollectionManagerKind, DifferentialIntrospectionConfig,
 };
 use crate::instance::{Instance, ReplicaConfig};
-use crate::statistics::StatsState;
 
 mod collection_mgmt;
 mod history;
@@ -137,8 +136,6 @@ pub struct Controller<T: Timestamp + Lattice + Codec64 + From<EpochMillis> + Tim
     build_info: &'static BuildInfo,
     /// A function that returns the current time.
     now: NowFn,
-    /// The fencing token for this instance of the controller.
-    envd_epoch: NonZeroI64,
 
     /// Whether or not this controller is in read-only mode.
     ///
@@ -197,7 +194,7 @@ pub struct Controller<T: Timestamp + Lattice + Codec64 + From<EpochMillis> + Tim
     source_statistics: Arc<Mutex<statistics::SourceStatistics>>,
     /// Consolidated metrics updates to periodically write. We do not eagerly initialize this,
     /// and its contents are entirely driven by `StorageResponse::StatisticsUpdates`'s.
-    sink_statistics: Arc<Mutex<BTreeMap<GlobalId, statistics::StatsState<SinkStatisticsUpdate>>>>,
+    sink_statistics: Arc<Mutex<BTreeMap<(GlobalId, Option<ReplicaId>), ControllerSinkStatistics>>>,
     /// A way to update the statistics interval in the statistics tasks.
     statistics_interval_sender: Sender<Duration>,
 
@@ -398,8 +395,15 @@ where
     fn collections_hydrated_on_replicas(
         &self,
         target_replica_ids: Option<Vec<ReplicaId>>,
+        target_cluster_id: &StorageInstanceId,
         exclude_collections: &BTreeSet<GlobalId>,
     ) -> Result<bool, StorageError<Self::Timestamp>> {
+        // If an empty set of replicas is provided there can be
+        // no collections on them, we'll count this as hydrated.
+        if target_replica_ids.as_ref().is_some_and(|v| v.is_empty()) {
+            return Ok(true);
+        }
+
         // If target_replica_ids is provided, use it as the set of target
         // replicas. Otherwise check for hydration on any replica.
         let target_replicas: Option<BTreeSet<ReplicaId>> =
@@ -412,6 +416,9 @@ where
             }
             let hydrated = match &collection_state.extra_state {
                 CollectionStateExtra::Ingestion(state) => {
+                    if &state.instance_id != target_cluster_id {
+                        continue;
+                    }
                     match &target_replicas {
                         Some(target_replicas) => !state.hydrated_on.is_disjoint(target_replicas),
                         None => {
@@ -511,7 +518,6 @@ where
         let metrics = self.metrics.for_instance(id);
         let mut instance = Instance::new(
             workload_class,
-            self.envd_epoch,
             metrics,
             Arc::clone(self.config().config_set()),
             self.now.clone(),
@@ -954,6 +960,21 @@ where
                 && !is_in_txns(id, &metadata)
                 && !matches!(&data_source, DataSource::Sink { .. })
             {
+                // As the halt message says, this can happen when trying to come
+                // up in read-only mode and the current read-write
+                // environmentd/controller deletes a collection. We exit
+                // gracefully, which means we'll get restarted and get to try
+                // again.
+                if dependency_since.is_empty() {
+                    halt!(
+                        "dependency since frontier is empty while dependent upper \
+                        is not empty (dependent id={id}, write_frontier={:?}, dependency_read_holds={:?}), \
+                        this indicates concurrent deletion of a collection",
+                        write_frontier,
+                        dependency_read_holds,
+                    );
+                }
+
                 // The dependency since cannot be beyond the dependent (our)
                 // upper unless the collection is new. In practice, the
                 // depdenency is the remap shard of a source (export), and if
@@ -1149,28 +1170,17 @@ where
         }
 
         {
-            // Ensure all sources are associated with the statistics.
-            //
-            // We currently do not call `create_collections` after we have initialized the source
-            // statistics scrapers, but in the interest of safety, avoid overriding existing
-            // statistics values.
             let mut source_statistics = self.source_statistics.lock().expect("poisoned");
-            let mut sink_statistics = self.sink_statistics.lock().expect("poisoned");
 
-            for id in new_source_statistic_entries {
-                source_statistics
-                    .source_statistics
-                    .entry(id)
-                    .or_insert_with(|| StatsState::new(SourceStatisticsUpdate::new(id)));
-            }
+            // Webhooks don't run on clusters/replicas, so we initialize their
+            // statistics collection here.
             for id in new_webhook_statistic_entries {
                 source_statistics.webhook_statistics.entry(id).or_default();
             }
-            for id in new_sink_statistic_entries {
-                sink_statistics
-                    .entry(id)
-                    .or_insert_with(|| StatsState::new(SinkStatisticsUpdate::new(id)));
-            }
+
+            // Sources and sinks only have statistics in the collection when
+            // there is a replica that is reporting them. No need to initialize
+            // here.
         }
 
         // Register the tables all in one batch.
@@ -1987,8 +1997,12 @@ where
         {
             let mut source_statistics = self.source_statistics.lock().expect("poisoned");
             for id in source_statistics_to_drop {
-                source_statistics.source_statistics.remove(&id);
-                source_statistics.webhook_statistics.remove(&id);
+                source_statistics
+                    .source_statistics
+                    .retain(|(stats_id, _), _| stats_id != &id);
+                source_statistics
+                    .webhook_statistics
+                    .retain(|stats_id, _| stats_id != &id);
             }
         }
 
@@ -2091,7 +2105,7 @@ where
             let mut sink_statistics = self.sink_statistics.lock().expect("poisoned");
             for id in sinks_to_drop.iter() {
                 status_updates.push(StatusUpdate::new(*id, status_now, Status::Dropped));
-                sink_statistics.remove(id);
+                sink_statistics.retain(|(stats_id, _), _| stats_id != id);
             }
         }
 
@@ -2247,32 +2261,101 @@ where
                         soft_panic_or_log!("unexpected DroppedId for {id}");
                     }
                 }
-                (_replica_id, StorageResponse::StatisticsUpdates(source_stats, sink_stats)) => {
+                (replica_id, StorageResponse::StatisticsUpdates(source_stats, sink_stats)) => {
                     // Note we only hold the locks while moving some plain-old-data around here.
-                    //
-                    // We just write the whole object, as the update from storage represents the
-                    // current values.
-                    //
-                    // We don't overwrite removed objects, as we may have received a late
-                    // `StatisticsUpdates` while we were shutting down the storage object.
                     {
+                        // NOTE(aljoscha): We explicitly unwrap the `Option`,
+                        // because we expect that stats coming from replicas
+                        // have a replica id.
+                        //
+                        // If this is `None` and we would use that to access
+                        // state below we might clobber something unexpectedly.
+                        let replica_id = if let Some(replica_id) = replica_id {
+                            replica_id
+                        } else {
+                            tracing::error!(
+                                ?source_stats,
+                                "missing replica_id for source statistics update"
+                            );
+                            continue;
+                        };
+
                         let mut shared_stats = self.source_statistics.lock().expect("poisoned");
+
                         for stat in source_stats {
-                            // Don't override it if its been removed.
-                            shared_stats
+                            let collection_id = stat.id.clone();
+
+                            if self.collection(collection_id).is_err() {
+                                // We can get updates for collections that have
+                                // already been deleted, ignore those.
+                                continue;
+                            }
+
+                            let entry = shared_stats
                                 .source_statistics
-                                .entry(stat.id)
-                                .and_modify(|current| current.stat().incorporate(stat));
+                                .entry((stat.id, Some(replica_id)));
+
+                            match entry {
+                                btree_map::Entry::Vacant(vacant_entry) => {
+                                    let mut stats = ControllerSourceStatistics::new(
+                                        collection_id,
+                                        Some(replica_id),
+                                    );
+                                    stats.incorporate(stat);
+                                    vacant_entry.insert(stats);
+                                }
+                                btree_map::Entry::Occupied(mut occupied_entry) => {
+                                    occupied_entry.get_mut().incorporate(stat);
+                                }
+                            }
                         }
                     }
 
                     {
+                        // NOTE(aljoscha); Same as above. We want to be
+                        // explicit.
+                        //
+                        // Also, technically for sinks there is no webhook
+                        // "sources" that would force us to use an `Option`. But
+                        // we still have to use an option for other reasons: the
+                        // scraper expects a trait for working with stats, and
+                        // that in the end forces the sink stats map to also
+                        // have `Option` in the key. Do I like that? No, but
+                        // here we are.
+                        let replica_id = if let Some(replica_id) = replica_id {
+                            replica_id
+                        } else {
+                            tracing::error!(
+                                ?sink_stats,
+                                "missing replica_id for sink statistics update"
+                            );
+                            continue;
+                        };
+
                         let mut shared_stats = self.sink_statistics.lock().expect("poisoned");
+
                         for stat in sink_stats {
-                            // Don't override it if its been removed.
-                            shared_stats
-                                .entry(stat.id)
-                                .and_modify(|current| current.stat().incorporate(stat));
+                            let collection_id = stat.id.clone();
+
+                            if self.collection(collection_id).is_err() {
+                                // We can get updates for collections that have
+                                // already been deleted, ignore those.
+                                continue;
+                            }
+
+                            let entry = shared_stats.entry((stat.id, Some(replica_id)));
+
+                            match entry {
+                                btree_map::Entry::Vacant(vacant_entry) => {
+                                    let mut stats =
+                                        ControllerSinkStatistics::new(collection_id, replica_id);
+                                    stats.incorporate(stat);
+                                    vacant_entry.insert(stats);
+                                }
+                                btree_map::Entry::Occupied(mut occupied_entry) => {
+                                    occupied_entry.get_mut().incorporate(stat);
+                                }
+                            }
                         }
                     }
                 }
@@ -2372,9 +2455,10 @@ where
                                 // Send the results down our channel.
                                 (pending.result_tx)(batches)
                             }
-                            // TODO(cf2): When we support running COPY FROM on multiple
-                            // replicas we can probably just ignore the case of `None`.
-                            None => mz_ore::soft_panic_or_log!("no sender for {ingestion_id}!"),
+                            None => {
+                                // We might not be tracking this oneshot ingestion anymore because
+                                // it was canceled.
+                            }
                         }
                     }
                 }
@@ -2621,7 +2705,6 @@ where
         now: NowFn,
         wallclock_lag: WallclockLagFn<T>,
         txns_metrics: Arc<TxnMetrics>,
-        envd_epoch: NonZeroI64,
         read_only: bool,
         metrics_registry: &MetricsRegistry,
         controller_metrics: ControllerMetrics,
@@ -2709,7 +2792,6 @@ where
             introspection_ids,
             introspection_tokens,
             now,
-            envd_epoch,
             read_only,
             source_statistics: Arc::new(Mutex::new(statistics::SourceStatistics {
                 source_statistics: BTreeMap::new(),
@@ -3068,6 +3150,9 @@ where
             // be able to update desired state via the collection manager
             // already.
             CollectionManagerKind::Differential => {
+                let statistics_retention_duration =
+                    dyncfgs::STATISTICS_RETENTION_DURATION.get(self.config().config_set());
+
                 // These do a shallow copy.
                 let introspection_config = DifferentialIntrospectionConfig {
                     recent_upper,
@@ -3078,6 +3163,7 @@ where
                     sink_statistics: Arc::clone(&self.sink_statistics),
                     statistics_interval: self.config.parameters.statistics_interval.clone(),
                     statistics_interval_receiver: self.statistics_interval_sender.subscribe(),
+                    statistics_retention_duration,
                     metrics: self.metrics.clone(),
                     introspection_tokens: Arc::clone(&self.introspection_tokens),
                 };
@@ -3123,11 +3209,11 @@ where
             .expect("poisoned")
             .source_statistics
             // collections should also contain subsources.
-            .retain(|k, _| self.storage_collections.check_exists(*k).is_ok());
+            .retain(|(k, _replica_id), _| self.storage_collections.check_exists(*k).is_ok());
         self.sink_statistics
             .lock()
             .expect("poisoned")
-            .retain(|k, _| self.export(*k).is_ok());
+            .retain(|(k, _replica_id), _| self.export(*k).is_ok());
     }
 
     /// Appends a new global ID, shard ID pair to the appropriate collection.

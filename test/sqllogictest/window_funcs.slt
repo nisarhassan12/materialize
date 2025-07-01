@@ -321,7 +321,7 @@ SELECT * FROM t1, LATERAL(SELECT t2.*, ROW_NUMBER() OVER() FROM t2 WHERE t1.f2 =
 2  2  1  2  1
 2  2  2  2  2
 
-query IIIII
+query IIIII rowsort
 SELECT * FROM t2, LATERAL(SELECT t1.*, ROW_NUMBER() OVER() FROM t1 WHERE t1.f1 = t2.f1) AS foo;
 ----
 1  1  1  1  1
@@ -334,7 +334,7 @@ SELECT * FROM t2, LATERAL(SELECT t1.*, ROW_NUMBER() OVER() FROM t1 WHERE t1.f1 =
 1  1  1  1  1
 2  2  2  2  1
 
-query IIIII
+query IIIII rowsort
 SELECT * FROM t2, LATERAL(SELECT t1.*, ROW_NUMBER() OVER() FROM t1 WHERE t1.f2 = t2.f2) AS foo;
 ----
 1  1  1  1  1
@@ -514,7 +514,7 @@ ORDER BY dense_rank
 2  b
 3  a
 
-query IIT
+query IIT rowsort
 SELECT rank() OVER (ORDER BY x), dense_rank() OVER (ORDER BY x), x FROM t
 ----
 1  1  a
@@ -590,7 +590,7 @@ CREATE TABLE t(x string, y int);
 statement ok
 INSERT INTO t VALUES ('a', 98), ('b', 99), ('c', 98);
 
-query IIT
+query IIT rowsort
 SELECT rank() OVER (PARTITION BY y ORDER BY x), dense_rank() OVER (PARTITION BY y ORDER BY x), x FROM t;
 ----
 1  1  a
@@ -651,7 +651,7 @@ ORDER BY dense_rank, x;
 1  c
 2  a
 
-query IIT
+query IIT rowsort
 SELECT rank() OVER (PARTITION BY x ORDER BY x), dense_rank() OVER (PARTITION BY x ORDER BY x), x FROM t;
 ----
 1  1  a
@@ -666,7 +666,7 @@ ORDER BY dense_rank, x;
 1  b
 1  c
 
-query IIT
+query IIT rowsort
 SELECT rank() OVER (PARTITION BY NULL ORDER BY 10000), dense_rank() OVER (PARTITION BY NULL ORDER BY 10000) AS q, a1.x
 FROM t AS a1, t AS a2;
 ----
@@ -7363,6 +7363,9 @@ ORDER BY x5_simple;
 4  NULL  NULL  NULL
 
 # Regression test for https://github.com/MaterializeInc/materialize/pull/22270#issuecomment-1761432124
+statement ok
+SET cluster_replica = r1
+
 statement error db error: ERROR: Evaluation error: "4294967295 \* 2" uint4 out of range
 select max(1) over (partition by 1 order by 1, 1)
 from
@@ -7664,7 +7667,7 @@ ORDER BY x,y,l;
 
 # Simple situation
 query T multiline
-EXPLAIN PHYSICAL PLAN FOR
+EXPLAIN PHYSICAL PLAN AS VERBOSE TEXT FOR
 SELECT
   lead(x,y-2,120) OVER (ORDER BY x)
 FROM t9;
@@ -7692,7 +7695,7 @@ EOF
 
 # PARTITION BY
 query T multiline
-EXPLAIN PHYSICAL PLAN FOR
+EXPLAIN PHYSICAL PLAN AS VERBOSE TEXT FOR
 SELECT
   lead(x,y-2,120) OVER (PARTITION BY x/2 ORDER BY x)
 FROM t9;
@@ -7721,7 +7724,7 @@ EOF
 
 # PARTITION BY multiple columns
 query T multiline
-EXPLAIN PHYSICAL PLAN FOR
+EXPLAIN PHYSICAL PLAN AS VERBOSE TEXT FOR
 SELECT
   lead(x,y-2,120) OVER (PARTITION BY x/2, y ORDER BY x)
 FROM t9;
@@ -7750,7 +7753,7 @@ EOF
 
 # row_number()
 query T multiline
-EXPLAIN PHYSICAL PLAN FOR
+EXPLAIN PHYSICAL PLAN AS VERBOSE TEXT FOR
 SELECT
   row_number() OVER (ORDER BY x),
   x
@@ -7781,7 +7784,7 @@ EOF
 
 # MFP after is fused into the Reduce
 query T multiline
-EXPLAIN PHYSICAL PLAN FOR
+EXPLAIN PHYSICAL PLAN AS VERBOSE TEXT FOR
 SELECT *
 FROM (
   SELECT *, lag(x) OVER (ORDER BY x) AS l
@@ -7816,7 +7819,7 @@ EOF
 
 # Two lags fused with each other + Reduce-FlatMap fusion.
 query T multiline
-EXPLAIN PHYSICAL PLAN FOR
+EXPLAIN PHYSICAL PLAN AS VERBOSE TEXT FOR
 SELECT
   *,
   lag(x) OVER (),

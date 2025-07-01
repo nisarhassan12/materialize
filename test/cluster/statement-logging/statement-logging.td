@@ -37,6 +37,10 @@ $ sleep-is-probably-flaky-i-have-justified-my-need-with-a-comment duration="1s"
 $ postgres-execute connection=postgres://mz_system:materialize@${testdrive.materialize-internal-sql-addr}
 ALTER SYSTEM SET enable_rbac_checks = false
 
+# No peek result stash for large results, so that result sizes match the expectations below.
+$ postgres-execute connection=postgres://mz_system:materialize@${testdrive.materialize-internal-sql-addr}
+ALTER SYSTEM SET enable_compute_peek_response_stash = false
+
 # Now the real test begins
 
 # This will be executed on `mz_catalog_server`, due to auto-routing of "simple" queries.
@@ -202,7 +206,6 @@ COMMIT execution-finished
 "SELECT count(*) > 0 FROM mz_internal.mz_cluster_replica_metrics" execution-began
 "SELECT count(*) > 0 FROM mz_internal.mz_cluster_replica_metrics" execution-finished
 "SELECT count(*) > 0 FROM mz_internal.mz_cluster_replica_metrics" optimization-finished
-"SELECT count(*) > 0 FROM mz_internal.mz_cluster_replica_metrics" storage-dependencies-finished
 "SELECT count(*) FROM t" compute-dependencies-finished
 "SELECT count(*) FROM t" compute-dependencies-finished
 "SELECT count(*) FROM t" execution-began
@@ -302,3 +305,7 @@ ROLLBACK
 
 > SELECT result_size, rows_returned FROM mz_internal.mz_recent_activity_log WHERE sql = 'SELECT * FROM t_offset_limit ORDER BY a DESC LIMIT 0';
 0 0
+
+> SELECT mseh.began_at, mslh.occurred_at
+  FROM mz_internal.mz_statement_execution_history mseh JOIN mz_internal.mz_statement_lifecycle_history mslh ON (mseh.id = mslh.statement_id)
+  WHERE mslh.event_type = 'execution-began' AND mseh.began_at != mslh.occurred_at;

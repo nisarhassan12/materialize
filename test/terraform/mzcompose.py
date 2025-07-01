@@ -31,7 +31,7 @@ from materialize.mzcompose.composition import (
     WorkflowArgumentParser,
 )
 from materialize.mzcompose.services.testdrive import Testdrive
-from materialize.version_list import get_lts_versions
+from materialize.version_list import get_self_managed_versions
 
 SERVICES = [
     Testdrive(),  # overridden below
@@ -62,7 +62,6 @@ COMPATIBLE_TESTDRIVE_FILES = [
     "drop.td",
     "duplicate-table-names.td",
     "failpoints.td",
-    "fetch-tail-as-of.td",
     "fetch-tail-large-diff.td",
     "fetch-tail-limit-timeout.td",
     "fetch-tail-timestamp-zero.td",
@@ -96,7 +95,6 @@ COMPATIBLE_TESTDRIVE_FILES = [
     "oid.td",
     "orms.td",
     "pg-catalog.td",
-    "quickstart.td",
     "runtime-errors.td",
     "search_path.td",
     "self-test.td",
@@ -238,12 +236,14 @@ class State:
     path: Path
     environmentd_port_forward_process: subprocess.Popen[bytes] | None
     balancerd_port_forward_process: subprocess.Popen[bytes] | None
+    version: int
 
     def __init__(self, path: Path):
         self.materialize_environment = None
         self.path = path
         self.environmentd_port_forward_process = None
         self.balancerd_port_forward_process = None
+        self.version = 0
 
     def kubectl_setup(
         self, tag: str, metadata_backend_url: str, persist_backend_url: str
@@ -346,6 +346,7 @@ class State:
                     "requests": {"cpu": "100m", "memory": "256Mi"},
                 },
                 "backendSecretName": "materialize-backend",
+                "authenticatorKind": "None",
             },
         }
 
@@ -613,6 +614,7 @@ class AWS(State):
         prefix: str,
         setup: bool,
         tag: str,
+        orchestratord_tag: str | None = None,
     ) -> None:
         if not setup:
             spawn.runv(
@@ -630,13 +632,12 @@ class AWS(State):
 
         vars = [
             "-var",
-            "operator_version=v25.2.0-beta.1",
+            "operator_version=v25.3.0-beta.1",
         ]
-        if not tag:
-            vars += [
-                "-var",
-                f"orchestratord_version={get_tag(tag)}",
-            ]
+        vars += [
+            "-var",
+            f"orchestratord_version={get_tag(orchestratord_tag or tag)}",
+        ]
 
         print("--- Setup")
         spawn.runv(
@@ -673,7 +674,7 @@ class AWS(State):
         self.kubectl_setup(tag, metadata_backend_url, persist_backend_url)
 
     def upgrade(self, tag: str) -> None:
-        print("--- Upgrading")
+        print(f"--- Upgrading to {tag}")
         # Following https://materialize.com/docs/self-managed/v25.1/installation/install-on-aws/upgrade-on-aws/
         self.materialize_environment = {
             "apiVersion": "materialize.cloud/v1alpha1",
@@ -684,7 +685,7 @@ class AWS(State):
             },
             "spec": {
                 "inPlaceRollout": True,
-                "requestRollout": "12345678-9012-3456-7890-123456789013",
+                "requestRollout": f"12345678-9012-3456-7890-12345678901{self.version+3}",
                 "environmentdImageRef": f"materialize/environmentd:{tag}",
                 "environmentdResourceRequirements": {
                     "limits": {"memory": "4Gi"},
@@ -695,9 +696,11 @@ class AWS(State):
                     "requests": {"cpu": "100m", "memory": "256Mi"},
                 },
                 "backendSecretName": "materialize-backend",
+                "authenticatorKind": "None",
             },
         }
 
+        self.version += 1
         spawn.runv(
             ["kubectl", "apply", "-f", "-"],
             cwd=self.path,
@@ -804,7 +807,7 @@ def workflow_aws_upgrade(c: Composition, parser: WorkflowArgumentParser) -> None
     add_arguments_temporary_test(parser)
     args = parser.parse_args()
 
-    previous_tag = get_lts_versions()[-1]
+    previous_tags = get_self_managed_versions()
     tag = get_tag(args.tag)
     path = MZ_ROOT / "test" / "terraform" / "aws-upgrade"
     aws = AWS(path)
@@ -812,7 +815,9 @@ def workflow_aws_upgrade(c: Composition, parser: WorkflowArgumentParser) -> None
     try:
         if args.run_mz_debug:
             mz_debug_build_thread = build_mz_debug_async()
-        aws.setup("aws-upgrade", args.setup, str(previous_tag))
+        aws.setup("aws-upgrade", args.setup, str(previous_tags[0]), str(tag))
+        for previous_tag in previous_tags[1:]:
+            aws.upgrade(str(previous_tag))
         aws.upgrade(tag)
         if args.test:
             # Try waiting a bit, otherwise connection error, should be handled better
@@ -1009,13 +1014,12 @@ def workflow_gcp_temporary(c: Composition, parser: WorkflowArgumentParser) -> No
 
         vars = [
             "-var",
-            "operator_version=v25.2.0-beta.1",
+            "operator_version=v25.3.0-beta.1",
         ]
-        if not tag:
-            vars += [
-                "-var",
-                f"orchestratord_version={get_tag(tag)}",
-            ]
+        vars += [
+            "-var",
+            f"orchestratord_version={get_tag(tag)}",
+        ]
 
         if args.setup:
             print("--- Setup")
@@ -1104,7 +1108,7 @@ def workflow_azure_temporary(c: Composition, parser: WorkflowArgumentParser) -> 
             assert username, "AZURE_SERVICE_ACCOUNT_USERNAME has to be set"
             assert password, "AZURE_SERVICE_ACCOUNT_PASSWORD has to be set"
             assert tenant, "AZURE_SERVICE_ACOUNT_TENANT has to be set"
-            spawn.runv(
+            subprocess.run(
                 [
                     "az",
                     "login",
@@ -1121,13 +1125,12 @@ def workflow_azure_temporary(c: Composition, parser: WorkflowArgumentParser) -> 
 
         vars = [
             "-var",
-            "operator_version=v25.2.0-beta.1",
+            "operator_version=v25.3.0-beta.1",
         ]
-        if not tag:
-            vars += [
-                "-var",
-                f"orchestratord_version={get_tag(tag)}",
-            ]
+        vars += [
+            "-var",
+            f"orchestratord_version={get_tag(tag)}",
+        ]
 
         if args.setup:
             spawn.runv(

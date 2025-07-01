@@ -42,6 +42,7 @@ use chrono::{DateTime, NaiveDateTime, NaiveTime, Utc};
 use fallible_iterator::FallibleIterator;
 use futures::sink::SinkExt;
 use itertools::Itertools;
+use maplit::btreemap;
 use md5::{Digest, Md5};
 use mz_adapter_types::bootstrap_builtin_cluster_config::{
     ANALYTICS_CLUSTER_DEFAULT_REPLICATION_FACTOR, BootstrapBuiltinClusterConfig,
@@ -76,6 +77,10 @@ use mz_repr::adt::date::Date;
 use mz_repr::adt::mz_acl_item::{AclItem, MzAclItem};
 use mz_repr::adt::numeric;
 use mz_secrets::SecretsController;
+use mz_server_core::listeners::{
+    AllowedRoles, AuthenticatorKind, BaseListenerConfig, HttpListenerConfig, HttpRoutesEnabled,
+    ListenersConfig, SqlListenerConfig,
+};
 use mz_sql::ast::{Expr, Raw, Statement};
 use mz_sql::catalog::EnvironmentId;
 use mz_sql_parser::ast::display::AstDisplay;
@@ -832,8 +837,8 @@ impl<'a> Runner<'a> {
             .batch_execute("CREATE DATABASE materialize")
             .await?;
 
-        // Ensure quickstart cluster exists with one replica of size '1'. We don't
-        // destroy the existing quickstart cluster replica if it exists, as turning
+        // Ensure quickstart cluster exists with one replica of size `self.config.replica_size`.
+        // We don't destroy the existing quickstart cluster replica if it exists, as turning
         // on a cluster replica is exceptionally slow.
         let mut needs_default_cluster = true;
         for row in inner
@@ -855,6 +860,63 @@ impl<'a> Runner<'a> {
             inner
                 .system_client
                 .batch_execute("CREATE CLUSTER quickstart REPLICAS ()")
+                .await?;
+        }
+        let mut needs_default_replica = false;
+        let rows = inner
+            .system_client
+            .query(
+                "SELECT name, size FROM mz_cluster_replicas
+                 WHERE cluster_id = (SELECT id FROM mz_clusters WHERE name = 'quickstart')
+                 ORDER BY name",
+                &[],
+            )
+            .await?;
+        if rows.len() != self.config.replicas {
+            needs_default_replica = true;
+        } else {
+            for (i, row) in rows.iter().enumerate() {
+                let name: &str = row.get("name");
+                let size: &str = row.get("size");
+                if name != format!("r{i}") || size != self.config.replica_size.to_string() {
+                    needs_default_replica = true;
+                    break;
+                }
+            }
+        }
+
+        if needs_default_replica {
+            inner
+                .system_client
+                .batch_execute("ALTER CLUSTER quickstart SET (MANAGED = false)")
+                .await?;
+            for row in inner
+                .system_client
+                .query(
+                    "SELECT name FROM mz_cluster_replicas
+                     WHERE cluster_id = (SELECT id FROM mz_clusters WHERE name = 'quickstart')",
+                    &[],
+                )
+                .await?
+            {
+                let name: &str = row.get("name");
+                inner
+                    .system_client
+                    .batch_execute(&format!("DROP CLUSTER REPLICA quickstart.{}", name))
+                    .await?;
+            }
+            for i in 1..=self.config.replicas {
+                inner
+                    .system_client
+                    .batch_execute(&format!(
+                        "CREATE CLUSTER REPLICA quickstart.r{i} SIZE '{}'",
+                        self.config.replica_size
+                    ))
+                    .await?;
+            }
+            inner
+                .system_client
+                .batch_execute("ALTER CLUSTER quickstart SET (MANAGED = true)")
                 .await?;
         }
 
@@ -880,7 +942,7 @@ impl<'a> Runner<'a> {
             .batch_execute("GRANT CREATE ON CLUSTER quickstart TO materialize")
             .await?;
 
-        // Some sqllogic tests require more than the default amount of tables, so we increase the
+        // Some sqllogictests require more than the default amount of tables, so we increase the
         // limit for all tests.
         inner
             .system_client
@@ -1006,8 +1068,59 @@ impl<'a> RunnerInner<'a> {
             orchestrator,
             config.tracing.clone(),
         ));
-        let listeners = mz_environmentd::Listeners::bind_any_local().await?;
-        let host_name = format!("localhost:{}", listeners.http_local_addr().port());
+        let listeners_config = ListenersConfig {
+            sql: btreemap! {
+                "external".to_owned() => SqlListenerConfig {
+                    addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
+                    authenticator_kind: AuthenticatorKind::None,
+                    allowed_roles: AllowedRoles::Normal,
+                    enable_tls: false,
+                },
+                "internal".to_owned() => SqlListenerConfig {
+                    addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
+                    authenticator_kind: AuthenticatorKind::None,
+                    allowed_roles: AllowedRoles::Internal,
+                    enable_tls: false,
+                },
+            },
+            http: btreemap![
+                "external".to_owned() => HttpListenerConfig {
+                    base: BaseListenerConfig {
+                        addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
+                        authenticator_kind: AuthenticatorKind::None,
+                        allowed_roles: AllowedRoles::Normal,
+                        enable_tls: false
+                    },
+                    routes: HttpRoutesEnabled {
+                        base: true,
+                        webhook: true,
+                        internal: false,
+                        metrics: false,
+                        profiling: false,
+                    },
+                },
+                "internal".to_owned() => HttpListenerConfig {
+                    base: BaseListenerConfig {
+                        addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
+                        authenticator_kind: AuthenticatorKind::None,
+                        allowed_roles: AllowedRoles::NormalAndInternal,
+                        enable_tls: false
+                    },
+                    routes: HttpRoutesEnabled {
+                        base: true,
+                        webhook: true,
+                        internal: true,
+                        metrics: true,
+                        profiling: true,
+                    },
+                },
+            ],
+        };
+        let listeners = mz_environmentd::Listeners::bind(listeners_config).await?;
+        let host_name = format!(
+            "localhost:{}",
+            listeners.http["external"].handle.local_addr.port()
+        );
         let catalog_config = CatalogConfig {
             persist_clients: Arc::clone(&persist_clients),
             metrics: Arc::new(mz_catalog::durable::Metrics::new(&MetricsRegistry::new())),
@@ -1047,8 +1160,6 @@ impl<'a> RunnerInner<'a> {
             cloud_resource_controller: None,
             tls: None,
             frontegg: None,
-            self_hosted_auth: false,
-            self_hosted_auth_internal: false,
             cors_allowed_origin: AllowOrigin::list([]),
             unsafe_mode: true,
             all_features: false,
@@ -1056,27 +1167,30 @@ impl<'a> RunnerInner<'a> {
             now,
             environment_id,
             cluster_replica_sizes: ClusterReplicaSizeMap::for_tests(),
-            bootstrap_default_cluster_replica_size: config.replicas.to_string(),
-            bootstrap_default_cluster_replication_factor: 1,
+            bootstrap_default_cluster_replica_size: config.replica_size.to_string(),
+            bootstrap_default_cluster_replication_factor: config
+                .replicas
+                .try_into()
+                .expect("replicas must fit"),
             bootstrap_builtin_system_cluster_config: BootstrapBuiltinClusterConfig {
                 replication_factor: SYSTEM_CLUSTER_DEFAULT_REPLICATION_FACTOR,
-                size: config.replicas.to_string(),
+                size: config.replica_size.to_string(),
             },
             bootstrap_builtin_catalog_server_cluster_config: BootstrapBuiltinClusterConfig {
                 replication_factor: CATALOG_SERVER_CLUSTER_DEFAULT_REPLICATION_FACTOR,
-                size: config.replicas.to_string(),
+                size: config.replica_size.to_string(),
             },
             bootstrap_builtin_probe_cluster_config: BootstrapBuiltinClusterConfig {
                 replication_factor: PROBE_CLUSTER_DEFAULT_REPLICATION_FACTOR,
-                size: config.replicas.to_string(),
+                size: config.replica_size.to_string(),
             },
             bootstrap_builtin_support_cluster_config: BootstrapBuiltinClusterConfig {
                 replication_factor: SUPPORT_CLUSTER_DEFAULT_REPLICATION_FACTOR,
-                size: config.replicas.to_string(),
+                size: config.replica_size.to_string(),
             },
             bootstrap_builtin_analytics_cluster_config: BootstrapBuiltinClusterConfig {
                 replication_factor: ANALYTICS_CLUSTER_DEFAULT_REPLICATION_FACTOR,
-                size: config.replicas.to_string(),
+                size: config.replica_size.to_string(),
             },
             system_parameter_defaults: {
                 let mut params = BTreeMap::new();
@@ -1093,11 +1207,14 @@ impl<'a> RunnerInner<'a> {
             storage_usage_retention_period: None,
             segment_api_key: None,
             segment_client_side: false,
+            // SLT doesn't like eternally running tasks since it waits for them to finish inbetween SLT files
+            test_only_dummy_segment_client: false,
             egress_addresses: vec![],
             aws_account_id: None,
             aws_privatelink_availability_zones: None,
             launchdarkly_sdk_key: None,
             launchdarkly_key_map: Default::default(),
+            config_sync_file_path: None,
             config_sync_timeout: Duration::from_secs(30),
             config_sync_loop_interval: None,
             bootstrap_role: Some("materialize".into()),
@@ -1106,6 +1223,7 @@ impl<'a> RunnerInner<'a> {
             tls_reload_certs: mz_server_core::cert_reload_never_reload(),
             helm_chart_version: None,
             license_key: ValidatedLicenseKey::for_tests(),
+            external_login_password_mz_system: None,
         };
         // We need to run the server on its own Tokio runtime, which in turn
         // requires its own thread, so that we can wait for any tasks spawned
@@ -1137,13 +1255,13 @@ impl<'a> RunnerInner<'a> {
                 }
             };
             server_addr_tx
-                .send(Ok(server.sql_local_addr()))
+                .send(Ok(server.sql_listener_handles["external"].local_addr))
                 .expect("receiver should not drop first");
             internal_server_addr_tx
-                .send(server.internal_sql_local_addr())
+                .send(server.sql_listener_handles["internal"].local_addr)
                 .expect("receiver should not drop first");
             internal_http_server_addr_tx
-                .send(server.internal_http_local_addr())
+                .send(server.http_listener_handles["internal"].local_addr)
                 .expect("receiver should not drop first");
             let _ = runtime.block_on(shutdown_trigger_rx);
         });
@@ -1824,10 +1942,11 @@ pub struct RunConfig<'a> {
     pub system_parameter_defaults: BTreeMap<String, String>,
     /// Persist state is handled specially because:
     /// - Persist background workers do not necessarily shut down immediately once the server is
-    ///   shut down, and may panic if their storage is delete out from under them.
+    ///   shut down, and may panic if their storage is deleted out from under them.
     /// - It's safe for different databases to reference the same state: all data is scoped by UUID.
     pub persist_dir: TempDir,
     pub replicas: usize,
+    pub replica_size: usize,
 }
 
 fn print_record(config: &RunConfig<'_>, record: &Record) {

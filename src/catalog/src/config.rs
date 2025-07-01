@@ -13,6 +13,7 @@ use anyhow::bail;
 use bytesize::ByteSize;
 use ipnet::IpNet;
 use mz_adapter_types::bootstrap_builtin_cluster_config::BootstrapBuiltinClusterConfig;
+use mz_auth::password::Password;
 use mz_build_info::BuildInfo;
 use mz_cloud_resources::AwsExternalIdPrefix;
 use mz_controller::clusters::ReplicaAllocation;
@@ -96,6 +97,7 @@ pub struct StateConfig {
     pub enable_0dt_deployment: bool,
     /// Helm chart version
     pub helm_chart_version: Option<String>,
+    pub external_login_password_mz_system: Option<Password>,
 }
 
 #[derive(Debug)]
@@ -178,6 +180,7 @@ impl ClusterReplicaSizeMap {
                         name,
                         ReplicaAllocation {
                             memory_limit: memory_limit.map(|gib| MemoryLimit(ByteSize::gib(gib))),
+                            memory_request: None,
                             cpu_limit: None,
                             disk_limit: None,
                             scale: 1,
@@ -199,6 +202,7 @@ impl ClusterReplicaSizeMap {
                 format!("{scale}-1"),
                 ReplicaAllocation {
                     memory_limit: None,
+                    memory_request: None,
                     cpu_limit: None,
                     disk_limit: None,
                     scale,
@@ -215,6 +219,7 @@ impl ClusterReplicaSizeMap {
                 format!("{scale}-{scale}"),
                 ReplicaAllocation {
                     memory_limit: None,
+                    memory_request: None,
                     cpu_limit: None,
                     disk_limit: None,
                     scale,
@@ -231,6 +236,7 @@ impl ClusterReplicaSizeMap {
                 format!("mem-{scale}"),
                 ReplicaAllocation {
                     memory_limit: Some(MemoryLimit(ByteSize(u64::cast_from(scale) * (1 << 30)))),
+                    memory_request: None,
                     cpu_limit: None,
                     disk_limit: None,
                     scale: 1,
@@ -248,6 +254,7 @@ impl ClusterReplicaSizeMap {
             "2-4".to_string(),
             ReplicaAllocation {
                 memory_limit: None,
+                memory_request: None,
                 cpu_limit: None,
                 disk_limit: None,
                 scale: 2,
@@ -264,6 +271,7 @@ impl ClusterReplicaSizeMap {
             "free".to_string(),
             ReplicaAllocation {
                 memory_limit: None,
+                memory_request: None,
                 cpu_limit: None,
                 disk_limit: None,
                 scale: 0,
@@ -281,6 +289,7 @@ impl ClusterReplicaSizeMap {
                 size.to_string(),
                 ReplicaAllocation {
                     memory_limit: None,
+                    memory_request: None,
                     cpu_limit: None,
                     disk_limit: None,
                     scale: 1,

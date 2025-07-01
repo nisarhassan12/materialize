@@ -52,6 +52,7 @@ steps:
           queue: builder-linux-x86_64
         env:
           CI_SANITIZER: address
+        sanitizer: skip
 
       - id: build-aarch64-asan
         label: ":bazel: Build aarch64 (ASan)"
@@ -65,6 +66,7 @@ steps:
           queue: builder-linux-aarch64-mem
         env:
           CI_SANITIZER: address
+        sanitizer: skip
 
   - group: Linters
     key: linters
@@ -85,7 +87,7 @@ steps:
         depends_on: []
         timeout_in_minutes: 45
         agents:
-          queue: hetzner-aarch64-4cpu-8gb
+          queue: hetzner-aarch64-8cpu-16gb
         sanitizer: skip
 
       - id: cargo-deny-check-advisories
@@ -108,7 +110,7 @@ steps:
           composition: cargo-test
           args: [--miri-full]
     agents:
-      queue: hetzner-aarch64-8cpu-16gb
+      queue: hetzner-aarch64-16cpu-32gb
     sanitizer: skip
 
   - group: Benchmarks
@@ -120,7 +122,7 @@ steps:
         timeout_in_minutes: 720
         parallelism: 8
         agents:
-          queue: hetzner-x86-64-dedi-8cpu-32gb
+          queue: hetzner-x86-64-dedi-16cpu-64gb
         plugins:
           - ./ci/plugins/mzcompose:
               composition: feature-benchmark
@@ -134,7 +136,7 @@ steps:
         timeout_in_minutes: 240
         agents:
           # Larger instance is more stable in performance
-          queue: hetzner-x86-64-dedi-8cpu-32gb
+          queue: hetzner-x86-64-dedi-16cpu-64gb
         plugins:
           - ./ci/plugins/mzcompose:
               composition: scalability
@@ -282,7 +284,6 @@ steps:
           - ./ci/plugins/mzcompose:
               composition: testdrive
               args: [--replicas=4]
-        skip: "Reenable when database-issues#9095 is fixed"
 
       - id: testdrive-size-1
         label: ":racing_car: testdrive with SIZE 1"
@@ -505,7 +506,7 @@ steps:
         depends_on: build-aarch64
         timeout_in_minutes: 180
         agents:
-          queue: hetzner-aarch64-4cpu-8gb
+          queue: hetzner-aarch64-16cpu-32gb
         plugins:
           - ./ci/plugins/mzcompose:
               composition: zippy
@@ -516,7 +517,7 @@ steps:
         depends_on: build-aarch64
         timeout_in_minutes: 120
         agents:
-          queue: hetzner-aarch64-4cpu-8gb
+          queue: hetzner-aarch64-16cpu-32gb
         plugins:
           - ./ci/plugins/mzcompose:
               composition: zippy
@@ -527,7 +528,7 @@ steps:
         depends_on: build-aarch64
         timeout_in_minutes: 120
         agents:
-          queue: hetzner-aarch64-4cpu-8gb
+          queue: hetzner-aarch64-8cpu-16gb
         plugins:
           - ./ci/plugins/mzcompose:
               composition: zippy
@@ -538,7 +539,7 @@ steps:
         depends_on: build-aarch64
         timeout_in_minutes: 120
         agents:
-          queue: hetzner-aarch64-4cpu-8gb
+          queue: hetzner-aarch64-8cpu-16gb
         plugins:
           - ./ci/plugins/mzcompose:
               composition: zippy
@@ -549,7 +550,7 @@ steps:
         depends_on: build-aarch64
         timeout_in_minutes: 120
         agents:
-          queue: hetzner-aarch64-4cpu-8gb
+          queue: hetzner-aarch64-8cpu-16gb
         plugins:
           - ./ci/plugins/mzcompose:
               composition: zippy
@@ -560,7 +561,7 @@ steps:
         depends_on: build-aarch64
         timeout_in_minutes: 120
         agents:
-          queue: hetzner-aarch64-4cpu-8gb
+          queue: hetzner-aarch64-8cpu-16gb
         plugins:
           - ./ci/plugins/mzcompose:
               composition: zippy
@@ -611,7 +612,7 @@ steps:
           - ./ci/plugins/mzcompose:
               composition: mysql-cdc-resumption-old-syntax
         agents:
-          queue: hetzner-aarch64-4cpu-8gb
+          queue: hetzner-aarch64-8cpu-16gb
 
       - id: mysql-rtr-old-syntax
         label: MySQL RTR tests (before source versioning)
@@ -653,7 +654,7 @@ steps:
           - ./ci/plugins/mzcompose:
               composition: pg-cdc-resumption-old-syntax
         agents:
-          queue: hetzner-aarch64-4cpu-8gb
+          queue: hetzner-aarch64-8cpu-16gb
 
       - id: pg-rtr-old-syntax
         label: Postgres RTR tests (before source versioning)
@@ -685,7 +686,7 @@ steps:
               composition: testdrive-old-kafka-src-syntax
               run: migration
         agents:
-          queue: hetzner-aarch64-8cpu-16gb
+          queue: hetzner-aarch64-16cpu-32gb
 
   - group: AWS
     key: aws
@@ -876,8 +877,8 @@ steps:
               composition: platform-checks
               args: [--scenario=UpgradeEntireMz, "--seed=$BUILDKITE_JOB_ID"]
 
-      - id: checks-lts-upgrade
-        label: "Checks LTS upgrade, whole-Mz restart"
+      - id: checks-self-managed-upgrade
+        label: "Checks Self-Managed upgrade, whole-Mz restart"
         depends_on: build-aarch64
         timeout_in_minutes: 180
         parallelism: 3
@@ -886,7 +887,19 @@ steps:
         plugins:
           - ./ci/plugins/mzcompose:
               composition: platform-checks
-              args: [--scenario=UpgradeEntireMzFromLatestLTS, "--seed=$BUILDKITE_JOB_ID"]
+              args: [--scenario=UpgradeEntireMzFromLatestSelfManaged, "--seed=$BUILDKITE_JOB_ID"]
+
+      - id: checks-self-managed-upgrade-previous
+        label: "Checks Self-Managed upgrade from previous, whole-Mz restart"
+        depends_on: build-aarch64
+        timeout_in_minutes: 180
+        parallelism: 3
+        agents:
+          queue: hetzner-aarch64-8cpu-16gb
+        plugins:
+          - ./ci/plugins/mzcompose:
+              composition: platform-checks
+              args: [--scenario=UpgradeEntireMzFromPreviousSelfManaged, "--seed=$BUILDKITE_JOB_ID"]
 
       - id: checks-preflight-check-rollback
         label: "Checks preflight-check and roll back upgrade"
@@ -1012,6 +1025,8 @@ steps:
           automatic:
             - exit_status: 1
               limit: 2
+            - exit_status: 143 # SIGTERM
+              limit: 2
             - exit_status: 255
               limit: 2
         agents:
@@ -1037,6 +1052,8 @@ steps:
         retry:
           automatic:
             - exit_status: 1
+              limit: 2
+            - exit_status: 143 # SIGTERM
               limit: 2
             - exit_status: 255
               limit: 2
@@ -1064,6 +1081,8 @@ steps:
           automatic:
             - exit_status: 1
               limit: 2
+            - exit_status: 143 # SIGTERM
+              limit: 2
             - exit_status: 255
               limit: 2
         agents:
@@ -1089,6 +1108,8 @@ steps:
         retry:
           automatic:
             - exit_status: 1
+              limit: 2
+            - exit_status: 143 # SIGTERM
               limit: 2
             - exit_status: 255
               limit: 2
@@ -1139,7 +1160,7 @@ steps:
         depends_on: build-aarch64
         timeout_in_minutes: 40
         agents:
-          queue: hetzner-aarch64-4cpu-8gb
+          queue: hetzner-aarch64-8cpu-16gb
         artifact_paths: [test/persist/maelstrom/**/*.log]
         plugins:
           - ./ci/plugins/mzcompose:
@@ -1151,7 +1172,7 @@ steps:
         depends_on: build-aarch64
         timeout_in_minutes: 40
         agents:
-          queue: hetzner-aarch64-4cpu-8gb
+          queue: hetzner-aarch64-8cpu-16gb
         artifact_paths: [test/persist/maelstrom/**/*.log]
         plugins:
           - ./ci/plugins/mzcompose:
@@ -1163,7 +1184,7 @@ steps:
         depends_on: build-aarch64
         timeout_in_minutes: 40
         agents:
-          queue: hetzner-aarch64-4cpu-8gb
+          queue: hetzner-aarch64-8cpu-16gb
         artifact_paths: [test/persist/maelstrom/**/*.log]
         plugins:
           - ./ci/plugins/mzcompose:
@@ -1175,7 +1196,7 @@ steps:
         depends_on: build-aarch64
         timeout_in_minutes: 40
         agents:
-          queue: hetzner-aarch64-4cpu-8gb
+          queue: hetzner-aarch64-8cpu-16gb
         artifact_paths: [test/persist/maelstrom/**/*.log]
         plugins:
           - ./ci/plugins/mzcompose:
@@ -1263,7 +1284,7 @@ steps:
             run: aws-temporary
             # Cleanup runs in pre-exit hook
             args: [--no-cleanup]
-      branches: "main v*.* lts-v* *aws* *tf* *terraform* *helm* *self-managed* *orchestratord*"
+      branches: "main v*.* *aws* *tf* *terraform* *helm* *self-managed* *orchestratord*"
 
     - id: terraform-aws-upgrade
       label: "Terraform + Helm Chart Upgrade on AWS"
@@ -1281,7 +1302,7 @@ steps:
             run: aws-upgrade
             # Cleanup runs in pre-exit hook
             args: [--no-cleanup]
-      branches: "main v*.* lts-v* *aws* *tf* *terraform* *helm* *self-managed* *orchestratord*"
+      branches: "main v*.* *aws* *tf* *terraform* *helm* *self-managed* *orchestratord*"
 
     - id: terraform-gcp
       label: "Terraform + Helm Chart E2E on GCP"
@@ -1298,7 +1319,7 @@ steps:
             run: gcp-temporary
             # Cleanup runs in pre-exit hook
             args: [--no-cleanup]
-      branches: "main v*.* lts-v* *gcp* *tf* *terraform* *helm* *self-managed* *orchestratord*"
+      branches: "main v*.* *gcp* *tf* *terraform* *helm* *self-managed* *orchestratord*"
 
     - id: terraform-azure
       label: "Terraform + Helm Chart E2E on Azure"
@@ -1315,7 +1336,7 @@ steps:
             run: azure-temporary
             # Cleanup runs in pre-exit hook
             args: [--no-cleanup]
-      branches: "main v*.* lts-v* *azure* *tf* *terraform* *helm* *self-managed* *orchestratord*"
+      branches: "main v*.* *azure* *tf* *terraform* *helm* *self-managed* *orchestratord*"
 
   - group: "Output consistency"
     key: output-consistency
@@ -1393,7 +1414,7 @@ steps:
         plugins:
           - ./ci/plugins/mzcompose:
               composition: sqlsmith
-              args: [--max-joins=2, --runtime=1500]
+              args: [--max-joins=5, --runtime=1500]
 
       - id: sqlsmith-explain
         label: "SQLsmith explain"
@@ -1471,7 +1492,8 @@ steps:
       - id: rqg-db3-joins
         label: "RQG dbt3-joins workload"
         depends_on: build-aarch64
-        timeout_in_minutes: 60
+        # Some queries run very slow on Postgres, set a higher timeout to give them a chance to finish
+        timeout_in_minutes: 120
         agents:
           # Runs into timeout/OoM on small agents
           queue: hetzner-aarch64-8cpu-16gb
@@ -1683,7 +1705,7 @@ steps:
         artifact_paths: [parallel-workload-queries.log.zst]
         timeout_in_minutes: 90
         agents:
-          queue: hetzner-aarch64-8cpu-16gb
+          queue: hetzner-aarch64-16cpu-32gb
         plugins:
           - ./ci/plugins/mzcompose:
               composition: parallel-workload
@@ -1695,7 +1717,7 @@ steps:
         artifact_paths: [parallel-workload-queries.log.zst]
         timeout_in_minutes: 90
         agents:
-          queue: hetzner-aarch64-8cpu-16gb
+          queue: hetzner-aarch64-16cpu-32gb
         plugins:
           - ./ci/plugins/mzcompose:
               composition: parallel-workload
@@ -1706,7 +1728,6 @@ steps:
         depends_on: build-aarch64
         artifact_paths: [parallel-workload-queries.log.zst]
         timeout_in_minutes: 90
-        skip: "TODO(def-): Reenable when database-issues#835 is fixed"
         agents:
           queue: hetzner-aarch64-8cpu-16gb
         plugins:
@@ -1741,11 +1762,11 @@ steps:
 
       - id: parallel-workload-0dt
         label: "Parallel Workload (0dt deploy)"
-        depends_on: build-aarch64
+        depends_on: build-x86_64
         artifact_paths: [parallel-workload-queries.log.zst]
         timeout_in_minutes: 90
         agents:
-          queue: hetzner-aarch64-16cpu-32gb
+          queue: hetzner-x86-64-dedi-16cpu-64gb
         plugins:
           - ./ci/plugins/mzcompose:
               composition: parallel-workload
@@ -1794,7 +1815,7 @@ steps:
         plugins:
           - ./ci/plugins/mzcompose:
               composition: legacy-upgrade
-              args: ["--versions-source=docs", "--lts-upgrade"]
+              args: ["--versions-source=docs", "--self-managed-upgrade"]
         agents:
           queue: hetzner-aarch64-4cpu-8gb
 
@@ -1915,7 +1936,8 @@ steps:
   - id: 0dt
     label: Zero downtime
     depends_on: build-aarch64
-    timeout_in_minutes: 180
+    timeout_in_minutes: 240
+    parallelism: 4
     plugins:
       - ./ci/plugins/mzcompose:
           composition: 0dt
@@ -1933,17 +1955,18 @@ steps:
       queue: hetzner-aarch64-4cpu-8gb
 
   - id: sqllogictest
-    label: ":bulb: SQL logic tests"
+    label: ":bulb: SQL logic tests (4 replicas)"
     depends_on: build-aarch64
-    timeout_in_minutes: 240
+    timeout_in_minutes: 480
     parallelism: 10
     agents:
       # Runs faster/more consistently on larger agent
-      queue: hetzner-aarch64-8cpu-16gb
+      queue: hetzner-aarch64-16cpu-32gb
     plugins:
       - ./ci/plugins/mzcompose:
           composition: sqllogictest
           run: slow-tests
+          args: [--replicas=4]
 
   - id: cluster-tests-azurite
     label: "Cluster tests with :azure: blob store"
@@ -1963,57 +1986,57 @@ steps:
        - id: race-condition-subsequent
          label: "Race Condition Test (subsequent)"
          depends_on: build-aarch64
-         timeout_in_minutes: 360
+         timeout_in_minutes: 180
          agents:
            queue: hetzner-aarch64-8cpu-16gb
          plugins:
            - ./ci/plugins/mzcompose:
                composition: race-condition
-               args: [--runtime=10800, --scenario=subsequent]
+               args: [--runtime=2800, --scenario=subsequent]
 
        - id: race-condition-subsequent-100
          label: "Race Condition Test (subsequent, 100 objects)"
          depends_on: build-aarch64
-         timeout_in_minutes: 360
+         timeout_in_minutes: 180
          agents:
            queue: hetzner-aarch64-8cpu-16gb
          plugins:
            - ./ci/plugins/mzcompose:
                composition: race-condition
-               args: [--runtime=10800, --scenario=subsequent, --num-objects=100]
+               args: [--runtime=2800, --scenario=subsequent, --num-objects=100]
 
        - id: race-condition-subsequent-chain
          label: "Race Condition Test (subsequent chain)"
          depends_on: build-aarch64
-         timeout_in_minutes: 360
+         timeout_in_minutes: 180
          agents:
            queue: hetzner-aarch64-8cpu-16gb
          plugins:
            - ./ci/plugins/mzcompose:
                composition: race-condition
-               args: [--runtime=10800, --scenario=subsequent-chain]
+               args: [--runtime=2800, --scenario=subsequent-chain]
 
        - id: race-condition-subsequent-chain-100
          label: "Race Condition Test (subsequent chain, 100 objects)"
          depends_on: build-aarch64
-         timeout_in_minutes: 360
+         timeout_in_minutes: 180
          agents:
            queue: hetzner-aarch64-8cpu-16gb
          plugins:
            - ./ci/plugins/mzcompose:
                composition: race-condition
-               args: [--runtime=10800, --scenario=subsequent-chain, --num-objects=100]
+               args: [--runtime=2800, --scenario=subsequent-chain, --num-objects=100]
 
        - id: race-condition-concurrent
          label: "Race Condition Test (concurrent)"
          depends_on: build-aarch64
-         timeout_in_minutes: 360
+         timeout_in_minutes: 180
          agents:
            queue: hetzner-aarch64-8cpu-16gb
          plugins:
            - ./ci/plugins/mzcompose:
                composition: race-condition
-               args: [--runtime=10800, --scenario=concurrent]
+               args: [--runtime=2800, --scenario=concurrent]
          skip: "Not stable yet, not clear if this is a product issue"
 
   - group: "Language tests"

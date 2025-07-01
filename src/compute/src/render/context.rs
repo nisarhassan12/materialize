@@ -10,15 +10,13 @@
 //! Management of dataflow-local state, like arrangements, while building a
 //! dataflow.
 
+use std::cell::RefCell;
 use std::collections::BTreeMap;
-use std::rc::{Rc, Weak};
+use std::rc::Rc;
 use std::sync::mpsc;
 
-use columnar::Columnar;
 use differential_dataflow::IntoOwned;
 use differential_dataflow::consolidation::ConsolidatingContainerBuilder;
-use differential_dataflow::containers::Columnation;
-use differential_dataflow::lattice::Lattice;
 use differential_dataflow::operators::arrange::Arranged;
 use differential_dataflow::trace::{BatchReader, Cursor, TraceReader};
 use differential_dataflow::{AsCollection, Collection, Data};
@@ -31,6 +29,7 @@ use mz_repr::fixed_length::ToDatumIter;
 use mz_repr::{DatumVec, DatumVecBorrow, Diff, GlobalId, Row, RowArena, SharedRow};
 use mz_storage_types::controller::CollectionMetadata;
 use mz_storage_types::errors::DataflowError;
+use mz_timely_util::builder_async::{ButtonHandle, PressOnDropButton};
 use mz_timely_util::containers::{Col2ValBatcher, ColumnBuilder, columnar_exchange};
 use mz_timely_util::operator::{CollectionExt, StreamExt};
 use timely::Container;
@@ -50,7 +49,8 @@ use crate::render::errors::ErrorLogger;
 use crate::render::{LinearJoinSpec, RenderTimestamp};
 use crate::row_spine::{DatumSeq, RowRowBuilder};
 use crate::typedefs::{
-    ErrAgent, ErrBatcher, ErrBuilder, ErrEnter, ErrSpine, RowRowAgent, RowRowEnter, RowRowSpine,
+    ErrAgent, ErrBatcher, ErrBuilder, ErrEnter, ErrSpine, MzTimestamp, RowRowAgent, RowRowEnter,
+    RowRowSpine,
 };
 
 /// Dataflow-local collections and arrangements.
@@ -65,8 +65,8 @@ use crate::typedefs::{
 /// of regions or iteration.
 pub struct Context<S: Scope, T = mz_repr::Timestamp>
 where
-    T: Timestamp + Lattice + Columnation,
-    S::Timestamp: Lattice + Refines<T> + Columnation,
+    T: MzTimestamp,
+    S::Timestamp: MzTimestamp + Refines<T>,
 {
     /// The scope within which all managed collections exist.
     ///
@@ -86,8 +86,8 @@ where
     pub until: Antichain<T>,
     /// Bindings of identifiers to collections.
     pub bindings: BTreeMap<Id, CollectionBundle<S, T>>,
-    /// A token that operators can probe to know whether the dataflow is shutting down.
-    pub(super) shutdown_token: ShutdownToken,
+    /// A handle that operators can probe to know whether the dataflow is shutting down.
+    pub(super) shutdown_probe: ShutdownProbe,
     /// A logger that operators can use to report hydration events.
     ///
     /// `None` if no hydration events should be logged in this context.
@@ -105,7 +105,7 @@ where
 
 impl<S: Scope> Context<S>
 where
-    S::Timestamp: Lattice + Refines<mz_repr::Timestamp> + Columnation,
+    S::Timestamp: MzTimestamp + Refines<mz_repr::Timestamp>,
 {
     /// Creates a new empty Context.
     pub fn for_dataflow_in<Plan>(
@@ -146,7 +146,7 @@ where
             as_of_frontier,
             until,
             bindings: BTreeMap::new(),
-            shutdown_token: Default::default(),
+            shutdown_probe: Default::default(),
             hydration_logger,
             compute_logger,
             linear_join_spec: compute_state.linear_join_spec,
@@ -158,8 +158,8 @@ where
 
 impl<S: Scope, T> Context<S, T>
 where
-    T: Timestamp + Lattice + Columnation,
-    S::Timestamp: Lattice + Refines<T> + Columnation,
+    T: MzTimestamp,
+    S::Timestamp: MzTimestamp + Refines<T>,
 {
     /// Insert a collection bundle by an identifier.
     ///
@@ -201,14 +201,14 @@ where
     }
 
     pub(super) fn error_logger(&self) -> ErrorLogger {
-        ErrorLogger::new(self.shutdown_token.clone(), self.debug_name.clone())
+        ErrorLogger::new(self.shutdown_probe.clone(), self.debug_name.clone())
     }
 }
 
 impl<S: Scope, T> Context<S, T>
 where
-    T: Timestamp + Lattice + Columnation,
-    S::Timestamp: Lattice + Refines<T> + Columnation,
+    T: MzTimestamp,
+    S::Timestamp: MzTimestamp + Refines<T>,
 {
     /// Brings the underlying arrangements and collections into a region.
     pub fn enter_region<'a>(
@@ -229,7 +229,7 @@ where
             dataflow_id: self.dataflow_id.clone(),
             as_of_frontier: self.as_of_frontier.clone(),
             until: self.until.clone(),
-            shutdown_token: self.shutdown_token.clone(),
+            shutdown_probe: self.shutdown_probe.clone(),
             hydration_logger: self.hydration_logger.clone(),
             compute_logger: self.compute_logger.clone(),
             linear_join_spec: self.linear_join_spec.clone(),
@@ -240,39 +240,61 @@ where
     }
 }
 
-/// Convenient wrapper around an optional `Weak` instance that can be used to check whether a
-/// datalow is shutting down.
+pub(super) fn shutdown_token<G: Scope>(scope: &mut G) -> (ShutdownProbe, PressOnDropButton) {
+    let (button_handle, button) = mz_timely_util::builder_async::button(scope, scope.addr());
+    let probe = ShutdownProbe::new(button_handle);
+    let token = button.press_on_drop();
+    (probe, token)
+}
+
+/// Convenient wrapper around an optional `ButtonHandle` that can be used to check whether a
+/// dataflow is shutting down.
 ///
 /// Instances created through the `Default` impl act as if the dataflow never shuts down.
-/// Instances created through [`ShutdownToken::new`] defer to the wrapped token.
+/// Instances created through [`ShutdownProbe::new`] defer to the wrapped button.
 #[derive(Clone, Default)]
-pub(super) struct ShutdownToken(Option<Weak<()>>);
+pub(super) struct ShutdownProbe(Option<Rc<RefCell<ButtonHandle>>>);
 
-impl ShutdownToken {
-    /// Construct a `ShutdownToken` instance that defers to `token`.
-    pub(super) fn new(token: Weak<()>) -> Self {
-        Self(Some(token))
+impl ShutdownProbe {
+    /// Construct a `ShutdownProbe` instance that defers to `button`.
+    fn new(button: ButtonHandle) -> Self {
+        Self(Some(Rc::new(RefCell::new(button))))
     }
 
     /// Probe the token for dataflow shutdown.
     ///
     /// This method is meant to be used with the `?` operator: It returns `None` if the dataflow is
     /// in the process of shutting down and `Some` otherwise.
+    ///
+    /// The result of this method is synchronized among workers: It only returns `None` once all
+    /// workers have dropped their shutdown token.
     pub(super) fn probe(&self) -> Option<()> {
-        match &self.0 {
-            Some(t) => t.upgrade().map(|_| ()),
-            None => Some(()),
+        match self.in_shutdown() {
+            false => Some(()),
+            true => None,
         }
     }
 
     /// Returns whether the dataflow is in the process of shutting down.
+    ///
+    /// The result of this method is synchronized among workers: It only returns `true` once all
+    /// workers have dropped their shutdown token.
     pub(super) fn in_shutdown(&self) -> bool {
-        self.probe().is_none()
+        match &self.0 {
+            Some(t) => t.borrow_mut().all_pressed(),
+            None => false,
+        }
     }
 
-    /// Returns a reference to the wrapped `Weak`.
-    pub(crate) fn get_inner(&self) -> Option<&Weak<()>> {
-        self.0.as_ref()
+    /// Returns whether the dataflow is in the process of shutting down on the current worker.
+    ///
+    /// In contrast to [`ShutdownProbe::in_shutdown`], this method returns `true` as soon as the
+    /// current worker has dropped its shutdown token, without waiting for other workers.
+    pub(super) fn in_local_shutdown(&self) -> bool {
+        match &self.0 {
+            Some(t) => t.borrow_mut().local_pressed(),
+            None => false,
+        }
     }
 }
 
@@ -307,8 +329,8 @@ impl HydrationLogger {
 #[derive(Clone)]
 pub enum ArrangementFlavor<S: Scope, T = mz_repr::Timestamp>
 where
-    T: Timestamp + Lattice + Columnation,
-    S::Timestamp: Lattice + Refines<T> + Columnation,
+    T: MzTimestamp,
+    S::Timestamp: MzTimestamp + Refines<T>,
 {
     /// A dataflow-local arrangement.
     Local(
@@ -328,8 +350,8 @@ where
 
 impl<S: Scope, T> ArrangementFlavor<S, T>
 where
-    T: Timestamp + Lattice + Columnation,
-    S::Timestamp: Lattice + Refines<T> + Columnation,
+    T: MzTimestamp,
+    S::Timestamp: MzTimestamp + Refines<T>,
 {
     /// Presents `self` as a stream of updates.
     ///
@@ -412,8 +434,8 @@ where
 }
 impl<S: Scope, T> ArrangementFlavor<S, T>
 where
-    T: Timestamp + Lattice + Columnation,
-    S::Timestamp: Lattice + Refines<T> + Columnation,
+    T: MzTimestamp,
+    S::Timestamp: MzTimestamp + Refines<T>,
 {
     /// The scope containing the collection bundle.
     pub fn scope(&self) -> S {
@@ -440,8 +462,8 @@ where
 }
 impl<'a, S: Scope, T> ArrangementFlavor<Child<'a, S, S::Timestamp>, T>
 where
-    T: Timestamp + Lattice + Columnation,
-    S::Timestamp: Lattice + Refines<T> + Columnation,
+    T: MzTimestamp,
+    S::Timestamp: MzTimestamp + Refines<T>,
 {
     /// Extracts the arrangement flavor from a region.
     pub fn leave_region(&self) -> ArrangementFlavor<S, T> {
@@ -463,17 +485,17 @@ where
 #[derive(Clone)]
 pub struct CollectionBundle<S: Scope, T = mz_repr::Timestamp>
 where
-    T: Timestamp + Lattice + Columnation,
-    S::Timestamp: Lattice + Refines<T> + Columnation,
+    T: MzTimestamp,
+    S::Timestamp: MzTimestamp + Refines<T>,
 {
     pub collection: Option<(Collection<S, Row, Diff>, Collection<S, DataflowError, Diff>)>,
     pub arranged: BTreeMap<Vec<MirScalarExpr>, ArrangementFlavor<S, T>>,
 }
 
-impl<S: Scope, T: Lattice> CollectionBundle<S, T>
+impl<S: Scope, T> CollectionBundle<S, T>
 where
-    T: Timestamp + Lattice + Columnation,
-    S::Timestamp: Lattice + Refines<T> + Columnation,
+    T: MzTimestamp,
+    S::Timestamp: MzTimestamp + Refines<T>,
 {
     /// Construct a new collection bundle from update streams.
     pub fn from_collections(
@@ -545,8 +567,8 @@ where
 
 impl<'a, S: Scope, T> CollectionBundle<Child<'a, S, S::Timestamp>, T>
 where
-    T: Timestamp + Lattice + Columnation,
-    S::Timestamp: Lattice + Refines<T> + Columnation,
+    T: MzTimestamp,
+    S::Timestamp: MzTimestamp + Refines<T>,
 {
     /// Extracts the collection bundle from a region.
     pub fn leave_region(&self) -> CollectionBundle<S, T> {
@@ -566,8 +588,8 @@ where
 
 impl<S: Scope, T> CollectionBundle<S, T>
 where
-    T: Timestamp + Lattice + Columnation,
-    S::Timestamp: Lattice + Refines<T> + Columnation,
+    T: MzTimestamp,
+    S::Timestamp: MzTimestamp + Refines<T>,
 {
     /// Asserts that the arrangement for a specific key
     /// (or the raw collection for no key) exists,
@@ -738,11 +760,9 @@ where
 
 impl<S, T> CollectionBundle<S, T>
 where
-    T: Timestamp + Lattice + Columnation,
+    T: MzTimestamp,
     S: Scope,
     S::Timestamp: Refines<T> + RenderTimestamp,
-    <S::Timestamp as Columnar>::Container: Clone + Send,
-    for<'a> <S::Timestamp as Columnar>::Ref<'a>: Ord + Copy,
 {
     /// Presents `self` as a stream of updates, having been subjected to `mfp`.
     ///
@@ -952,7 +972,6 @@ where
 struct PendingWork<C>
 where
     C: Cursor,
-    C::Time: Timestamp,
 {
     capability: Capability<C::Time>,
     cursor: C,
@@ -962,7 +981,6 @@ where
 impl<C> PendingWork<C>
 where
     C: Cursor,
-    C::Time: Timestamp,
 {
     /// Create a new bundle of pending work, from the capability, cursor, and backing storage.
     fn new(capability: Capability<C::Time>, cursor: C, batch: C::Storage) -> Self {

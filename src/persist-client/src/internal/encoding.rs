@@ -12,6 +12,7 @@ use std::collections::BTreeMap;
 use std::fmt::Debug;
 use std::hash::{Hash, Hasher};
 use std::marker::PhantomData;
+use std::str::FromStr;
 use std::sync::Arc;
 
 use bytes::{Buf, Bytes};
@@ -49,7 +50,7 @@ use crate::internal::state::{
     ProtoLeasedReaderState, ProtoMerge, ProtoRollup, ProtoRunMeta, ProtoRunOrder, ProtoSpineBatch,
     ProtoSpineId, ProtoStateDiff, ProtoStateField, ProtoStateFieldDiffType, ProtoStateFieldDiffs,
     ProtoTrace, ProtoU64Antichain, ProtoU64Description, ProtoVersionedData, ProtoWriterState,
-    RunMeta, RunOrder, RunPart, State, StateCollections, TypedState, WriterState,
+    RunId, RunMeta, RunOrder, RunPart, State, StateCollections, TypedState, WriterState,
     proto_hollow_batch_part,
 };
 use crate::internal::state_diff::{
@@ -61,12 +62,17 @@ use crate::internal::trace::{
 use crate::read::{LeasedReaderId, READER_LEASE_DURATION};
 use crate::{PersistConfig, ShardId, WriterId, cfg};
 
+/// A key and value `Schema` of data written to a batch or shard.
 #[derive(Debug)]
 pub struct Schemas<K: Codec, V: Codec> {
     // TODO: Remove the Option once this finishes rolling out and all shards
     // have a registered schema.
+    /// Id under which this schema is registered in the shard's schema registry,
+    /// if any.
     pub id: Option<SchemaId>,
+    /// Key `Schema`.
     pub key: Arc<K::Schema>,
+    /// Value `Schema`.
     pub val: Arc<V::Schema>,
 }
 
@@ -1388,6 +1394,18 @@ impl<T: Timestamp + Codec64> RustType<ProtoHollowBatch> for HollowBatch<T> {
     }
 }
 
+impl RustType<String> for RunId {
+    fn into_proto(&self) -> String {
+        self.to_string()
+    }
+
+    fn from_proto(proto: String) -> Result<Self, TryFromProtoError> {
+        RunId::from_str(&proto).map_err(|_| {
+            TryFromProtoError::InvalidPersistState(format!("invalid RunId: {}", proto))
+        })
+    }
+}
+
 impl RustType<ProtoRunMeta> for RunMeta {
     fn into_proto(&self) -> ProtoRunMeta {
         let order = match self.order {
@@ -1400,6 +1418,7 @@ impl RustType<ProtoRunMeta> for RunMeta {
             order: order.into(),
             schema_id: self.schema.into_proto(),
             deprecated_schema_id: self.deprecated_schema.into_proto(),
+            id: self.id.into_proto(),
         }
     }
 
@@ -1414,6 +1433,7 @@ impl RustType<ProtoRunMeta> for RunMeta {
             order,
             schema: proto.schema_id.into_rust()?,
             deprecated_schema: proto.deprecated_schema_id.into_rust()?,
+            id: proto.id.into_rust()?,
         })
     }
 }
@@ -1445,7 +1465,7 @@ impl<T: Timestamp + Codec64> RustType<ProtoHollowBatchPart> for HollowRunRef<T> 
             })),
             encoded_size_bytes: self.hollow_bytes.into_proto(),
             key_lower: Bytes::copy_from_slice(&self.key_lower),
-            diffs_sum: None,
+            diffs_sum: self.diffs_sum.map(i64::from_le_bytes),
             key_stats: None,
             ts_rewrite: None,
             format: None,
@@ -1469,6 +1489,7 @@ impl<T: Timestamp + Codec64> RustType<ProtoHollowBatchPart> for HollowRunRef<T> 
             max_part_bytes: run_proto.max_part_bytes.into_rust()?,
             key_lower: proto.key_lower.to_vec(),
             structured_key_lower: proto.structured_key_lower.into_rust()?,
+            diffs_sum: proto.diffs_sum.as_ref().map(|x| i64::to_le_bytes(*x)),
             _phantom_data: Default::default(),
         })
     }
@@ -2129,13 +2150,22 @@ mod tests {
     }
 
     #[mz_ore::test]
-    fn check_data_versions_with_lts_versions() {
+    fn check_data_versions_with_self_managed_versions() {
         #[track_caller]
-        fn testcase(code: &str, data: &str, lts_versions: &[Version], expected: Result<(), ()>) {
+        fn testcase(
+            code: &str,
+            data: &str,
+            self_managed_versions: &[Version],
+            expected: Result<(), ()>,
+        ) {
             let code = Version::parse(code).unwrap();
             let data = Version::parse(data).unwrap();
-            let actual = cfg::check_data_version_with_lts_versions(&code, &data, lts_versions)
-                .map_err(|_| ());
+            let actual = cfg::check_data_version_with_self_managed_versions(
+                &code,
+                &data,
+                self_managed_versions,
+            )
+            .map_err(|_| ());
             assert_eq!(actual, expected);
         }
 

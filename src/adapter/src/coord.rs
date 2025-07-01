@@ -92,6 +92,7 @@ use mz_adapter_types::bootstrap_builtin_cluster_config::BootstrapBuiltinClusterC
 use mz_adapter_types::compaction::CompactionWindow;
 use mz_adapter_types::connection::ConnectionId;
 use mz_adapter_types::dyncfgs::WITH_0DT_DEPLOYMENT_CAUGHT_UP_CHECK_INTERVAL;
+use mz_auth::password::Password;
 use mz_build_info::BuildInfo;
 use mz_catalog::builtin::{BUILTINS, BUILTINS_STATIC, MZ_AUDIT_EVENTS, MZ_STORAGE_USAGE_BY_SHARD};
 use mz_catalog::config::{AwsPrincipalContext, BuiltinItemMigrationConfig, ClusterReplicaSizeMap};
@@ -112,7 +113,7 @@ use mz_controller::clusters::{ClusterConfig, ClusterEvent, ClusterStatus, Proces
 use mz_controller_types::{ClusterId, ReplicaId, WatchSetId};
 use mz_expr::{MapFilterProject, OptimizedMirRelationExpr, RowSetFinishing};
 use mz_license_keys::ValidatedLicenseKey;
-use mz_orchestrator::{OfflineReason, ServiceProcessMetrics};
+use mz_orchestrator::OfflineReason;
 use mz_ore::cast::{CastFrom, CastInto, CastLossy};
 use mz_ore::channel::trigger::Trigger;
 use mz_ore::future::TimeoutError;
@@ -126,6 +127,7 @@ use mz_ore::vec::VecExt;
 use mz_ore::{
     assert_none, instrument, soft_assert_eq_or_log, soft_assert_or_log, soft_panic_or_log, stack,
 };
+use mz_persist_client::PersistClient;
 use mz_persist_client::batch::ProtoBatch;
 use mz_persist_client::usage::{ShardsUsageReferenced, StorageUsageClient};
 use mz_repr::explain::{ExplainConfig, ExplainFormat};
@@ -1035,13 +1037,7 @@ pub struct Config {
 
     pub helm_chart_version: Option<String>,
     pub license_key: ValidatedLicenseKey,
-}
-
-/// Soft-state metadata about a compute replica
-#[derive(Clone, Default, Debug, Eq, PartialEq)]
-pub struct ReplicaMetadata {
-    /// The last known CPU and memory metrics
-    pub metrics: Option<Vec<ServiceProcessMetrics>>,
+    pub external_login_password_mz_system: Option<Password>,
 }
 
 /// Metadata about an active connection.
@@ -1600,17 +1596,6 @@ impl ClusterReplicaStatuses {
     }
 
     /// Gets the statuses of the given cluster.
-    ///
-    /// Panics if the cluster does not exist
-    pub(crate) fn get_cluster_statuses(
-        &self,
-        cluster_id: ClusterId,
-    ) -> &BTreeMap<ReplicaId, BTreeMap<ProcessId, ClusterReplicaProcessStatus>> {
-        self.try_get_cluster_statuses(cluster_id)
-            .unwrap_or_else(|| panic!("unknown cluster: {cluster_id}"))
-    }
-
-    /// Gets the statuses of the given cluster.
     pub(crate) fn try_get_cluster_statuses(
         &self,
         cluster_id: ClusterId,
@@ -1634,6 +1619,10 @@ pub struct Coordinator {
     /// read their catalog as long as needed. In the future we would like this
     /// to be a pTVC, but for now this is sufficient.
     catalog: Arc<Catalog>,
+
+    /// A client for persist. Initially, this is only used for reading stashed
+    /// peek responses out of batches.
+    persist_client: PersistClient,
 
     /// Channel to manage internal commands from the coordinator to itself.
     internal_cmd_tx: mpsc::UnboundedSender<Message>,
@@ -1720,13 +1709,6 @@ pub struct Coordinator {
     /// Handle to a manager that can create and delete kubernetes resources
     /// (ie: VpcEndpoint objects)
     cloud_resource_controller: Option<Arc<dyn CloudResourceController>>,
-
-    /// Metadata about replicas that doesn't need to be persisted.
-    /// Intended for inclusion in system tables.
-    ///
-    /// `None` is used as a tombstone value for replicas that have been
-    /// dropped and for which no further updates should be recorded.
-    transient_replica_metadata: BTreeMap<ReplicaId, Option<ReplicaMetadata>>,
 
     /// Persist client for fetching storage metadata such as size metrics.
     storage_usage_client: StorageUsageClient,
@@ -1847,24 +1829,6 @@ impl Coordinator {
                     );
             }
         }
-        for replica_statuses in self.cluster_replica_statuses.0.values() {
-            for (replica_id, processes_statuses) in replica_statuses {
-                for (process_id, status) in processes_statuses {
-                    let builtin_table_update =
-                        self.catalog().state().pack_cluster_replica_status_update(
-                            *replica_id,
-                            *process_id,
-                            status,
-                            Diff::ONE,
-                        );
-                    let builtin_table_update = self
-                        .catalog()
-                        .state()
-                        .resolve_builtin_table_update(builtin_table_update);
-                    builtin_table_updates.push(builtin_table_update);
-                }
-            }
-        }
 
         let system_config = self.catalog().system_config();
 
@@ -1875,10 +1839,12 @@ impl Coordinator {
         let compute_config = flags::compute_config(system_config);
         let storage_config = flags::storage_config(system_config);
         let scheduling_config = flags::orchestrator_scheduling_config(system_config);
+        let dyncfg_updates = system_config.dyncfg_updates();
         self.controller.compute.update_configuration(compute_config);
         self.controller.storage.update_parameters(storage_config);
         self.controller
             .update_orchestrator_scheduling_config(scheduling_config);
+        self.controller.update_configuration(dyncfg_updates);
 
         let mut policies_to_set: BTreeMap<CompactionWindow, CollectionIdBundle> =
             Default::default();
@@ -3232,6 +3198,7 @@ impl Coordinator {
             &read_policies,
             &*self.controller.storage_collections,
             read_ts,
+            self.controller.read_only(),
         );
 
         let catalog = self.catalog_mut();
@@ -3952,6 +3919,7 @@ pub fn serve(
         caught_up_trigger: clusters_caught_up_trigger,
         helm_chart_version,
         license_key,
+        external_login_password_mz_system,
     }: Config,
 ) -> BoxFuture<'static, Result<(Handle, Client), AdapterError>> {
     async move {
@@ -4099,6 +4067,7 @@ pub fn serve(
                 enable_expression_cache_override: None,
                 enable_0dt_deployment,
                 helm_chart_version,
+                external_login_password_mz_system,
             },
         })
         .await?;
@@ -4273,7 +4242,6 @@ pub fn serve(
                     secrets_controller,
                     caching_secrets_reader,
                     cloud_resource_controller,
-                    transient_replica_metadata: BTreeMap::new(),
                     storage_usage_client,
                     storage_usage_collection_interval,
                     segment_client,
@@ -4293,6 +4261,7 @@ pub fn serve(
                     read_only_controllers,
                     buffered_builtin_table_updates: Some(Vec::new()),
                     license_key,
+                    persist_client,
                 };
                 let bootstrap = handle.block_on(async {
                     coord

@@ -21,6 +21,7 @@ use arrow::buffer::OffsetBuffer;
 use arrow::datatypes::{DataType, Int64Type, ToByteSlice};
 use base64::Engine;
 use bytes::{BufMut, Bytes};
+use differential_dataflow::difference::Semigroup;
 use differential_dataflow::trace::Description;
 use mz_ore::bytes::SegmentedBytes;
 use mz_ore::cast::CastFrom;
@@ -263,6 +264,20 @@ impl BlobTraceUpdates {
         }
     }
 
+    /// Return the sum of the diffs in the blob.
+    pub fn diffs_sum<D: Codec64 + Semigroup>(&self) -> Option<D> {
+        let mut sum = None;
+        for d in self.diffs().values().iter() {
+            let d = D::decode(d.to_le_bytes());
+            match &mut sum {
+                None => sum = Some(d),
+                Some(x) => x.plus_equals(&d),
+            }
+        }
+
+        sum
+    }
+
     /// Return the [`ColumnarRecords`] of the blob.
     pub fn records(&self) -> Option<&ColumnarRecords> {
         match self {
@@ -490,7 +505,7 @@ impl BlobTraceUpdates {
             };
             match BinaryArray::try_new(
                 OffsetBuffer::new(offsets.into()),
-                ::arrow::buffer::Buffer::from_bytes(data.into()),
+                ::arrow::buffer::Buffer::from(data),
                 None,
             ) {
                 Ok(data) => Ok(Some(realloc_array(&data, lgbytes))),

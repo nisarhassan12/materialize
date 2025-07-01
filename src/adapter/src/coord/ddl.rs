@@ -34,7 +34,7 @@ use mz_ore::str::StrExt;
 use mz_ore::task;
 use mz_postgres_util::tunnel::PostgresFlavor;
 use mz_repr::adt::numeric::Numeric;
-use mz_repr::{CatalogItemId, Diff, GlobalId, Timestamp};
+use mz_repr::{CatalogItemId, GlobalId, Timestamp};
 use mz_sql::catalog::{CatalogCluster, CatalogClusterReplica, CatalogSchema};
 use mz_sql::names::ResolvedDatabaseSpecifier;
 use mz_sql::plan::ConnectionDetails;
@@ -57,9 +57,9 @@ use tracing::{Instrument, Level, event, info_span, warn};
 
 use crate::active_compute_sink::{ActiveComputeSink, ActiveComputeSinkRetireReason};
 use crate::catalog::{DropObjectInfo, Op, ReplicaCreateDropReason, TransactionResult};
+use crate::coord::Coordinator;
 use crate::coord::appends::BuiltinTableAppendNotify;
 use crate::coord::timeline::{TimelineContext, TimelineState};
-use crate::coord::{Coordinator, ReplicaMetadata};
 use crate::session::{Session, Transaction, TransactionOps};
 use crate::statement_logging::StatementEndedExecutionReason;
 use crate::telemetry::{EventDetails, SegmentClientExt};
@@ -212,6 +212,7 @@ impl Coordinator {
         let mut cluster_replicas_to_create = vec![];
         let mut update_metrics_config = false;
         let mut update_tracing_config = false;
+        let mut update_controller_config = false;
         let mut update_compute_config = false;
         let mut update_storage_config = false;
         let mut update_pg_timestamp_oracle_config = false;
@@ -315,6 +316,11 @@ impl Coordinator {
                         .system_config()
                         .is_metrics_config_var(name);
                     update_tracing_config |= vars::is_tracing_var(name);
+                    update_controller_config |= self
+                        .catalog
+                        .state()
+                        .system_config()
+                        .is_controller_config_var(name);
                     update_compute_config |= self
                         .catalog
                         .state()
@@ -337,6 +343,7 @@ impl Coordinator {
                     // We could see if the config's have actually changed, but
                     // this is simpler.
                     update_tracing_config = true;
+                    update_controller_config = true;
                     update_compute_config = true;
                     update_storage_config = true;
                     update_pg_timestamp_oracle_config = true;
@@ -535,7 +542,7 @@ impl Coordinator {
         let conn = conn_id.map(|id| active_conns.get(id).expect("connection must exist"));
 
         let TransactionResult {
-            mut builtin_table_updates,
+            builtin_table_updates,
             audit_events,
         } = catalog
             .transact(
@@ -546,60 +553,14 @@ impl Coordinator {
             )
             .await?;
 
-        // Update in-memory cluster replica statuses.
-        // TODO(jkosh44) All these builtin table updates should be handled as a builtin source
-        // updates elsewhere.
         for (cluster_id, replica_id) in &cluster_replicas_to_drop {
-            let replica_statuses =
-                cluster_replica_statuses.remove_cluster_replica_statuses(cluster_id, replica_id);
-            for (process_id, status) in replica_statuses {
-                let builtin_table_update = catalog.state().pack_cluster_replica_status_update(
-                    *replica_id,
-                    process_id,
-                    &status,
-                    Diff::MINUS_ONE,
-                );
-                let builtin_table_update = catalog
-                    .state()
-                    .resolve_builtin_table_update(builtin_table_update);
-                builtin_table_updates.push(builtin_table_update);
-            }
+            cluster_replica_statuses.remove_cluster_replica_statuses(cluster_id, replica_id);
         }
         for cluster_id in &clusters_to_drop {
-            let cluster_statuses = cluster_replica_statuses.remove_cluster_statuses(cluster_id);
-            for (replica_id, replica_statuses) in cluster_statuses {
-                for (process_id, status) in replica_statuses {
-                    let builtin_table_update = catalog.state().pack_cluster_replica_status_update(
-                        replica_id,
-                        process_id,
-                        &status,
-                        Diff::MINUS_ONE,
-                    );
-                    let builtin_table_update = catalog
-                        .state()
-                        .resolve_builtin_table_update(builtin_table_update);
-                    builtin_table_updates.push(builtin_table_update);
-                }
-            }
+            cluster_replica_statuses.remove_cluster_statuses(cluster_id);
         }
         for cluster_id in clusters_to_create {
             cluster_replica_statuses.initialize_cluster_statuses(cluster_id);
-            for (replica_id, replica_statuses) in
-                cluster_replica_statuses.get_cluster_statuses(cluster_id)
-            {
-                for (process_id, status) in replica_statuses {
-                    let builtin_table_update = catalog.state().pack_cluster_replica_status_update(
-                        *replica_id,
-                        *process_id,
-                        status,
-                        Diff::ONE,
-                    );
-                    let builtin_table_update = catalog
-                        .state()
-                        .resolve_builtin_table_update(builtin_table_update);
-                    builtin_table_updates.push(builtin_table_update);
-                }
-            }
         }
         let now = to_datetime((catalog.config().now)());
         for (cluster_id, replica_name, num_processes) in cluster_replicas_to_create {
@@ -613,20 +574,6 @@ impl Coordinator {
                 num_processes,
                 now,
             );
-            for (process_id, status) in
-                cluster_replica_statuses.get_cluster_replica_statuses(cluster_id, replica_id)
-            {
-                let builtin_table_update = catalog.state().pack_cluster_replica_status_update(
-                    replica_id,
-                    *process_id,
-                    status,
-                    Diff::ONE,
-                );
-                let builtin_table_update = catalog
-                    .state()
-                    .resolve_builtin_table_update(builtin_table_update);
-                builtin_table_updates.push(builtin_table_update);
-            }
         }
 
         // Append our builtin table updates, then return the notify so we can run other tasks in
@@ -795,6 +742,9 @@ impl Coordinator {
             if update_metrics_config {
                 mz_metrics::update_dyncfg(&self.catalog().system_config().dyncfg_updates());
             }
+            if update_controller_config {
+                self.update_controller_config();
+            }
             if update_compute_config {
                 self.update_compute_config();
             }
@@ -858,26 +808,6 @@ impl Coordinator {
     }
 
     fn drop_replica(&mut self, cluster_id: ClusterId, replica_id: ReplicaId) {
-        if let Some(Some(ReplicaMetadata { metrics })) =
-            self.transient_replica_metadata.insert(replica_id, None)
-        {
-            let mut updates = vec![];
-            if let Some(metrics) = metrics {
-                let retractions = self.catalog().state().pack_replica_metric_updates(
-                    replica_id,
-                    &metrics,
-                    Diff::MINUS_ONE,
-                );
-                let retractions = self
-                    .catalog()
-                    .state()
-                    .resolve_builtin_table_updates(retractions);
-                updates.extend(retractions);
-            }
-            // We don't care about when the write finishes.
-            let _notify = self.builtin_table_update().background(updates);
-        }
-
         self.drop_introspection_subscribes(replica_id);
 
         self.controller
@@ -1287,6 +1217,12 @@ impl Coordinator {
             .collect::<Vec<_>>();
         self.update_storage_read_policies(storage_policies);
         self.update_compute_read_policies(compute_policies);
+    }
+
+    fn update_controller_config(&mut self) {
+        let sys_config = self.catalog().system_config();
+        self.controller
+            .update_configuration(sys_config.dyncfg_updates());
     }
 
     fn update_http_config(&mut self) {

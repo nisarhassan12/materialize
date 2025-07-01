@@ -1,6 +1,6 @@
 # Materialize Kubernetes Operator Helm Chart
 
-![Version: v25.2.0-beta.1](https://img.shields.io/badge/Version-v25.2.0--beta.1-informational?style=flat-square) ![Type: application](https://img.shields.io/badge/Type-application-informational?style=flat-square) ![AppVersion: v0.146.0-dev.0](https://img.shields.io/badge/AppVersion-v0.146.0--dev.0-informational?style=flat-square)
+![Version: v25.3.0-beta.1](https://img.shields.io/badge/Version-v25.3.0--beta.1-informational?style=flat-square) ![Type: application](https://img.shields.io/badge/Type-application-informational?style=flat-square) ![AppVersion: v0.149.0-dev.0](https://img.shields.io/badge/AppVersion-v0.149.0--dev.0-informational?style=flat-square)
 
 Materialize Kubernetes Operator Helm Chart
 
@@ -149,10 +149,9 @@ The following table lists the configurable parameters of the Materialize operato
 | `operator.clusters.defaultSizes.probe` |  | ``"mz_probe"`` |
 | `operator.clusters.defaultSizes.support` |  | ``"25cc"`` |
 | `operator.clusters.defaultSizes.system` |  | ``"25cc"`` |
-| `operator.features.authentication` | Whether to enable environmentd rbac checks TODO: this is not yet supported in the helm chart | ``false`` |
 | `operator.image.pullPolicy` | Policy for pulling the image: "IfNotPresent" avoids unnecessary re-pulling of images | ``"IfNotPresent"`` |
 | `operator.image.repository` | The Docker repository for the operator image | ``"materialize/orchestratord"`` |
-| `operator.image.tag` | The tag/version of the operator image to be used | ``"v0.145.0"`` |
+| `operator.image.tag` | The tag/version of the operator image to be used | ``"v0.148.0"`` |
 | `operator.nodeSelector` | Node selector to use for the operator pod | ``nil`` |
 | `operator.resources.limits` | Resource limits for the operator's CPU and memory | ``{"memory":"512Mi"}`` |
 | `operator.resources.requests` | Resources requested by the operator for CPU and memory | ``{"cpu":"100m","memory":"512Mi"}`` |
@@ -178,7 +177,7 @@ Specify each parameter using the `--set key=value[,key=value]` argument to `helm
 
 ```shell
 helm install my-materialize-operator \
-  --set operator.image.tag=v0.146.0-dev.0 \
+  --set operator.image.tag=v0.149.0-dev.0 \
   materialize/materialize-operator
 ```
 
@@ -213,7 +212,7 @@ metadata:
   name: 12345678-1234-1234-1234-123456789012
   namespace: materialize-environment
 spec:
-  environmentdImageRef: materialize/environmentd:v0.146.0-dev.0
+  environmentdImageRef: materialize/environmentd:v0.149.0-dev.0
   backendSecretName: materialize-backend
   environmentdResourceRequirements:
     limits:
@@ -296,11 +295,11 @@ Or check the `Chart.yaml` file in the `misc/helm-charts/operator` directory:
 apiVersion: v2
 name: materialize-operator
 # ...
-version: v25.2.0-beta-1
-appVersion: v0.130.3  # Use this version for your Materialize instances
+version: v25.3.0-beta-1
+appVersion: v0.147.0  # Use this version for your Materialize instances
 ```
 
-Use the `appVersion` (`v0.130.3` in this case) when updating your Materialize instances to ensure compatibility.
+Use the `appVersion` (`v0.147.0` in this case) when updating your Materialize instances to ensure compatibility.
 
 #### Using `kubectl` patch
 
@@ -311,7 +310,7 @@ For standard upgrades such as image updates:
 kubectl patch materialize <instance-name> \
   -n <materialize-instance-namespace> \
   --type='merge' \
-  -p "{\"spec\": {\"environmentdImageRef\": \"materialize/environmentd:v0.130.3\"}}"
+  -p "{\"spec\": {\"environmentdImageRef\": \"materialize/environmentd:v0.147.0\"}}"
 
 # Then trigger the rollout with a new UUID
 kubectl patch materialize <instance-name> \
@@ -326,7 +325,7 @@ You can combine both operations in a single command if preferred:
 kubectl patch materialize 12345678-1234-1234-1234-123456789012 \
   -n materialize-environment \
   --type='merge' \
-  -p "{\"spec\": {\"environmentdImageRef\": \"materialize/environmentd:v0.130.3\", \"requestRollout\": \"$(uuidgen)\"}}"
+  -p "{\"spec\": {\"environmentdImageRef\": \"materialize/environmentd:v0.147.0\", \"requestRollout\": \"$(uuidgen)\"}}"
 ```
 
 #### Using YAML Definition
@@ -340,7 +339,7 @@ metadata:
   name: 12345678-1234-1234-1234-123456789012
   namespace: materialize-environment
 spec:
-  environmentdImageRef: materialize/environmentd:v0.130.3 # Update version as needed
+  environmentdImageRef: materialize/environmentd:v0.147.0 # Update version as needed
   requestRollout: 22222222-2222-2222-2222-222222222222    # Generate new UUID
   forceRollout: 33333333-3333-3333-3333-333333333333      # Optional: for forced rollouts
   inPlaceRollout: false                                   # When false, performs a rolling upgrade rather than in-place

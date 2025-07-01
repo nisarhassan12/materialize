@@ -41,7 +41,6 @@ skip = [
     { name = "windows-sys", version = "0.52.0" },
     # Newer versions of crates like `tempfile` are held back by crates like `atty`.
     # This is very Unfortunate as we don't actually use these platforms.
-    { name = "hermit-abi", version = "0.3.9" },
     { name = "redox_syscall", version = "0.2.10" },
     { name = "redox_syscall", version = "0.4.1" },
 
@@ -90,7 +89,6 @@ skip = [
 
     { name = "hyper-timeout", version = "0.4.1" },
 
-    { name = "tungstenite", version = "0.21.0" },
     { name = "tungstenite", version = "0.24.0" },
     { name = "tokio-tungstenite", version = "0.24.0" },
 
@@ -116,6 +114,9 @@ skip = [
     { name = "rand_core", version = "0.6.2" },
     { name = "reqwest", version = "0.11.24" },
     { name = "rustls-pemfile", version = "1.0.4" },
+    # Used by reqwest
+    { name = "system-configuration", version = "0.5.1" },
+    { name = "system-configuration-sys", version = "0.5.0" },
     { name = "thiserror", version = "1.0.61" },
     { name = "thiserror-impl", version = "1.0.61" },
     { name = "twox-hash", version = "1.6.3" },
@@ -155,6 +156,8 @@ skip = [
     { name = "itertools", version = "0.13.0" },
     # Used by pprof
     { name = "nix", version = "0.26.4" },
+    # Used by dynfmt
+    { name = "erased-serde", version = "0.3.26" },
 ]
 
 [[bans.deny]]
@@ -191,6 +194,7 @@ name = "log"
 wrappers = [
     "azure_svc_blobstorage",
     "buildid",
+    "cookie_store",
     "deadpool-postgres",
     "eventsource-client",
     "fail",
@@ -199,6 +203,7 @@ wrappers = [
     "launchdarkly-server-sdk",
     "launchdarkly-server-sdk-evaluation",
     "native-tls",
+    "opentls",
     "os_info",
     "postgres",
     "pprof",

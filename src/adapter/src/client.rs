@@ -11,7 +11,7 @@ use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::fmt::{Debug, Display, Formatter};
 use std::future::Future;
-use std::pin;
+use std::pin::{self, Pin};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -33,7 +33,7 @@ use mz_ore::result::ResultExt;
 use mz_ore::task::AbortOnDropHandle;
 use mz_ore::thread::JoinOnDropHandle;
 use mz_ore::tracing::OpenTelemetryContext;
-use mz_repr::{CatalogItemId, ColumnIndex, Row, RowIterator, ScalarType};
+use mz_repr::{CatalogItemId, ColumnIndex, Row, ScalarType};
 use mz_sql::ast::{Raw, Statement};
 use mz_sql::catalog::{EnvironmentId, SessionCatalog};
 use mz_sql::session::hint::ApplicationNameHint;
@@ -376,7 +376,7 @@ Issue a SQL query to get started. Need help?
     pub async fn support_execute_one(
         &self,
         sql: &str,
-    ) -> Result<Box<dyn RowIterator>, anyhow::Error> {
+    ) -> Result<Pin<Box<dyn Stream<Item = PeekResponseUnary> + Send + Sync>>, anyhow::Error> {
         // Connect to the coordinator.
         let conn_id = self.new_conn_id()?;
         let session = self.new_session(SessionConfig {
@@ -402,15 +402,24 @@ Issue a SQL query to get started. Need help?
         session_client
             .declare(EMPTY_PORTAL.into(), stmt, sql.to_string())
             .await?;
+
         match session_client
             .execute(EMPTY_PORTAL.into(), futures::future::pending(), None)
             .await?
         {
-            (ExecuteResponse::SendingRows { future, .. }, _) => match future.await {
-                PeekResponseUnary::Rows(rows) => Ok(rows),
-                PeekResponseUnary::Canceled => bail!("query canceled"),
-                PeekResponseUnary::Error(e) => bail!(e),
-            },
+            (ExecuteResponse::SendingRowsStreaming { mut rows, .. }, _) => {
+                // We have to only drop the session client _after_ we read the
+                // result. Otherwise the peek will get cancelled right when we
+                // drop the session client. So we wrap it up in an extra stream
+                // like this, which owns the client and can return it.
+                let owning_response_stream = async_stream::stream! {
+                    while let Some(rows) = rows.next().await {
+                        yield rows;
+                    }
+                    drop(session_client);
+                };
+                Ok(Box::pin(owning_response_stream))
+            }
             r => bail!("unsupported response type: {r:?}"),
         }
     }
@@ -1074,16 +1083,26 @@ impl Timeout {
     }
 }
 
-/// A wrapper around an UnboundedReceiver of PeekResponseUnary that records when it sees the
-/// first row data in the given histogram
+/// A wrapper around a Stream of PeekResponseUnary that records when it sees the
+/// first row data in the given histogram. It also keeps track of whether we have already observed
+/// the end of the underlying stream.
 #[derive(Derivative)]
 #[derivative(Debug)]
 pub struct RecordFirstRowStream {
+    /// The underlying stream of rows.
     #[derivative(Debug = "ignore")]
     pub rows: Box<dyn Stream<Item = PeekResponseUnary> + Unpin + Send + Sync>,
+    /// The Instant when execution started.
     pub execute_started: Instant,
+    /// The histogram where the time since `execute_started` will be recorded when we see the first
+    /// row.
     pub time_to_first_row_seconds: Histogram,
-    saw_rows: bool,
+    /// Whether we've seen any rows.
+    pub saw_rows: bool,
+    /// The Instant when we saw the first row.
+    pub recorded_first_row_instant: Option<Instant>,
+    /// Whether we have already observed the end of the underlying stream.
+    pub no_more_rows: bool,
 }
 
 impl RecordFirstRowStream {
@@ -1101,6 +1120,8 @@ impl RecordFirstRowStream {
             execute_started,
             time_to_first_row_seconds: histogram,
             saw_rows: false,
+            recorded_first_row_instant: None,
+            no_more_rows: false,
         }
     }
 
@@ -1149,6 +1170,10 @@ impl RecordFirstRowStream {
             self.saw_rows = true;
             self.time_to_first_row_seconds
                 .observe(self.execute_started.elapsed().as_secs_f64());
+            self.recorded_first_row_instant = Some(Instant::now());
+        }
+        if msg.is_none() {
+            self.no_more_rows = true;
         }
         msg
     }

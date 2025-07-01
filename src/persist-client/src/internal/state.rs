@@ -9,6 +9,7 @@
 
 use anyhow::ensure;
 use async_stream::{stream, try_stream};
+use differential_dataflow::difference::Semigroup;
 use mz_persist::metrics::ColumnarMetrics;
 use std::borrow::Cow;
 use std::cmp::Ordering;
@@ -119,6 +120,12 @@ pub(crate) const GC_USE_ACTIVE_GC: Config<bool> = Config::new(
     "persist_gc_use_active_gc",
     false,
     "Whether to use the new active GC tracking mechanism.",
+);
+
+pub(crate) const ENABLE_INCREMENTAL_COMPACTION: Config<bool> = Config::new(
+    "persist_enable_incremental_compaction",
+    false,
+    "Whether to enable incremental compaction.",
 );
 
 /// A token to disambiguate state commands that could not otherwise be
@@ -366,6 +373,17 @@ impl<T: Timestamp + Codec64> BatchPart<T> {
             }
         }
     }
+
+    pub fn diffs_sum<D: Codec64 + Semigroup>(&self, metrics: &ColumnarMetrics) -> Option<D> {
+        match self {
+            BatchPart::Hollow(x) => x.diffs_sum.map(D::decode),
+            BatchPart::Inline { updates, .. } => updates
+                .decode::<T>(metrics)
+                .expect("valid inline part")
+                .updates
+                .diffs_sum(),
+        }
+    }
 }
 
 /// An ordered list of parts, generally stored as part of a larger run.
@@ -393,6 +411,8 @@ pub struct HollowRunRef<T> {
     /// The lower bound of the data in this part, ordered by the structured ordering.
     pub structured_key_lower: Option<LazyProto<ProtoArrayData>>,
 
+    pub diffs_sum: Option<[u8; 8]>,
+
     pub(crate) _phantom_data: PhantomData<T>,
 }
 impl<T: Eq> PartialOrd<Self> for HollowRunRef<T> {
@@ -415,7 +435,7 @@ impl<T> HollowRunRef<T> {
 
 impl<T: Timestamp + Codec64> HollowRunRef<T> {
     /// Stores the given runs and returns a [HollowRunRef] that points to them.
-    pub async fn set(
+    pub async fn set<D: Codec64 + Semigroup>(
         shard_id: ShardId,
         blob: &dyn Blob,
         writer: &WriterKey,
@@ -438,6 +458,19 @@ impl<T: Timestamp + Codec64> HollowRunRef<T> {
             Some(RunPart::Single(BatchPart::Hollow(p))) => p.structured_key_lower.clone(),
             Some(RunPart::Single(BatchPart::Inline { .. })) | None => None,
         };
+        let diffs_sum = data
+            .parts
+            .iter()
+            .map(|p| {
+                p.diffs_sum::<D>(&metrics.columnar)
+                    .expect("valid diffs sum")
+            })
+            .reduce(|mut a, b| {
+                a.plus_equals(&b);
+                a
+            })
+            .expect("valid diffs sum")
+            .encode();
 
         let key = PartialBatchKey::new(writer, &PartId::new());
         let blob_key = key.complete(&shard_id);
@@ -452,6 +485,7 @@ impl<T: Timestamp + Codec64> HollowRunRef<T> {
             max_part_bytes,
             key_lower,
             structured_key_lower,
+            diffs_sum: Some(diffs_sum),
             _phantom_data: Default::default(),
         }
     }
@@ -603,6 +637,18 @@ impl<T> RunPart<T> {
     }
 }
 
+impl<T> RunPart<T>
+where
+    T: Timestamp + Codec64,
+{
+    pub fn diffs_sum<D: Codec64 + Semigroup>(&self, metrics: &ColumnarMetrics) -> Option<D> {
+        match self {
+            Self::Single(p) => p.diffs_sum(metrics),
+            Self::Many(hollow_run) => hollow_run.diffs_sum.map(D::decode),
+        }
+    }
+}
+
 /// A blob was missing!
 #[derive(Clone, Debug)]
 pub struct MissingBlob(BlobKey);
@@ -692,6 +738,41 @@ pub(crate) enum RunOrder {
     Structured,
 }
 
+#[derive(Clone, PartialEq, Eq, Ord, PartialOrd, Serialize)]
+pub struct RunId(pub(crate) [u8; 16]);
+
+impl std::fmt::Display for RunId {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(f, "ri{}", Uuid::from_bytes(self.0))
+    }
+}
+
+impl std::fmt::Debug for RunId {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(f, "RunId({})", Uuid::from_bytes(self.0))
+    }
+}
+
+impl std::str::FromStr for RunId {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        parse_id('r', "RunId", s).map(RunId)
+    }
+}
+
+impl From<RunId> for String {
+    fn from(x: RunId) -> Self {
+        x.to_string()
+    }
+}
+
+impl RunId {
+    pub(crate) fn new() -> Self {
+        RunId(*Uuid::new_v4().as_bytes())
+    }
+}
+
 /// Metadata shared across a run.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Ord, PartialOrd, Serialize)]
 pub struct RunMeta {
@@ -702,6 +783,9 @@ pub struct RunMeta {
 
     /// ID of a schema that has since been deprecated and exists only to cleanly roundtrip.
     pub(crate) deprecated_schema: Option<SchemaId>,
+
+    /// If set, a UUID that uniquely identifies this run.
+    pub(crate) id: Option<RunId>,
 }
 
 /// A subset of a [HollowBatch] corresponding 1:1 to a blob.
@@ -869,7 +953,7 @@ impl<T: Ord> Ord for HollowBatch<T> {
 }
 
 impl<T: Timestamp + Codec64 + Sync> HollowBatch<T> {
-    pub fn part_stream<'a>(
+    pub(crate) fn part_stream<'a>(
         &'a self,
         shard_id: ShardId,
         blob: &'a dyn Blob,
@@ -973,11 +1057,11 @@ impl<T> HollowBatch<T> {
         self.parts.iter().map(|x| x.inline_bytes()).sum()
     }
 
-    pub fn is_empty(&self) -> bool {
+    pub(crate) fn is_empty(&self) -> bool {
         self.parts.is_empty()
     }
 
-    pub fn part_count(&self) -> usize {
+    pub(crate) fn part_count(&self) -> usize {
         self.parts.len()
     }
 
@@ -1684,9 +1768,10 @@ where
         Continue(merge_reqs)
     }
 
-    pub fn apply_merge_res(
+    pub fn apply_merge_res<D: Codec64 + Semigroup + PartialEq>(
         &mut self,
         res: &FueledMergeRes<T>,
+        metrics: &ColumnarMetrics,
     ) -> ControlFlow<NoOpStateTransition<ApplyMergeResult>, ApplyMergeResult> {
         // We expire all writers if the upper and since both advance to the
         // empty antichain. Gracefully handle this. At the same time,
@@ -1696,7 +1781,7 @@ where
             return Break(NoOpStateTransition(ApplyMergeResult::NotAppliedNoMatch));
         }
 
-        let apply_merge_result = self.trace.apply_merge_res(res);
+        let apply_merge_result = self.trace.apply_merge_res_checked::<D>(res, metrics);
         Continue(apply_merge_result)
     }
 
@@ -2051,7 +2136,7 @@ where
             let fake_merge = FueledMergeRes {
                 output: HollowBatch::empty(desc),
             };
-            let result = self.trace.apply_merge_res(&fake_merge);
+            let result = self.trace.apply_tombstone_merge(&fake_merge);
             assert!(
                 result.matched(),
                 "merge with a matching desc should always match"
@@ -3662,7 +3747,7 @@ pub(crate) mod tests {
 
         // When a writer is present, non-writes don't gc.
         let writer_id = WriterId::new();
-        state.collections.compare_and_append(
+        let _ = state.collections.compare_and_append(
             &hollow(1, 2, &["key1"], 1),
             &writer_id,
             now,
@@ -3777,7 +3862,7 @@ pub(crate) mod tests {
         // When a writer is present, non-writes don't gc.
         let writer_id = WriterId::new();
         let now = SYSTEM_TIME.clone();
-        state.collections.compare_and_append(
+        let _ = state.collections.compare_and_append(
             &hollow(1, 2, &["key1"], 1),
             &writer_id,
             now(),

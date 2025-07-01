@@ -53,7 +53,7 @@ not suitable for full feature set evaluations or production workloads.
    been already downloaded.
 
    ```sh
-   docker run -d -p 127.0.0.1:6874:6874 -p 127.0.0.1:6875:6875 -p 127.0.0.1:6876:6876 materialize/materialized:{{< version >}}
+   docker run -d -p 127.0.0.1:6874:6874 -p 127.0.0.1:6875:6875 -p 127.0.0.1:6876:6876 materialize/materialized:v0.147.1
    ```
 
    When running locally:
@@ -99,7 +99,9 @@ not suitable for full feature set evaluations or production workloads.
   Cloud
   account](https://materialize.com/register/?utm_campaign=General&utm_source=documentation).
   The full experience of Materialize is also available as a self-managed
-  offering. See [Self-managed Materialize](/self-managed/).
+  offering. See [Self-managed Materialize].
+
+[Self-managed Materialize]: https://materialize.com/docs/self-managed/v25.2/
 
 ### Technical Support
 

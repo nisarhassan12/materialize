@@ -63,7 +63,6 @@ from materialize.ui import (
     CommandFailureCausedUIError,
     UIError,
 )
-from materialize.xcompile import Arch
 
 
 class UnknownCompositionError(UIError):
@@ -206,22 +205,6 @@ class Composition:
                 if image_name not in self.repo.images:
                     raise UIError(f"mzcompose: unknown image {image_name}")
                 image = self.repo.images[image_name]
-                if "platform" in config:
-                    # Intentionally not copying the image.rd so that the
-                    # repository details of dependencies are also switched to
-                    # the wanted architecture. An alternative would be to
-                    # iterate over all the dependencies and change their arch
-                    # too, but this is messy. Architecting a cleaner approach
-                    # is probably not worth it since the platform-checks
-                    # scenarios for the x86-64-aarch64 migration are supposed
-                    # to be temporary.
-                    # image.rd = copy.deepcopy(image.rd)
-                    if config["platform"] == "linux/amd64":
-                        image.rd.arch = Arch.X86_64
-                    elif config["platform"] == "linux/arm64/v8":
-                        image.rd.arch = Arch.AARCH64
-                    else:
-                        raise ValueError(f"Unknown platform {config['platform']}")
                 if config.get("publish") is not None:
                     # Override whether an image is expected to be published, so
                     # that we will build it in CI instead of failing.
@@ -316,7 +299,16 @@ class Composition:
         """
 
         if not self.silent and not silent:
-            print(f"$ docker compose {' '.join(args)}", file=sys.stderr)
+            # Don't print out secrets in test logs
+            filtered_args = [
+                (
+                    "[REDACTED]"
+                    if "mzp_" in arg or "-----BEGIN PRIVATE KEY-----" in arg
+                    else arg
+                )
+                for arg in args
+            ]
+            print(f"$ docker compose {' '.join(filtered_args)}", file=sys.stderr)
 
         stdout = None
         if capture:
@@ -799,6 +791,7 @@ class Composition:
         *args: str,
         rm: bool = False,
         mz_service: str | None = None,
+        quiet: bool = False,
     ) -> subprocess.CompletedProcess:
         if mz_service is not None:
             args = tuple(
@@ -814,7 +807,9 @@ class Composition:
             *args,
             rm=rm,
             # needed for sufficient error information in the junit.xml while still printing to stdout during execution
-            capture_and_print=True,
+            capture_and_print=not quiet,
+            capture=quiet,
+            capture_stderr=quiet,
             env_extra=environment,
         )
 

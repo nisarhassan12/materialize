@@ -30,14 +30,17 @@ from materialize.mz_version import MzVersion
 MZ_ROOT = Path(os.environ["MZ_ROOT"])
 
 
-def get_lts_versions() -> list[MzVersion]:
+def get_self_managed_versions() -> list[MzVersion]:
+    prefixes = set()
     result = set()
     for entry in yaml.safe_load(
         requests.get("https://materializeinc.github.io/materialize/index.yaml").text
     )["entries"]["materialize-operator"]:
         version = MzVersion.parse_mz(entry["appVersion"])
-        if not version.prerelease:
+        prefix = (version.major, version.minor)
+        if not version.prerelease and prefix not in prefixes:
             result.add(version)
+            prefixes.add(prefix)
     return sorted(result)
 
 

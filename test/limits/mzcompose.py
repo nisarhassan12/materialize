@@ -14,6 +14,7 @@ to prevent regressions in basic functionality for larger installations.
 
 import contextlib
 import json
+import re
 import sys
 import time
 import traceback
@@ -22,7 +23,7 @@ from io import StringIO
 from textwrap import dedent
 from urllib.parse import quote
 
-from materialize import buildkite
+from materialize import MZ_ROOT, buildkite
 from materialize.mzcompose.composition import Composition, WorkflowArgumentParser
 from materialize.mzcompose.services.balancerd import Balancerd
 from materialize.mzcompose.services.clusterd import Clusterd
@@ -91,6 +92,16 @@ class Generator:
         print("DROP SCHEMA IF EXISTS public CASCADE;")
         print(f"CREATE SCHEMA public /* {cls} */;")
         print("GRANT ALL PRIVILEGES ON SCHEMA public TO materialize")
+        print(f'GRANT ALL PRIVILEGES ON SCHEMA public TO "{ADMIN_USER}"')
+        print(
+            f'GRANT ALL PRIVILEGES ON CLUSTER single_replica_cluster TO "{ADMIN_USER}";',
+        )
+        print(
+            f'GRANT ALL PRIVILEGES ON CLUSTER single_worker_cluster TO "{ADMIN_USER}";',
+        )
+        print(
+            f'GRANT ALL PRIVILEGES ON CLUSTER quickstart TO "{ADMIN_USER}";',
+        )
 
     @classmethod
     def body(cls) -> None:
@@ -1587,8 +1598,6 @@ class PostgresTables(Generator):
 
 
 class PostgresTablesOldSyntax(Generator):
-    MAX_COUNT = 1500  # Too long-running with count=1800
-
     @classmethod
     def body(cls) -> None:
         print("> SET statement_timeout='300s'")
@@ -1623,6 +1632,7 @@ class PostgresTablesOldSyntax(Generator):
           FROM POSTGRES CONNECTION pg (PUBLICATION 'mz_source') FOR SCHEMAS (public)
           """
         )
+        print("> SET TRANSACTION_ISOLATION TO 'SERIALIZABLE';")
         for i in cls.all():
             print("$ set-sql-timeout duration=300s")
             cls.store_explain_and_run(f"SELECT * FROM t{i}")
@@ -1811,6 +1821,7 @@ SERVICES = [
         sanity_restart=False,
         external_metadata_store=True,
         metadata_store="cockroach",
+        listeners_config_path=f"{MZ_ROOT}/src/materialized/ci/listener_configs/no_auth_https.json",
     ),
     Mz(app_password=""),
 ]
@@ -1834,12 +1845,12 @@ service_names = [
     "frontegg-mock",
     "cockroach",
     "clusterd_1_1_1",
+    "clusterd_1_1_2",
     "clusterd_1_2_1",
+    "clusterd_1_2_2",
     "clusterd_2_1_1",
-    "clusterd_2_2_1",
+    "clusterd_2_1_2",
     "clusterd_3_1_1",
-    "clusterd_3_2_1",
-    "clusterd_4_1_1",
 ]
 
 
@@ -1851,33 +1862,40 @@ def setup(c: Composition, workers: int) -> None:
         port=6877,
         user="mz_system",
     )
+    # Ensure the admin user exists
+    c.sql(
+        "SELECT 1;",
+        port=6875,
+        user=ADMIN_USER,
+        password=app_password(ADMIN_USER),
+    )
 
     c.sql(
         f"""
         DROP CLUSTER quickstart cascade;
         CREATE CLUSTER quickstart REPLICAS (
             replica1 (
-                STORAGECTL ADDRESSES ['clusterd_1_1_1:2100', 'clusterd_1_2_1:2100'],
-                STORAGE ADDRESSES ['clusterd_1_1_1:2103', 'clusterd_1_2_1:2103'],
-                COMPUTECTL ADDRESSES ['clusterd_1_1_1:2101', 'clusterd_1_2_1:2101'],
-                COMPUTE ADDRESSES ['clusterd_1_1_1:2102', 'clusterd_1_2_1:2102'],
+                STORAGECTL ADDRESSES ['clusterd_1_1_1:2100', 'clusterd_1_1_2:2100'],
+                STORAGE ADDRESSES ['clusterd_1_1_1:2103', 'clusterd_1_1_2:2103'],
+                COMPUTECTL ADDRESSES ['clusterd_1_1_1:2101', 'clusterd_1_1_2:2101'],
+                COMPUTE ADDRESSES ['clusterd_1_1_1:2102', 'clusterd_1_1_2:2102'],
                 WORKERS {workers}
             ),
             replica2 (
-                STORAGECTL ADDRESSES ['clusterd_2_1_1:2100', 'clusterd_2_2_1:2100'],
-                STORAGE ADDRESSES ['clusterd_2_1_1:2103', 'clusterd_2_2_1:2103'],
-                COMPUTECTL ADDRESSES ['clusterd_2_1_1:2101', 'clusterd_2_2_1:2101'],
-                COMPUTE ADDRESSES ['clusterd_2_1_1:2102', 'clusterd_2_2_1:2102'],
+                STORAGECTL ADDRESSES ['clusterd_1_2_1:2100', 'clusterd_1_2_2:2100'],
+                STORAGE ADDRESSES ['clusterd_1_2_1:2103', 'clusterd_1_2_2:2103'],
+                COMPUTECTL ADDRESSES ['clusterd_1_2_1:2101', 'clusterd_1_2_2:2101'],
+                COMPUTE ADDRESSES ['clusterd_1_2_1:2102', 'clusterd_1_2_2:2102'],
                 WORKERS {workers}
             )
         );
         DROP CLUSTER IF EXISTS single_replica_cluster CASCADE;
         CREATE CLUSTER single_replica_cluster REPLICAS (
             replica1 (
-                STORAGECTL ADDRESSES ['clusterd_3_1_1:2100', 'clusterd_3_2_1:2100'],
-                STORAGE ADDRESSES ['clusterd_3_1_1:2103', 'clusterd_3_2_1:2103'],
-                COMPUTECTL ADDRESSES ['clusterd_3_1_1:2101', 'clusterd_3_2_1:2101'],
-                COMPUTE ADDRESSES ['clusterd_3_1_1:2102', 'clusterd_3_2_1:2102'],
+                STORAGECTL ADDRESSES ['clusterd_2_1_1:2100', 'clusterd_2_1_2:2100'],
+                STORAGE ADDRESSES ['clusterd_2_1_1:2103', 'clusterd_2_1_2:2103'],
+                COMPUTECTL ADDRESSES ['clusterd_2_1_1:2101', 'clusterd_2_1_2:2101'],
+                COMPUTE ADDRESSES ['clusterd_2_1_1:2102', 'clusterd_2_1_2:2102'],
                 WORKERS {workers}
             )
         );
@@ -1885,14 +1903,16 @@ def setup(c: Composition, workers: int) -> None:
         DROP CLUSTER IF EXISTS single_worker_cluster CASCADE;
         CREATE CLUSTER single_worker_cluster REPLICAS (
             replica1 (
-                STORAGECTL ADDRESSES ['clusterd_4_1_1:2100'],
-                STORAGE ADDRESSES ['clusterd_4_1_1:2103'],
-                COMPUTECTL ADDRESSES ['clusterd_4_1_1:2101'],
-                COMPUTE ADDRESSES ['clusterd_4_1_1:2102'],
+                STORAGECTL ADDRESSES ['clusterd_3_1_1:2100'],
+                STORAGE ADDRESSES ['clusterd_3_1_1:2103'],
+                COMPUTECTL ADDRESSES ['clusterd_3_1_1:2101'],
+                COMPUTE ADDRESSES ['clusterd_3_1_1:2102'],
                 WORKERS 1
             )
         );
         GRANT ALL PRIVILEGES ON CLUSTER single_replica_cluster TO materialize;
+        GRANT ALL PRIVILEGES ON CLUSTER single_replica_cluster TO "{ADMIN_USER}";
+        GRANT ALL PRIVILEGES ON CLUSTER quickstart TO "{ADMIN_USER}";
     """,
         port=6877,
         user="mz_system",
@@ -1985,15 +2005,57 @@ def workflow_main(c: Composition, parser: WorkflowArgumentParser) -> None:
     if not scenarios:
         return
 
-    setup(c, args.workers)
+    with c.override(
+        Clusterd(
+            name="clusterd_1_1_1",
+            workers=args.workers,
+            process_names=["clusterd_1_1_1", "clusterd_1_1_2"],
+        ),
+        Clusterd(
+            name="clusterd_1_1_2",
+            workers=args.workers,
+            process_names=["clusterd_1_1_1", "clusterd_1_1_2"],
+        ),
+        Clusterd(
+            name="clusterd_1_2_1",
+            workers=args.workers,
+            process_names=["clusterd_1_2_1", "clusterd_1_2_2"],
+        ),
+        Clusterd(
+            name="clusterd_1_2_2",
+            workers=args.workers,
+            process_names=["clusterd_1_2_1", "clusterd_1_2_2"],
+        ),
+        Clusterd(
+            name="clusterd_2_1_1",
+            workers=args.workers,
+            process_names=["clusterd_2_1_1", "clusterd_2_1_2"],
+        ),
+        Clusterd(
+            name="clusterd_2_1_2",
+            workers=args.workers,
+            process_names=["clusterd_2_1_1", "clusterd_2_1_2"],
+        ),
+        Clusterd(
+            name="clusterd_3_1_1",
+            workers=1,
+        ),
+    ):
+        run_scenarios(c, scenarios, args.find_limit, args.workers)
 
+
+def run_scenarios(
+    c: Composition, scenarios: list[type[Generator]], find_limit: bool, workers: int
+):
     c.up("testdrive", persistent=True)
+
+    setup(c, workers)
 
     failures: list[TestFailureDetails] = []
     stats: dict[tuple[type[Generator], int], Statistics] = {}
 
     for scenario in scenarios:
-        if args.find_limit:
+        if find_limit:
             good_count = None
             bad_count = None
             while True:
@@ -2023,10 +2085,16 @@ def workflow_main(c: Composition, parser: WorkflowArgumentParser) -> None:
                             if i > 10:
                                 raise
                             i += 1
-                            traceback.print_exc()
+                            print(
+                                re.sub(
+                                    r"mzp_[a-z1-9]*",
+                                    "[REDACTED]",
+                                    traceback.format_exc(),
+                                )
+                            )
                             print("Retrying in a minute...")
                             time.sleep(60)
-                    setup(c, args.workers)
+                    setup(c, workers)
 
                     bad_count = scenario.COUNT
                     previous_count = scenario.COUNT
@@ -2054,7 +2122,7 @@ def workflow_main(c: Composition, parser: WorkflowArgumentParser) -> None:
                             password=app_password(ADMIN_USER),
                         ) as cur:
                             start_time = time.time()
-                            cur.execute(scenario.EXPLAIN)
+                            cur.execute(scenario.EXPLAIN.encode())
                             explain_wallclock = time.time() - start_time
                             explain_wallclock_str = (
                                 f", explain took {explain_wallclock:.2f} s"
@@ -2095,7 +2163,7 @@ def workflow_main(c: Composition, parser: WorkflowArgumentParser) -> None:
                     )
                 )
 
-    if args.find_limit:
+    if find_limit:
         upload_results_to_test_analytics(c, stats, not failures)
 
     if failures:
@@ -2151,12 +2219,23 @@ def workflow_instance_size(c: Composition, parser: WorkflowArgumentParser) -> No
     )
 
     # Construct the requied Clusterd instances and peer them into clusters
-    nodes = []
+    node_names = []
+    node_overrides = []
     for cluster_id in range(1, args.clusters + 1):
         for replica_id in range(1, args.replicas + 1):
-            for node_id in range(1, args.nodes + 1):
-                node_name = f"clusterd_{cluster_id}_{replica_id}_{node_id}"
-                nodes.append(node_name)
+            names = [
+                f"clusterd_{cluster_id}_{replica_id}_{i}"
+                for i in range(1, args.nodes + 1)
+            ]
+            for node_name in names:
+                node_names.append(node_name)
+                node_overrides.append(
+                    Clusterd(
+                        name=node_name,
+                        workers=args.workers,
+                        process_names=names,
+                    )
+                )
 
     with c.override(
         Testdrive(
@@ -2164,9 +2243,10 @@ def workflow_instance_size(c: Composition, parser: WorkflowArgumentParser) -> No
             materialize_url=f"postgres://{quote(ADMIN_USER)}:{app_password(ADMIN_USER)}@balancerd:6875?sslmode=require",
             materialize_use_https=True,
             no_reset=True,
-        )
+        ),
+        *node_overrides,
     ):
-        c.up(*nodes)
+        c.up(*node_names)
 
         # Increase resource limits
         c.testdrive(
@@ -2178,6 +2258,8 @@ def workflow_instance_size(c: Composition, parser: WorkflowArgumentParser) -> No
 
                 CREATE CLUSTER single_replica_cluster SIZE = '4';
                 GRANT ALL ON CLUSTER single_replica_cluster TO materialize;
+                GRANT ALL ON CLUSTER single_replica_cluster TO "{ADMIN_USER}";
+                GRANT ALL PRIVILEGES ON SCHEMA public TO "{ADMIN_USER}";
                 """
             )
         )
@@ -2241,6 +2323,11 @@ def workflow_instance_size(c: Composition, parser: WorkflowArgumentParser) -> No
             )
             c.sql(
                 f"GRANT ALL PRIVILEGES ON CLUSTER cluster_u{cluster_id} TO materialize",
+                port=6877,
+                user="mz_system",
+            )
+            c.sql(
+                f'GRANT ALL PRIVILEGES ON CLUSTER cluster_u{cluster_id} TO "{ADMIN_USER}"',
                 port=6877,
                 user="mz_system",
             )

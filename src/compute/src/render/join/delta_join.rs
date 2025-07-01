@@ -15,7 +15,6 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use columnar::Columnar;
 use differential_dataflow::IntoOwned;
 use differential_dataflow::consolidation::ConsolidatingContainerBuilder;
 use differential_dataflow::operators::arrange::Arranged;
@@ -36,15 +35,13 @@ use timely::progress::Antichain;
 use timely::progress::timestamp::Refines;
 
 use crate::render::RenderTimestamp;
-use crate::render::context::{ArrangementFlavor, CollectionBundle, Context, ShutdownToken};
+use crate::render::context::{ArrangementFlavor, CollectionBundle, Context, ShutdownProbe};
 use crate::typedefs::{RowRowAgent, RowRowEnter};
 
 impl<G> Context<G>
 where
     G: Scope,
     G::Timestamp: RenderTimestamp,
-    <G::Timestamp as Columnar>::Container: Clone + Send,
-    for<'a> <G::Timestamp as Columnar>::Ref<'a>: Ord + Copy,
 {
     /// Renders `MirRelationExpr:Join` using dogs^3 delta query dataflows.
     ///
@@ -212,7 +209,7 @@ where
                                             stream_thinning,
                                             |t1, t2| t1.le(t2),
                                             closure,
-                                            self.shutdown_token.clone(),
+                                            self.shutdown_probe.clone(),
                                         )
                                     } else {
                                         build_halfjoin::<_, RowRowAgent<_, _>, _>(
@@ -222,7 +219,7 @@ where
                                             stream_thinning,
                                             |t1, t2| t1.lt(t2),
                                             closure,
-                                            self.shutdown_token.clone(),
+                                            self.shutdown_probe.clone(),
                                         )
                                     }
                                 }
@@ -235,7 +232,7 @@ where
                                             stream_thinning,
                                             |t1, t2| t1.le(t2),
                                             closure,
-                                            self.shutdown_token.clone(),
+                                            self.shutdown_probe.clone(),
                                         )
                                     } else {
                                         build_halfjoin::<_, RowRowEnter<_, _, _>, _>(
@@ -245,7 +242,7 @@ where
                                             stream_thinning,
                                             |t1, t2| t1.lt(t2),
                                             closure,
-                                            self.shutdown_token.clone(),
+                                            self.shutdown_probe.clone(),
                                         )
                                     }
                                 }
@@ -329,7 +326,7 @@ fn build_halfjoin<G, Tr, CF>(
     prev_thinning: Vec<usize>,
     comparison: CF,
     closure: JoinClosure,
-    shutdown_token: ShutdownToken,
+    shutdown_probe: ShutdownProbe,
 ) -> (
     Collection<G, (Row, G::Timestamp), Diff>,
     Collection<G, DataflowError, Diff>,
@@ -337,8 +334,6 @@ fn build_halfjoin<G, Tr, CF>(
 where
     G: Scope,
     G::Timestamp: RenderTimestamp,
-    <G::Timestamp as Columnar>::Container: Clone + Send,
-    for<'a> <G::Timestamp as Columnar>::Ref<'a>: Ord + Copy,
     Tr: TraceReader<Time = G::Timestamp, Diff = Diff> + Clone + 'static,
     for<'a> Tr::Key<'a>: IntoOwned<'a, Owned = Row>,
     for<'a> Tr::Val<'a>: ToDatumIter,
@@ -384,7 +379,7 @@ where
             move |key, stream_row, lookup_row, initial, time, diff1, diff2| {
                 // Check the shutdown token to avoid doing unnecessary work when the dataflow is
                 // shutting down.
-                shutdown_token.probe()?;
+                shutdown_probe.probe()?;
 
                 let mut row_builder = SharedRow::get();
                 let temp_storage = RowArena::new();
@@ -430,7 +425,7 @@ where
             move |key, stream_row, lookup_row, initial, time, diff1, diff2| {
                 // Check the shutdown token to avoid doing unnecessary work when the dataflow is
                 // shutting down.
-                shutdown_token.probe()?;
+                shutdown_probe.probe()?;
 
                 let mut row_builder = SharedRow::get();
                 let temp_storage = RowArena::new();
@@ -467,8 +462,6 @@ fn build_update_stream<G, Tr>(
 where
     G: Scope,
     G::Timestamp: RenderTimestamp,
-    <G::Timestamp as Columnar>::Container: Clone + Send,
-    for<'a> <G::Timestamp as Columnar>::Ref<'a>: Ord + Copy,
     for<'a, 'b> &'a G::Timestamp: PartialEq<Tr::TimeGat<'b>>,
     Tr: for<'a> TraceReader<Time = G::Timestamp, Diff = Diff> + Clone + 'static,
     for<'a> Tr::Key<'a>: ToDatumIter,

@@ -59,7 +59,7 @@ use timely::dataflow::{Scope, StreamCore};
 use timely::progress::timestamp::Timestamp;
 use tracing::trace;
 
-use crate::render::context::ShutdownToken;
+use crate::render::context::ShutdownProbe;
 
 /// Joins two arranged collections with the same key type.
 ///
@@ -69,7 +69,7 @@ use crate::render::context::ShutdownToken;
 pub(super) fn mz_join_core<G, Tr1, Tr2, L, I, YFn, C>(
     arranged1: &Arranged<G, Tr1>,
     arranged2: &Arranged<G, Tr2>,
-    shutdown_token: ShutdownToken,
+    shutdown_probe: ShutdownProbe,
     mut result: L,
     yield_fn: YFn,
 ) -> StreamCore<G, C>
@@ -215,7 +215,7 @@ where
 
             move |input1, input2, output| {
                 // If the dataflow is shutting down, discard all existing and future work.
-                if shutdown_token.in_shutdown() {
+                if shutdown_probe.in_shutdown() {
                     trace!(operator_id, "shutting down");
 
                     // Discard data at the inputs.
@@ -523,26 +523,24 @@ where
 /// The structure wraps cursors which allow us to play out join computation at whatever rate we like.
 /// This allows us to avoid producing and buffering massive amounts of data, without giving the timely
 /// dataflow system a chance to run operators that can consume and aggregate the data.
-struct Deferred<T, C1, C2, D>
+struct Deferred<C1, C2, D>
 where
-    T: Timestamp,
-    C1: Cursor<Time = T, Diff = Diff>,
-    C2: for<'a> Cursor<Key<'a> = C1::Key<'a>, Time = T, Diff = Diff>,
+    C1: Cursor<Diff = Diff>,
+    C2: for<'a> Cursor<Key<'a> = C1::Key<'a>, Time = C1::Time, Diff = Diff>,
 {
     cursor1: C1,
     storage1: C1::Storage,
     cursor2: C2,
     storage2: C2::Storage,
-    capability: Capability<T>,
+    capability: Capability<C1::Time>,
     done: bool,
-    temp: Vec<(D, T, Diff)>,
+    temp: Vec<(D, C1::Time, Diff)>,
 }
 
-impl<T, C1, C2, D> Deferred<T, C1, C2, D>
+impl<C1, C2, D> Deferred<C1, C2, D>
 where
-    T: Timestamp + Lattice,
-    C1: Cursor<Time = T, Diff = Diff>,
-    C2: for<'a> Cursor<Key<'a> = C1::Key<'a>, Time = T, Diff = Diff>,
+    C1: Cursor<Diff = Diff>,
+    C2: for<'a> Cursor<Key<'a> = C1::Key<'a>, Time = C1::Time, Diff = Diff>,
     D: Data,
 {
     fn new(
@@ -550,7 +548,7 @@ where
         storage1: C1::Storage,
         cursor2: C2,
         storage2: C2::Storage,
-        capability: Capability<T>,
+        capability: Capability<C1::Time>,
     ) -> Self {
         Deferred {
             cursor1,
@@ -570,7 +568,7 @@ where
     /// Process keys until at least `fuel` output tuples produced, or the work is exhausted.
     fn work<L, I, YFn, C>(
         &mut self,
-        output: &mut OutputHandleCore<T, CapacityContainerBuilder<C>, Tee<T, C>>,
+        output: &mut OutputHandleCore<C1::Time, CapacityContainerBuilder<C>, Tee<C1::Time, C>>,
         mut logic: L,
         yield_fn: YFn,
         work: &mut usize,
@@ -578,7 +576,7 @@ where
         I: IntoIterator<Item = D>,
         L: FnMut(C1::Key<'_>, C1::Val<'_>, C2::Val<'_>) -> I,
         YFn: Fn(usize) -> bool,
-        C: SizableContainer + PushInto<(D, T, Diff)> + Data,
+        C: SizableContainer + PushInto<(D, C1::Time, Diff)> + Data,
     {
         let meet = self.capability.time();
 

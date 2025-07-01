@@ -10,11 +10,10 @@
 # This test verifies the Quickstart page works: https://materialize.com/docs/get-started/quickstart/
 # Uses shared compute+storage cluster
 
-# TODO: Reenable when database-issues#8581 is fixed
-$ skip-if
-SELECT true
+$ postgres-execute connection=postgres://mz_system:materialize@${testdrive.materialize-internal-sql-addr}
+ALTER SYSTEM SET enable_create_table_from_source = true
 
-> CREATE CLUSTER quickstart_tutorial REPLICAS (r1 (SIZE '4-4'));
+> CREATE CLUSTER quickstart_tutorial REPLICAS (r1 (SIZE '4'));
 
 > SET CLUSTER = quickstart_tutorial
 

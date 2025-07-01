@@ -38,6 +38,7 @@ use mz_compute_client::controller::{
 use mz_compute_client::protocol::response::SubscribeBatch;
 use mz_compute_client::service::{ComputeClient, ComputeGrpcClient};
 use mz_controller_types::WatchSetId;
+use mz_dyncfg::{ConfigSet, ConfigUpdates};
 use mz_orchestrator::{NamespacedOrchestrator, Orchestrator, ServiceProcessMetrics};
 use mz_ore::id_gen::Gen;
 use mz_ore::instrument;
@@ -120,8 +121,6 @@ pub enum ControllerResponse<T = mz_repr::Timestamp> {
     SubscribeResponse(GlobalId, SubscribeBatch<T>),
     /// The worker's next response to a specified copy to.
     CopyToResponse(GlobalId, Result<u64, anyhow::Error>),
-    /// Notification that new resource usage metrics are available for a given replica.
-    ComputeReplicaMetrics(ReplicaId, Vec<ServiceProcessMetrics>),
     /// Notification that a watch set has finished. See
     /// [`Controller::install_compute_watch_set`] and
     /// [`Controller::install_storage_watch_set`] for details.
@@ -200,9 +199,17 @@ pub struct Controller<T: ComputeControllerTimestamp = mz_repr::Timestamp> {
     ///
     /// See [`self.install_watch_set`] for a description of watch sets.
     immediate_watch_sets: Vec<WatchSetId>,
+
+    /// Dynamic system configuration.
+    dyncfg: ConfigSet,
 }
 
 impl<T: ComputeControllerTimestamp> Controller<T> {
+    /// Update the controller configuration.
+    pub fn update_configuration(&mut self, updates: ConfigUpdates) {
+        updates.apply(&self.dyncfg);
+    }
+
     /// Start sinking the compute controller's introspection data into storage.
     ///
     /// This method should be called once the introspection collections have been registered with
@@ -255,6 +262,7 @@ impl<T: ComputeControllerTimestamp> Controller<T> {
             unfulfilled_watch_sets,
             watch_set_id_gen: _,
             immediate_watch_sets,
+            dyncfg: _,
         } = self;
 
         let compute = compute.dump().await?;
@@ -561,7 +569,7 @@ where
         metrics: Vec<ServiceProcessMetrics>,
     ) -> Result<Option<ControllerResponse<T>>, anyhow::Error> {
         self.record_replica_metrics(id, &metrics);
-        Ok(Some(ControllerResponse::ComputeReplicaMetrics(id, metrics)))
+        Ok(None)
     }
 
     fn record_replica_metrics(&mut self, replica_id: ReplicaId, metrics: &[ServiceProcessMetrics]) {
@@ -670,12 +678,11 @@ where
 
         let storage_controller = mz_storage_controller::Controller::new(
             config.build_info,
-            config.persist_location,
+            config.persist_location.clone(),
             config.persist_clients,
             config.now.clone(),
             wallclock_lag_fn.clone(),
             Arc::clone(&txns_metrics),
-            envd_epoch,
             read_only,
             &config.metrics_registry,
             controller_metrics.clone(),
@@ -689,9 +696,9 @@ where
         let compute_controller = ComputeController::new(
             config.build_info,
             storage_collections,
-            envd_epoch,
             read_only,
             &config.metrics_registry,
+            config.persist_location,
             controller_metrics,
             config.now.clone(),
             wallclock_lag_fn,
@@ -718,6 +725,7 @@ where
             unfulfilled_watch_sets: BTreeMap::new(),
             watch_set_id_gen: Gen::default(),
             immediate_watch_sets: Vec::new(),
+            dyncfg: mz_dyncfgs::all_dyncfgs(),
         };
 
         if !this.read_only {

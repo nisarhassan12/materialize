@@ -59,64 +59,6 @@ identifier = "transform-data"
 name = "Transform data"
 weight = 12
 
-#
-# Serve results
-#
-
-[[menu.main]]
-identifier = "serve"
-name = "Serve results"
-weight = 13
-
-[[menu.main]]
-name = "Query using `SELECT`"
-parent = "serve"
-url = "/sql/select/"
-weight = 5
-
-[[menu.main]]
-name = "Query using external tools"
-identifier = "bi-tools"
-parent = "serve"
-weight = 10
-
-[[menu.main]]
-name = "Subscribe to results (`SUBSCRIBE`)"
-parent = "serve"
-url = "/sql/subscribe/"
-weight = 15
-
-[[menu.main]]
-name = "Sink results to external tools"
-identifier = "sink"
-parent = "serve"
-weight = 20
-
-[[menu.main]]
-name = "Kafka"
-parent = "sink"
-url = "/sql/create-sink"
-weight = 20
-
-[[menu.main]]
-name = "Redpanda"
-parent = "sink"
-url = "/sql/create-sink"
-weight = 30
-#
-# Manage Materialize
-#
-
-[[menu.main]]
-identifier = "manage"
-name = "Manage Materialize"
-weight = 14
-
-[[menu.main]]
-name = "Monitoring"
-identifier = "monitor"
-weight = 5
-parent = "manage"
 
 #
 # Reference
@@ -213,4 +155,4 @@ include = "docs/**"
 
 # Avoid deleting the LTS and self-managed docs which are deployed from the
 # lts-docs and self-managed-docs branches.
-exclude = "docs/{lts,self-managed/v25.1}/**"
+exclude = "docs/{lts,self-managed/v25.1,self-managed/v25.2}/**"

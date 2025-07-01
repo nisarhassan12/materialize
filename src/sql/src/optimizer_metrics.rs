@@ -66,7 +66,19 @@ impl OptimizerMetrics {
         self.e2e_optimization_time_seconds
             .with_label_values(&[object_type])
             .observe(duration.as_secs_f64());
-        if duration > self.e2e_optimization_time_seconds_log_threshold {
+        // Also log it when it's big.
+        let debug_threshold = cfg!(debug_assertions);
+        let threshold = if debug_threshold {
+            // Debug builds are much slower to optimize (despite mz-transform being built
+            // with `opt-level = 3` even in debug builds), so we have a larger threshold.
+            // (A big part of the slowness comes from not optimizing mz-expr, but turning on
+            // optimizations for that in debug builds would slow down the build
+            // considerably.)
+            self.e2e_optimization_time_seconds_log_threshold * 6
+        } else {
+            self.e2e_optimization_time_seconds_log_threshold
+        };
+        if duration > threshold {
             let transform_times = self
                 .transform_time_seconds
                 .take()
@@ -80,12 +92,14 @@ impl OptimizerMetrics {
                     )
                 })
                 .collect::<Vec<_>>();
+            let threshold_string = if debug_threshold {
+                format!("{}ms (debug)", threshold.as_millis())
+            } else {
+                format!("{}ms", threshold.as_millis())
+            };
             tracing::warn!(
                 duration = format!("{}ms", duration.as_millis()),
-                threshold = format!(
-                    "{}ms",
-                    self.e2e_optimization_time_seconds_log_threshold.as_millis()
-                ),
+                threshold = threshold_string,
                 object_type = object_type,
                 transform_times_μs = serde_json::to_string(&transform_times)
                     .unwrap_or_else(|_| format!("{:?}", transform_times)),

@@ -57,8 +57,8 @@ use crate::internal::merge::{MergeTree, Pending};
 use crate::internal::metrics::{BatchWriteMetrics, Metrics, RetryMetrics, ShardMetrics};
 use crate::internal::paths::{PartId, PartialBatchKey, WriterKey};
 use crate::internal::state::{
-    BatchPart, HollowBatch, HollowBatchPart, HollowRun, HollowRunRef, ProtoInlineBatchPart,
-    RunMeta, RunOrder, RunPart,
+    BatchPart, ENABLE_INCREMENTAL_COMPACTION, HollowBatch, HollowBatchPart, HollowRun,
+    HollowRunRef, ProtoInlineBatchPart, RunId, RunMeta, RunOrder, RunPart,
 };
 use crate::stats::{STATS_BUDGET_BYTES, STATS_COLLECTION_ENABLED, untrimmable_columns};
 use crate::{PersistConfig, ShardId};
@@ -272,6 +272,11 @@ where
         }
         self.batch.parts = parts;
     }
+
+    /// The sum of the encoded sizes of all parts in the batch.
+    pub fn encoded_size_bytes(&self) -> usize {
+        self.batch.encoded_size_bytes()
+    }
 }
 
 impl<K, V, T, D> Batch<K, V, T, D>
@@ -351,6 +356,7 @@ pub struct BatchBuilderConfig {
     pub(crate) preferred_order: RunOrder,
     pub(crate) structured_key_lower_len: usize,
     pub(crate) run_length_limit: usize,
+    pub(crate) enable_incremental_compaction: bool,
     /// The number of runs to cap the built batch at, or None if we should
     /// continue to generate one run per part for unordered batches.
     /// See the config definition for details.
@@ -366,7 +372,7 @@ pub(crate) const BATCH_DELETE_ENABLED: Config<bool> = Config::new(
 
 pub(crate) const ENCODING_ENABLE_DICTIONARY: Config<bool> = Config::new(
     "persist_encoding_enable_dictionary",
-    false,
+    true,
     "A feature flag to enable dictionary encoding for Parquet data (Materialize).",
 );
 
@@ -451,6 +457,7 @@ impl BatchBuilderConfig {
                 limit @ 2.. => Some(limit),
                 _ => None,
             },
+            enable_incremental_compaction: ENABLE_INCREMENTAL_COMPACTION.get(value),
         }
     }
 }
@@ -503,10 +510,6 @@ where
     inline_desc: Description<T>,
     inclusive_upper: Antichain<Reverse<T>>,
 
-    // Reusable buffers for encoding data. Should be cleared after use!
-    pub(crate) key_buf: Vec<u8>,
-    pub(crate) val_buf: Vec<u8>,
-
     records_builder: PartBuilder<K, K::Schema, V, V::Schema>,
     pub(crate) builder: BatchBuilderInternal<K, V, T, D>,
 }
@@ -529,8 +532,6 @@ where
         Self {
             inline_desc,
             inclusive_upper: Antichain::new(),
-            key_buf: vec![],
-            val_buf: vec![],
             records_builder,
             builder,
         }
@@ -621,8 +622,6 @@ where
         } else {
             Added::Record
         };
-        self.key_buf.clear();
-        self.val_buf.clear();
         Ok(added)
     }
 }
@@ -685,6 +684,7 @@ where
         self,
         registered_desc: Description<T>,
     ) -> Result<Batch<K, V, T, D>, InvalidUsage<T>> {
+        let write_run_ids = self.parts.cfg.enable_incremental_compaction;
         let batch_delete_enabled = self.parts.cfg.batch_delete_enabled;
         let shard_metrics = Arc::clone(&self.parts.shard_metrics);
         let runs = self.parts.finish().await;
@@ -704,6 +704,11 @@ where
                 schema: self.write_schemas.id,
                 // Field has been deprecated but kept around to roundtrip state.
                 deprecated_schema: None,
+                id: if write_run_ids {
+                    Some(RunId::new())
+                } else {
+                    None
+                },
             });
             run_parts.extend(parts);
         }
@@ -821,6 +826,11 @@ impl<T: Timestamp + Codec64> BatchParts<T> {
                                         // Field has been deprecated but kept around to
                                         // roundtrip state.
                                         deprecated_schema: None,
+                                        id: if cfg.incremental_compaction {
+                                            Some(RunId::new())
+                                        } else {
+                                            None
+                                        },
                                     },
                                     parts.into_result().await,
                                 )
@@ -873,7 +883,7 @@ impl<T: Timestamp + Codec64> BatchParts<T> {
         }
     }
 
-    pub(crate) fn new_ordered(
+    pub(crate) fn new_ordered<D: Semigroup + Codec64>(
         cfg: BatchBuilderConfig,
         order: RunOrder,
         metrics: Arc<Metrics>,
@@ -904,7 +914,7 @@ impl<T: Timestamp + Codec64> BatchParts<T> {
                             .then(|p: Pending<RunPart<T>>| p.into_result())
                             .collect()
                             .await;
-                        let run_ref = HollowRunRef::set(
+                        let run_ref = HollowRunRef::set::<D>(
                             shard_id,
                             blob.as_ref(),
                             &writer_key,
@@ -1265,6 +1275,7 @@ pub(crate) fn validate_truncate_batch<T: Timestamp>(
     batch: &HollowBatch<T>,
     truncate: &Description<T>,
     any_batch_rewrite: bool,
+    enforce_matching_batch_boundaries: bool,
 ) -> Result<(), InvalidUsage<T>> {
     // If rewrite_ts is used, we don't allow truncation, to keep things simpler
     // to reason about.
@@ -1294,6 +1305,10 @@ pub(crate) fn validate_truncate_batch<T: Timestamp>(
         }
     }
 
+    if !enforce_matching_batch_boundaries {
+        return Ok(());
+    }
+
     let batch = &batch.desc;
     if !PartialOrder::less_equal(batch.lower(), truncate.lower())
         || PartialOrder::less_than(batch.upper(), truncate.upper())
@@ -1305,6 +1320,7 @@ pub(crate) fn validate_truncate_batch<T: Timestamp>(
             append_upper: truncate.upper().clone(),
         });
     }
+
     Ok(())
 }
 
@@ -1414,7 +1430,6 @@ fn diffs_sum<D: Semigroup + Codec64>(updates: &Int64Array) -> Option<D> {
 #[cfg(test)]
 mod tests {
     use mz_dyncfg::ConfigUpdates;
-    use timely::order::Product;
 
     use super::*;
     use crate::PersistLocation;
@@ -1594,50 +1609,6 @@ mod tests {
 
         let part_bytes = client.blob.get(&part_key).await.expect("invalid usage");
         assert!(part_bytes.is_none());
-    }
-
-    #[mz_ore::test(tokio::test)]
-    #[cfg_attr(miri, ignore)] // unsupported operation: returning ready events from epoll_wait is not yet implemented
-    async fn batch_builder_partial_order() {
-        let cache = PersistClientCache::new_no_metrics();
-        // Set blob_target_size to 0 so that each row gets forced into its own batch part
-        cache.cfg.set_config(&BLOB_TARGET_SIZE, 0);
-        // Otherwise fails: expected hollow part!
-        cache.cfg.set_config(&STRUCTURED_KEY_LOWER_LEN, 0);
-        cache.cfg.set_config(&INLINE_WRITES_SINGLE_MAX_BYTES, 0);
-        cache.cfg.set_config(&INLINE_WRITES_TOTAL_MAX_BYTES, 0);
-        let client = cache
-            .open(PersistLocation::new_in_mem())
-            .await
-            .expect("client construction failed");
-        let shard_id = ShardId::new();
-        let (mut write, _) = client
-            .expect_open::<String, String, Product<u32, u32>, i64>(shard_id)
-            .await;
-
-        let batch = write
-            .batch(
-                &[
-                    (("1".to_owned(), "one".to_owned()), Product::new(0, 10), 1),
-                    (("2".to_owned(), "two".to_owned()), Product::new(10, 0), 1),
-                ],
-                Antichain::from_elem(Product::new(0, 0)),
-                Antichain::from_iter([Product::new(0, 11), Product::new(10, 1)]),
-            )
-            .await
-            .expect("invalid usage");
-
-        assert_eq!(batch.batch.part_count(), 2);
-        for part in &batch.batch.parts {
-            let part = part.expect_hollow_part();
-            match BlobKey::parse_ids(&part.key.complete(&shard_id)) {
-                Ok((shard, PartialBlobKey::Batch(writer, _))) => {
-                    assert_eq!(shard.to_string(), shard_id.to_string());
-                    assert_eq!(writer, WriterKey::for_version(&cache.cfg.build_version));
-                }
-                _ => panic!("unparseable blob key"),
-            }
-        }
     }
 
     #[mz_ore::test]

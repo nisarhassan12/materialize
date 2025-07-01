@@ -11,14 +11,12 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Debug;
-use std::num::NonZeroI64;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use chrono::{DateTime, DurationRound, TimeDelta, Utc};
 use mz_build_info::BuildInfo;
 use mz_cluster_client::WallclockLagFn;
-use mz_cluster_client::client::ClusterStartupEpoch;
 use mz_compute_types::ComputeInstanceId;
 use mz_compute_types::dataflows::{BuildDesc, DataflowDescription};
 use mz_compute_types::plan::LirId;
@@ -37,9 +35,10 @@ use mz_ore::channel::instrumented_unbounded_channel;
 use mz_ore::now::NowFn;
 use mz_ore::tracing::OpenTelemetryContext;
 use mz_ore::{soft_assert_or_log, soft_panic_or_log};
+use mz_persist_types::PersistLocation;
 use mz_repr::adt::timestamp::CheckedTimestamp;
 use mz_repr::refresh_schedule::RefreshSchedule;
-use mz_repr::{Datum, Diff, GlobalId, Row};
+use mz_repr::{Datum, Diff, GlobalId, RelationDesc, Row};
 use mz_storage_client::controller::{IntrospectionType, WallclockLag, WallclockLagHistogramPeriod};
 use mz_storage_types::read_holds::{self, ReadHold};
 use mz_storage_types::read_policy::ReadPolicy;
@@ -63,7 +62,9 @@ use crate::controller::{
 use crate::logging::LogVariant;
 use crate::metrics::IntCounter;
 use crate::metrics::{InstanceMetrics, ReplicaCollectionMetrics, ReplicaMetrics, UIntGauge};
-use crate::protocol::command::{ComputeCommand, ComputeParameters, Peek, PeekTarget};
+use crate::protocol::command::{
+    ComputeCommand, ComputeParameters, InstanceConfig, Peek, PeekTarget,
+};
 use crate::protocol::history::ComputeCommandHistory;
 use crate::protocol::response::{
     ComputeResponse, CopyToResponse, FrontiersResponse, OperatorHydrationStatus, PeekResponse,
@@ -160,8 +161,8 @@ where
         id: ComputeInstanceId,
         build_info: &'static BuildInfo,
         storage: StorageCollections<T>,
+        peek_stash_persist_location: PersistLocation,
         arranged_logs: Vec<(LogVariant, GlobalId, SharedCollectionState<T>)>,
-        envd_epoch: NonZeroI64,
         metrics: InstanceMetrics,
         now: NowFn,
         wallclock_lag: WallclockLagFn<T>,
@@ -187,8 +188,8 @@ where
             Instance::new(
                 build_info,
                 storage,
+                peek_stash_persist_location,
                 arranged_logs,
-                envd_epoch,
                 metrics,
                 now,
                 wallclock_lag,
@@ -281,14 +282,15 @@ pub(super) struct Instance<T: ComputeControllerTimestamp> {
     response_tx: mpsc::UnboundedSender<ComputeControllerResponse<T>>,
     /// Sender for introspection updates to be recorded.
     introspection_tx: mpsc::UnboundedSender<IntrospectionUpdates>,
-    /// A number that increases with each restart of `environmentd`.
-    envd_epoch: NonZeroI64,
     /// Numbers that increase with each restart of a replica.
     replica_epochs: BTreeMap<ReplicaId, u64>,
     /// The registry the controller uses to report metrics.
     metrics: InstanceMetrics,
     /// Dynamic system configuration.
     dyncfg: Arc<ConfigSet>,
+
+    /// The persist location where we can stash large peek results.
+    peek_stash_persist_location: PersistLocation,
 
     /// A function that produces the current wallclock time.
     now: NowFn,
@@ -418,7 +420,7 @@ impl<T: ComputeControllerTimestamp> Instance<T> {
         id: ReplicaId,
         client: ReplicaClient<T>,
         config: ReplicaConfig,
-        epoch: ClusterStartupEpoch,
+        epoch: u64,
     ) {
         let log_ids: BTreeSet<_> = config.logging.index_logs.values().copied().collect();
 
@@ -937,6 +939,7 @@ impl<T: ComputeControllerTimestamp> Instance<T> {
         let Self {
             build_info: _,
             storage_collections: _,
+            peek_stash_persist_location: _,
             initialized,
             read_only,
             workload_class,
@@ -950,7 +953,6 @@ impl<T: ComputeControllerTimestamp> Instance<T> {
             command_rx: _,
             response_tx: _,
             introspection_tx: _,
-            envd_epoch,
             replica_epochs,
             metrics: _,
             dyncfg: _,
@@ -1002,7 +1004,6 @@ impl<T: ComputeControllerTimestamp> Instance<T> {
             field("peeks", peeks)?,
             field("subscribes", subscribes)?,
             field("copy_tos", copy_tos)?,
-            field("envd_epoch", envd_epoch)?,
             field("replica_epochs", replica_epochs)?,
             field("wallclock_lag_last_recorded", wallclock_lag_last_recorded)?,
         ]);
@@ -1018,8 +1019,8 @@ where
     fn new(
         build_info: &'static BuildInfo,
         storage: StorageCollections<T>,
+        peek_stash_persist_location: PersistLocation,
         arranged_logs: Vec<(LogVariant, GlobalId, SharedCollectionState<T>)>,
-        envd_epoch: NonZeroI64,
         metrics: InstanceMetrics,
         now: NowFn,
         wallclock_lag: WallclockLagFn<T>,
@@ -1053,6 +1054,7 @@ where
         Self {
             build_info,
             storage_collections: storage,
+            peek_stash_persist_location,
             initialized: false,
             read_only: true,
             workload_class: None,
@@ -1066,7 +1068,6 @@ where
             command_rx,
             response_tx,
             introspection_tx,
-            envd_epoch,
             replica_epochs: Default::default(),
             metrics,
             dyncfg,
@@ -1082,12 +1083,17 @@ where
     async fn run(mut self) {
         self.send(ComputeCommand::CreateTimely {
             config: Default::default(),
-            epoch: ClusterStartupEpoch::new(self.envd_epoch, 0),
+            nonce: Uuid::default(),
         });
 
-        // Send a placeholder instance configuration for the replica task to fill in.
-        let dummy_instance_config = Default::default();
-        self.send(ComputeCommand::CreateInstance(dummy_instance_config));
+        let instance_config = InstanceConfig {
+            peek_stash_persist_location: self.peek_stash_persist_location.clone(),
+            // The remaining fields are replica-specific and will be set in `ReplicaTask::specialize_command`.
+            logging: Default::default(),
+            expiration_offset: Default::default(),
+        };
+
+        self.send(ComputeCommand::CreateInstance(Box::new(instance_config)));
 
         loop {
             tokio::select! {
@@ -1211,8 +1217,9 @@ where
 
         let replica_epoch = self.replica_epochs.entry(id).or_default();
         *replica_epoch += 1;
+        let epoch = *replica_epoch;
+
         let metrics = self.metrics.for_replica(id);
-        let epoch = ClusterStartupEpoch::new(self.envd_epoch, *replica_epoch);
         let client = ReplicaClient::spawn(
             id,
             self.build_info,
@@ -1397,6 +1404,7 @@ where
                 .unwrap_or_else(|| SharedCollectionState::new(as_of.clone()));
             let write_only = dataflow.sink_exports.contains_key(&export_id);
             let storage_sink = dataflow.persist_sink_ids().any(|id| id == export_id);
+
             self.add_collection(
                 export_id,
                 as_of.clone(),
@@ -1668,6 +1676,7 @@ where
         literal_constraints: Option<Vec<Row>>,
         uuid: Uuid,
         timestamp: T,
+        result_desc: RelationDesc,
         finishing: RowSetFinishing,
         map_filter_project: mz_expr::SafeMfpPlan,
         mut read_hold: ReadHold<T>,
@@ -1692,6 +1701,7 @@ where
         }
 
         let otel_ctx = OpenTelemetryContext::obtain();
+
         self.peeks.insert(
             uuid,
             PendingPeek {
@@ -1716,6 +1726,7 @@ where
             // tree to forward it on to the compute worker.
             otel_ctx,
             target: peek_target,
+            result_desc,
         };
         self.send(ComputeCommand::Peek(Box::new(peek)));
 
@@ -1921,19 +1932,19 @@ where
     }
 
     /// Handles a response from a replica. Replica IDs are re-used across replica restarts, so we
-    /// use the replica incarnation to drop stale responses.
-    fn handle_response(&mut self, (replica_id, incarnation, response): ReplicaResponse<T>) {
+    /// use the replica epoch to drop stale responses.
+    fn handle_response(&mut self, (replica_id, epoch, response): ReplicaResponse<T>) {
         // Filter responses from non-existing or stale replicas.
         if self
             .replicas
             .get(&replica_id)
-            .filter(|replica| replica.epoch.replica() == incarnation)
+            .filter(|replica| replica.epoch == epoch)
             .is_none()
         {
             return;
         }
 
-        // Invariant: the replica exists and has the expected incarnation.
+        // Invariant: the replica exists and has the expected epoch.
 
         match response {
             ComputeResponse::Frontiers(id, frontiers) => {
@@ -2819,7 +2830,7 @@ struct ReplicaState<T: ComputeControllerTimestamp> {
     /// Per-replica collection state.
     collections: BTreeMap<GlobalId, ReplicaCollectionState<T>>,
     /// The epoch of the replica.
-    epoch: ClusterStartupEpoch,
+    epoch: u64,
 }
 
 impl<T: ComputeControllerTimestamp> ReplicaState<T> {
@@ -2829,7 +2840,7 @@ impl<T: ComputeControllerTimestamp> ReplicaState<T> {
         config: ReplicaConfig,
         metrics: ReplicaMetrics,
         introspection_tx: mpsc::UnboundedSender<IntrospectionUpdates>,
-        epoch: ClusterStartupEpoch,
+        epoch: u64,
     ) -> Self {
         Self {
             id,

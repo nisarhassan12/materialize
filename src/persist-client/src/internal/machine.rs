@@ -596,62 +596,6 @@ where
         }
     }
 
-    pub async fn merge_res(
-        &self,
-        res: &FueledMergeRes<T>,
-    ) -> (ApplyMergeResult, RoutineMaintenance) {
-        let metrics = Arc::clone(&self.applier.metrics);
-
-        // SUBTLE! If Machine::merge_res returns false, the blobs referenced in
-        // compaction output are deleted so we don't leak them. Naively passing
-        // back the value returned by State::apply_merge_res might give a false
-        // negative in the presence of retries and Indeterminate errors.
-        // Specifically, something like the following:
-        //
-        // - We try to apply_merge_res, it matches.
-        // - When apply_unbatched_cmd goes to commit the new state, the
-        //   Consensus::compare_and_set returns an Indeterminate error (but
-        //   actually succeeds). The committed State now contains references to
-        //   the compaction output blobs.
-        // - Machine::apply_unbatched_idempotent_cmd retries the Indeterminate
-        //   error. For whatever reason, this time though it doesn't match
-        //   (maybe the batches simply get grouped difference when deserialized
-        //   from state, or more unavoidably perhaps another compaction
-        //   happens).
-        // - This now bubbles up applied=false to the caller, which uses it as a
-        //   signal that the blobs in the compaction output should be deleted so
-        //   that we don't leak them.
-        // - We now contain references in committed State to blobs that don't
-        //   exist.
-        //
-        // The fix is to keep track of whether applied ever was true, even for a
-        // compare_and_set that returned an Indeterminate error. This has the
-        // chance of false positive (leaking a blob) but that's better than a
-        // false negative (a blob we can never recover referenced by state). We
-        // anyway need a mechanism to clean up leaked blobs because of process
-        // crashes.
-        let mut merge_result_ever_applied = ApplyMergeResult::NotAppliedNoMatch;
-        let (_seqno, _apply_merge_result, maintenance) = self
-            .apply_unbatched_idempotent_cmd(&metrics.cmds.merge_res, |_, _, state| {
-                let ret = state.apply_merge_res(res);
-                if let Continue(result) = ret {
-                    // record if we've ever applied the merge
-                    if result.applied() {
-                        merge_result_ever_applied = result;
-                    }
-                    // otherwise record the most granular reason for _not_
-                    // applying the merge when there was a matching batch
-                    if result.matched() && !result.applied() && !merge_result_ever_applied.applied()
-                    {
-                        merge_result_ever_applied = result;
-                    }
-                }
-                ret
-            })
-            .await;
-        (merge_result_ever_applied, maintenance)
-    }
-
     pub async fn downgrade_since(
         &self,
         reader_id: &LeasedReaderId,
@@ -1139,6 +1083,70 @@ where
     }
 }
 
+impl<K, V, T, D> Machine<K, V, T, D>
+where
+    K: Debug + Codec,
+    V: Debug + Codec,
+    T: Timestamp + Lattice + Codec64 + Sync,
+    D: Semigroup + Codec64 + PartialEq,
+{
+    pub async fn merge_res(
+        &self,
+        res: &FueledMergeRes<T>,
+    ) -> (ApplyMergeResult, RoutineMaintenance) {
+        let metrics = Arc::clone(&self.applier.metrics);
+
+        // SUBTLE! If Machine::merge_res returns false, the blobs referenced in
+        // compaction output are deleted so we don't leak them. Naively passing
+        // back the value returned by State::apply_merge_res might give a false
+        // negative in the presence of retries and Indeterminate errors.
+        // Specifically, something like the following:
+        //
+        // - We try to apply_merge_res, it matches.
+        // - When apply_unbatched_cmd goes to commit the new state, the
+        //   Consensus::compare_and_set returns an Indeterminate error (but
+        //   actually succeeds). The committed State now contains references to
+        //   the compaction output blobs.
+        // - Machine::apply_unbatched_idempotent_cmd retries the Indeterminate
+        //   error. For whatever reason, this time though it doesn't match
+        //   (maybe the batches simply get grouped difference when deserialized
+        //   from state, or more unavoidably perhaps another compaction
+        //   happens).
+        // - This now bubbles up applied=false to the caller, which uses it as a
+        //   signal that the blobs in the compaction output should be deleted so
+        //   that we don't leak them.
+        // - We now contain references in committed State to blobs that don't
+        //   exist.
+        //
+        // The fix is to keep track of whether applied ever was true, even for a
+        // compare_and_set that returned an Indeterminate error. This has the
+        // chance of false positive (leaking a blob) but that's better than a
+        // false negative (a blob we can never recover referenced by state). We
+        // anyway need a mechanism to clean up leaked blobs because of process
+        // crashes.
+        let mut merge_result_ever_applied = ApplyMergeResult::NotAppliedNoMatch;
+        let (_seqno, _apply_merge_result, maintenance) = self
+            .apply_unbatched_idempotent_cmd(&metrics.cmds.merge_res, |_, _, state| {
+                let ret = state.apply_merge_res::<D>(res, &Arc::clone(&metrics).columnar);
+                if let Continue(result) = ret {
+                    // record if we've ever applied the merge
+                    if result.applied() {
+                        merge_result_ever_applied = result;
+                    }
+                    // otherwise record the most granular reason for _not_
+                    // applying the merge when there was a matching batch
+                    if result.matched() && !result.applied() && !merge_result_ever_applied.applied()
+                    {
+                        merge_result_ever_applied = result;
+                    }
+                }
+                ret
+            })
+            .await;
+        (merge_result_ever_applied, maintenance)
+    }
+}
+
 pub(crate) struct ExpireFn(
     /// This is stored on WriteHandle and ReadHandle, which we require to be
     /// Send + Sync, but the Future is only Send and not Sync. Instead store a
@@ -1422,7 +1430,7 @@ pub mod datadriven {
         BatchParts, validate_truncate_batch,
     };
     use crate::cfg::COMPACTION_MEMORY_BOUND_BYTES;
-    use crate::fetch::EncodedPart;
+    use crate::fetch::{EncodedPart, FetchConfig};
     use crate::internal::compact::{CompactConfig, CompactReq, Compactor};
     use crate::internal::datadriven::DirectiveArgs;
     use crate::internal::encoding::Schemas;
@@ -1775,7 +1783,7 @@ pub mod datadriven {
         } else {
             RunOrder::Unordered
         };
-        let parts = BatchParts::new_ordered(
+        let parts = BatchParts::new_ordered::<i64>(
             cfg.clone(),
             run_order,
             Arc::clone(&datadriven.client.metrics),
@@ -1886,6 +1894,7 @@ pub mod datadriven {
                 BatchPart::Inline { .. } => {}
             };
             let part = EncodedPart::fetch(
+                &FetchConfig::from_persist_config(&datadriven.client.cfg),
                 &datadriven.shard_id,
                 datadriven.client.blob.as_ref(),
                 datadriven.client.metrics.as_ref(),
@@ -1939,7 +1948,7 @@ pub mod datadriven {
             .expect("unknown batch")
             .clone();
         let truncated_desc = Description::new(lower, upper, batch.desc.since().clone());
-        let () = validate_truncate_batch(&batch, &truncated_desc, false)?;
+        let () = validate_truncate_batch(&batch, &truncated_desc, false, true)?;
         batch.desc = truncated_desc;
         datadriven.batches.insert(output.to_owned(), batch.clone());
         Ok(format!("parts={} len={}\n", batch.part_count(), batch.len))
@@ -2143,6 +2152,7 @@ pub mod datadriven {
                     writeln!(result, "<part {idx}>");
 
                     let part = EncodedPart::fetch(
+                        &FetchConfig::from_persist_config(&datadriven.client.cfg),
                         &datadriven.shard_id,
                         datadriven.client.blob.as_ref(),
                         datadriven.client.metrics.as_ref(),
@@ -2339,7 +2349,7 @@ pub mod datadriven {
         let mut batch_refs: Vec<_> = batches.iter_mut().collect();
 
         let () = writer
-            .compare_and_append_batch(batch_refs.as_mut_slice(), expected_upper, new_upper)
+            .compare_and_append_batch(batch_refs.as_mut_slice(), expected_upper, new_upper, true)
             .await?
             .map_err(|err| anyhow!("upper mismatch: {:?}", err))?;
 

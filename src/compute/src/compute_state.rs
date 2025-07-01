@@ -10,7 +10,7 @@ use std::cell::RefCell;
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
 use std::num::NonZeroUsize;
-use std::ops::DerefMut;
+
 use std::rc::Rc;
 use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
@@ -30,6 +30,11 @@ use mz_compute_client::protocol::response::{
     StatusResponse, SubscribeResponse,
 };
 use mz_compute_types::dataflows::DataflowDescription;
+use mz_compute_types::dyncfgs::{
+    ENABLE_ACTIVE_DATAFLOW_CANCELATION, ENABLE_PEEK_RESPONSE_STASH,
+    PEEK_RESPONSE_STASH_BATCH_MAX_RUNS, PEEK_RESPONSE_STASH_THRESHOLD_BYTES, PEEK_STASH_BATCH_SIZE,
+    PEEK_STASH_NUM_BATCHES,
+};
 use mz_compute_types::plan::LirId;
 use mz_compute_types::plan::render_plan::RenderPlan;
 use mz_dyncfg::ConfigSet;
@@ -45,6 +50,7 @@ use mz_persist_client::Diagnostics;
 use mz_persist_client::cache::PersistClientCache;
 use mz_persist_client::cfg::USE_CRITICAL_SINCE_SNAPSHOT;
 use mz_persist_client::read::ReadHandle;
+use mz_persist_types::PersistLocation;
 use mz_persist_types::codec_impls::UnitSchema;
 use mz_repr::fixed_length::ToDatumIter;
 use mz_repr::{DatumVec, Diff, GlobalId, Row, RowArena, Timestamp};
@@ -73,6 +79,9 @@ use crate::logging::initialize::LoggingTraces;
 use crate::metrics::{CollectionMetrics, WorkerMetrics};
 use crate::render::{LinearJoinSpec, StartSignal};
 use crate::server::{ComputeInstanceContext, ResponseSender};
+
+mod peek_result_iterator;
+mod peek_stash;
 
 /// Worker-local state that is maintained across dataflows.
 ///
@@ -104,6 +113,8 @@ pub struct ComputeState {
     pub copy_to_response_buffer: Rc<RefCell<Vec<(GlobalId, CopyToResponse)>>>,
     /// Peek commands that are awaiting fulfillment.
     pub pending_peeks: BTreeMap<Uuid, PendingPeek>,
+    /// The persist location where we can stash large peek results.
+    pub peek_stash_persist_location: Option<PersistLocation>,
     /// The logger, from Timely's logging framework, if logs are enabled.
     pub compute_logger: Option<logging::compute::Logger>,
     /// A process-global cache of (blob_uri, consensus_uri) -> PersistClient.
@@ -206,6 +217,7 @@ impl ComputeState {
             subscribe_response_buffer: Default::default(),
             copy_to_response_buffer: Default::default(),
             pending_peeks: Default::default(),
+            peek_stash_persist_location: None,
             compute_logger: None,
             persist_clients,
             txns_ctx,
@@ -292,6 +304,7 @@ impl ComputeState {
                         .file_growth_dampener(file_growth_dampener)
                         .local_buffer_bytes(local_buffer_bytes),
                 );
+                crate::lgalloc::apply_limiter_config(config);
             } else {
                 debug!("not enabling lgalloc, scratch directory not specified");
             }
@@ -437,6 +450,8 @@ impl<'a, A: Allocate + 'static> ActiveComputeState<'a, A> {
         }
 
         self.initialize_logging(config.logging);
+
+        self.compute_state.peek_stash_persist_location = Some(config.peek_stash_persist_location);
     }
 
     fn handle_update_configuration(&mut self, params: ComputeParameters) {
@@ -477,9 +492,7 @@ impl<'a, A: Allocate + 'static> ActiveComputeState<'a, A> {
         &mut self,
         dataflow: DataflowDescription<RenderPlan, CollectionMetadata>,
     ) {
-        // Collect the exported object identifiers, paired with their associated "collection" identifier.
-        // The latter is used to extract dependency information, which is in terms of collections ids.
-        let dataflow_index = self.timely_worker.next_dataflow_index();
+        let dataflow_index = Rc::new(self.timely_worker.next_dataflow_index());
         let as_of = dataflow.as_of.clone().unwrap();
 
         let dataflow_expiration = dataflow
@@ -530,13 +543,18 @@ impl<'a, A: Allocate + 'static> ActiveComputeState<'a, A> {
         for object_id in dataflow.export_ids() {
             let is_subscribe_or_copy = subscribe_copy_ids.contains(&object_id);
             let metrics = self.compute_state.metrics.for_collection(object_id);
-            let mut collection = CollectionState::new(is_subscribe_or_copy, as_of.clone(), metrics);
+            let mut collection = CollectionState::new(
+                Rc::clone(&dataflow_index),
+                is_subscribe_or_copy,
+                as_of.clone(),
+                metrics,
+            );
 
             if let Some(logger) = self.compute_state.compute_logger.clone() {
                 let logging = CollectionLogging::new(
                     object_id,
                     logger,
-                    dataflow_index,
+                    *dataflow_index,
                     dataflow.import_ids(),
                 );
                 collection.logging = Some(logging);
@@ -655,6 +673,13 @@ impl<'a, A: Allocate + 'static> ActiveComputeState<'a, A> {
         // If the collection is unscheduled, remove it from the list of waiting collections.
         self.compute_state.suspended_collections.remove(&id);
 
+        if ENABLE_ACTIVE_DATAFLOW_CANCELATION.get(&self.compute_state.worker_config) {
+            // Drop the dataflow, if all its exports have been dropped.
+            if let Ok(index) = Rc::try_unwrap(collection.dataflow_index) {
+                self.timely_worker.drop_dataflow(index);
+            }
+        }
+
         // Remember the collection as dropped, for emission of outstanding final compute responses.
         let dropped = DroppedCollection {
             reported_frontiers: collection.reported_frontiers,
@@ -675,6 +700,7 @@ impl<'a, A: Allocate + 'static> ActiveComputeState<'a, A> {
             compute_logger: logger,
         } = logging::initialize(self.timely_worker, &config);
 
+        let dataflow_index = Rc::new(dataflow_index);
         let mut log_index_ids = config.index_logs;
         for (log, trace) in traces {
             // Install trace as maintained index.
@@ -687,10 +713,15 @@ impl<'a, A: Allocate + 'static> ActiveComputeState<'a, A> {
             let is_subscribe_or_copy = false;
             let as_of = Antichain::from_elem(Timestamp::MIN);
             let metrics = self.compute_state.metrics.for_collection(id);
-            let mut collection = CollectionState::new(is_subscribe_or_copy, as_of, metrics);
+            let mut collection = CollectionState::new(
+                Rc::clone(&dataflow_index),
+                is_subscribe_or_copy,
+                as_of,
+                metrics,
+            );
 
             let logging =
-                CollectionLogging::new(id, logger.clone(), dataflow_index, std::iter::empty());
+                CollectionLogging::new(id, logger.clone(), *dataflow_index, std::iter::empty());
             collection.logging = Some(logging);
 
             let existing = self.compute_state.collections.insert(id, collection);
@@ -869,7 +900,58 @@ impl<'a, A: Allocate + 'static> ActiveComputeState<'a, A> {
     fn process_peek(&mut self, upper: &mut Antichain<Timestamp>, mut peek: PendingPeek) {
         let response = match &mut peek {
             PendingPeek::Index(peek) => {
-                peek.seek_fulfillment(upper, self.compute_state.max_result_size)
+                let peek_stash_eligible = peek
+                    .peek
+                    .finishing
+                    .is_streamable(peek.peek.result_desc.arity());
+
+                let peek_stash_enabled = {
+                    let enabled = ENABLE_PEEK_RESPONSE_STASH.get(&self.compute_state.worker_config);
+                    let peek_persist_stash_available =
+                        self.compute_state.peek_stash_persist_location.is_some();
+                    if !peek_persist_stash_available && enabled {
+                        tracing::error!(
+                            "missing peek_stash_persist_location but peek stash is enabled"
+                        );
+                    }
+                    enabled && peek_persist_stash_available
+                };
+
+                let peek_stash_threshold_bytes =
+                    PEEK_RESPONSE_STASH_THRESHOLD_BYTES.get(&self.compute_state.worker_config);
+
+                match peek.seek_fulfillment(
+                    upper,
+                    self.compute_state.max_result_size,
+                    peek_stash_enabled && peek_stash_eligible,
+                    peek_stash_threshold_bytes,
+                ) {
+                    PeekStatus::Ready(result) => Some(result),
+                    PeekStatus::NotReady => None,
+                    PeekStatus::UsePeekStash => {
+                        let _span =
+                            span!(parent: &peek.span, Level::DEBUG, "process_stash_peek").entered();
+
+                        let peek_stash_batch_max_runs = PEEK_RESPONSE_STASH_BATCH_MAX_RUNS
+                            .get(&self.compute_state.worker_config);
+
+                        let stash_task = peek_stash::StashingPeek::start_upload(
+                            Arc::clone(&self.compute_state.persist_clients),
+                            self.compute_state
+                                .peek_stash_persist_location
+                                .as_ref()
+                                .expect("verified above"),
+                            peek.peek.clone(),
+                            peek.trace_bundle.clone(),
+                            peek_stash_batch_max_runs,
+                        );
+
+                        self.compute_state
+                            .pending_peeks
+                            .insert(peek.peek.uuid, PendingPeek::Stash(stash_task));
+                        return;
+                    }
+                }
             }
             PendingPeek::Persist(peek) => peek.result.try_recv().ok().map(|(result, duration)| {
                 self.compute_state
@@ -878,10 +960,27 @@ impl<'a, A: Allocate + 'static> ActiveComputeState<'a, A> {
                     .observe(duration.as_secs_f64());
                 result
             }),
+            PendingPeek::Stash(stashing_peek) => {
+                let num_batches = PEEK_STASH_NUM_BATCHES.get(&self.compute_state.worker_config);
+                let batch_size = PEEK_STASH_BATCH_SIZE.get(&self.compute_state.worker_config);
+                stashing_peek.pump_rows(num_batches, batch_size);
+
+                if let Ok((response, duration)) = stashing_peek.result.try_recv() {
+                    self.compute_state
+                        .metrics
+                        .stashed_peek_seconds
+                        .observe(duration.as_secs_f64());
+                    tracing::trace!(?stashing_peek.peek, ?duration, "finished stashing peek response in persist");
+
+                    Some(response)
+                } else {
+                    None
+                }
+            }
         };
 
         if let Some(response) = response {
-            let _span = span!(parent: peek.span(), Level::DEBUG, "process_peek").entered();
+            let _span = span!(parent: peek.span(), Level::DEBUG, "process_peek_response").entered();
             self.send_peek_response(peek, response)
         } else {
             let uuid = peek.peek().uuid;
@@ -1039,6 +1138,9 @@ pub enum PendingPeek {
     Index(IndexPeek),
     /// A peek against a Persist-backed collection.
     Persist(PersistPeek),
+    /// A peek against an index that is being stashed in the peek stash by an
+    /// async background task.
+    Stash(peek_stash::StashingPeek),
 }
 
 impl PendingPeek {
@@ -1156,6 +1258,7 @@ impl PendingPeek {
         match self {
             PendingPeek::Index(p) => &p.span,
             PendingPeek::Persist(p) => &p.span,
+            PendingPeek::Stash(p) => &p.span,
         }
     }
 
@@ -1163,6 +1266,7 @@ impl PendingPeek {
         match self {
             PendingPeek::Index(p) => &p.peek,
             PendingPeek::Persist(p) => &p.peek,
+            PendingPeek::Stash(p) => &p.peek,
         }
     }
 }
@@ -1330,14 +1434,16 @@ impl IndexPeek {
         &mut self,
         upper: &mut Antichain<Timestamp>,
         max_result_size: u64,
-    ) -> Option<PeekResponse> {
+        peek_stash_eligible: bool,
+        peek_stash_threshold_bytes: usize,
+    ) -> PeekStatus {
         self.trace_bundle.oks_mut().read_upper(upper);
         if upper.less_equal(&self.peek.timestamp) {
-            return None;
+            return PeekStatus::NotReady;
         }
         self.trace_bundle.errs_mut().read_upper(upper);
         if upper.less_equal(&self.peek.timestamp) {
-            return None;
+            return PeekStatus::NotReady;
         }
 
         let read_frontier = self.trace_bundle.compaction_frontier();
@@ -1347,21 +1453,23 @@ impl IndexPeek {
                 read_frontier.elements(),
                 self.peek.timestamp,
             );
-            return Some(PeekResponse::Error(error));
+            return PeekStatus::Ready(PeekResponse::Error(error));
         }
 
-        let response = match self.collect_finished_data(max_result_size) {
-            Ok(rows) => PeekResponse::Rows(RowCollection::new(rows, &self.peek.finishing.order_by)),
-            Err(text) => PeekResponse::Error(text),
-        };
-        Some(response)
+        self.collect_finished_data(
+            max_result_size,
+            peek_stash_eligible,
+            peek_stash_threshold_bytes,
+        )
     }
 
     /// Collects data for a known-complete peek from the ok stream.
     fn collect_finished_data(
         &mut self,
         max_result_size: u64,
-    ) -> Result<Vec<(Row, NonZeroUsize)>, String> {
+        peek_stash_eligible: bool,
+        peek_stash_threshold_bytes: usize,
+    ) -> PeekStatus {
         // Check if there exist any errors and, if so, return whatever one we
         // find first.
         let (mut cursor, storage) = self.trace_bundle.errs_mut().cursor();
@@ -1378,27 +1486,35 @@ impl IndexPeek {
                     target = %self.peek.target.id(), diff = %copies, %error,
                     "index peek encountered negative multiplicities in error trace",
                 );
-                return Err(format!(
+                return PeekStatus::Ready(PeekResponse::Error(format!(
                     "Invalid data in source errors, \
-                     saw retractions ({}) for row that does not exist: {}",
+                    saw retractions ({}) for row that does not exist: {}",
                     -copies, error,
-                ));
+                )));
             }
             if copies.is_positive() {
-                return Err(cursor.key(&storage).to_string());
+                return PeekStatus::Ready(PeekResponse::Error(cursor.key(&storage).to_string()));
             }
             cursor.step_key(&storage);
         }
 
-        Self::collect_ok_finished_data(&mut self.peek, self.trace_bundle.oks_mut(), max_result_size)
+        Self::collect_ok_finished_data(
+            &self.peek,
+            self.trace_bundle.oks_mut(),
+            max_result_size,
+            peek_stash_eligible,
+            peek_stash_threshold_bytes,
+        )
     }
 
     /// Collects data for a known-complete peek from the ok stream.
     fn collect_ok_finished_data<Tr>(
-        peek: &mut Peek<Timestamp>,
+        peek: &Peek<Timestamp>,
         oks_handle: &mut Tr,
         max_result_size: u64,
-    ) -> Result<Vec<(Row, NonZeroUsize)>, String>
+        peek_stash_eligible: bool,
+        peek_stash_threshold_bytes: usize,
+    ) -> PeekStatus
     where
         for<'a> Tr: TraceReader<DiffGat<'a> = &'a Diff>,
         for<'a> Tr::Key<'a>: ToDatumIter + IntoOwned<'a, Owned = Row> + Eq,
@@ -1408,8 +1524,14 @@ impl IndexPeek {
         let max_result_size = usize::cast_from(max_result_size);
         let count_byte_size = std::mem::size_of::<NonZeroUsize>();
 
-        // Cursor and bound lifetime for `Row` data in the backing trace.
-        let (mut cursor, storage) = oks_handle.cursor();
+        let mut peek_iterator = peek_result_iterator::PeekResultIterator::new(
+            peek.target.id().clone(),
+            peek.map_filter_project.clone(),
+            peek.timestamp,
+            peek.literal_constraints.clone(),
+            oks_handle,
+        );
+
         // Accumulated `Vec<(row, count)>` results that we are likely to return.
         let mut results = Vec::new();
         let mut total_size: usize = 0;
@@ -1424,169 +1546,93 @@ impl IndexPeek {
             .limit
             .map(|l| usize::cast_from(u64::from(l)) + peek.finishing.offset);
 
-        use mz_ore::result::ResultExt;
-
-        let mut row_builder = Row::default();
-        let mut datum_vec = DatumVec::new();
         let mut l_datum_vec = DatumVec::new();
         let mut r_datum_vec = DatumVec::new();
 
-        // We have to sort the literal constraints because cursor.seek_key can seek only forward.
-        peek.literal_constraints
-            .iter_mut()
-            .for_each(|vec| vec.sort());
-        let has_literal_constraints = peek.literal_constraints.is_some();
-        let mut literals = peek.literal_constraints.iter().flatten();
-        let mut current_literal = None;
+        while let Some(row) = peek_iterator.next() {
+            let row = match row {
+                Ok(row) => row,
+                Err(err) => return PeekStatus::Ready(PeekResponse::Error(err)),
+            };
+            let (row, copies) = row;
+            let copies: NonZeroUsize = NonZeroUsize::try_from(copies).expect("fits into usize");
 
-        while cursor.key_valid(&storage) {
-            if has_literal_constraints {
-                loop {
-                    // Go to the next literal constraint.
-                    // (i.e., to the next OR argument in something like `c=3 OR c=7 OR c=9`)
-                    current_literal = literals.next();
-                    match current_literal {
-                        None => return Ok(results),
-                        Some(current_literal) => {
-                            // NOTE(vmarcos): We expect the extra allocations below to be manageable
-                            // since we only perform as many of them as there are literals.
-                            cursor.seek_key(&storage, IntoOwned::borrow_as(current_literal));
-                            if !cursor.key_valid(&storage) {
-                                return Ok(results);
-                            }
-                            if cursor.get_key(&storage).unwrap()
-                                == IntoOwned::borrow_as(current_literal)
-                            {
-                                // The cursor found a record whose key matches the current literal.
-                                // We break from the inner loop, and process this key.
-                                break;
-                            }
-                            // The cursor landed on a record that has a different key, meaning that there is
-                            // no record whose key would match the current literal.
-                        }
-                    }
-                }
+            total_size = total_size
+                .saturating_add(row.byte_len())
+                .saturating_add(count_byte_size);
+            if peek_stash_eligible && total_size > peek_stash_threshold_bytes {
+                return PeekStatus::UsePeekStash;
+            }
+            if total_size > max_result_size {
+                return PeekStatus::Ready(PeekResponse::Error(format!(
+                    "result exceeds max size of {}",
+                    ByteSize::b(u64::cast_from(max_result_size))
+                )));
             }
 
-            while cursor.val_valid(&storage) {
-                // TODO: This arena could be maintained and reused for longer,
-                // but it wasn't clear at what interval we should flush
-                // it to ensure we don't accidentally spike our memory use.
-                // This choice is conservative, and not the end of the world
-                // from a performance perspective.
-                let arena = RowArena::new();
+            results.push((row, copies));
 
-                let key_item = cursor.key(&storage);
-                let key = key_item.to_datum_iter();
-                let row_item = cursor.val(&storage);
-                let row = row_item.to_datum_iter();
-
-                let mut borrow = datum_vec.borrow();
-                borrow.extend(key);
-                borrow.extend(row);
-
-                if has_literal_constraints {
-                    // The peek was created from an IndexedFilter join. We have to add those columns
-                    // here that the join would add in a dataflow.
-                    let datum_vec = borrow.deref_mut();
-                    // unwrap is ok, because it could be None only if !has_literal_constraints or if
-                    // the iteration is finished. In the latter case we already exited the while
-                    // loop.
-                    datum_vec.extend(current_literal.unwrap().iter());
-                }
-                if let Some(result) = peek
-                    .map_filter_project
-                    .evaluate_into(&mut borrow, &arena, &mut row_builder)
-                    .map(|row| row.cloned())
-                    .map_err_to_string_with_causes()?
-                {
-                    let mut copies = Diff::ZERO;
-                    cursor.map_times(&storage, |time, diff| {
-                        if time.less_equal(&peek.timestamp) {
-                            copies += diff;
-                        }
-                    });
-                    let copies: usize = if copies.is_negative() {
-                        let row = &*borrow;
-                        tracing::error!(
-                            target = %peek.target.id(), diff = %copies, ?row,
-                            "index peek encountered negative multiplicities in ok trace",
-                        );
-                        return Err(format!(
-                            "Invalid data in source, \
-                             saw retractions ({}) for row that does not exist: {:?}",
-                            -copies, row,
-                        ));
+            // If we hold many more than `max_results` records, we can thin down
+            // `results` using `self.finishing.ordering`.
+            if let Some(max_results) = max_results {
+                // We use a threshold twice what we intend, to amortize the work
+                // across all of the insertions. We could tighten this, but it
+                // works for the moment.
+                if results.len() >= 2 * max_results {
+                    if peek.finishing.order_by.is_empty() {
+                        results.truncate(max_results);
+                        return PeekStatus::Ready(PeekResponse::Rows(RowCollection::new(
+                            results,
+                            &peek.finishing.order_by,
+                        )));
                     } else {
-                        copies.into_inner().try_into().unwrap()
-                    };
-                    // if copies > 0 ... otherwise skip
-                    if let Some(copies) = NonZeroUsize::new(copies) {
-                        total_size = total_size
-                            .saturating_add(result.byte_len())
-                            .saturating_add(count_byte_size);
-                        if total_size > max_result_size {
-                            return Err(format!(
-                                "result exceeds max size of {}",
-                                ByteSize::b(u64::cast_from(max_result_size))
-                            ));
-                        }
-                        results.push((result, copies));
-                    }
-
-                    // If we hold many more than `max_results` records, we can thin down
-                    // `results` using `self.finishing.ordering`.
-                    if let Some(max_results) = max_results {
-                        // We use a threshold twice what we intend, to amortize the work
-                        // across all of the insertions. We could tighten this, but it
-                        // works for the moment.
-                        if results.len() >= 2 * max_results {
-                            if peek.finishing.order_by.is_empty() {
-                                results.truncate(max_results);
-                                return Ok(results);
-                            } else {
-                                // We can sort `results` and then truncate to `max_results`.
-                                // This has an effect similar to a priority queue, without
-                                // its interactive dequeueing properties.
-                                // TODO: Had we left these as `Vec<Datum>` we would avoid
-                                // the unpacking; we should consider doing that, although
-                                // it will require a re-pivot of the code to branch on this
-                                // inner test (as we prefer not to maintain `Vec<Datum>`
-                                // in the other case).
-                                results.sort_by(|left, right| {
-                                    let left_datums = l_datum_vec.borrow_with(&left.0);
-                                    let right_datums = r_datum_vec.borrow_with(&right.0);
-                                    mz_expr::compare_columns(
-                                        &peek.finishing.order_by,
-                                        &left_datums,
-                                        &right_datums,
-                                        || left.0.cmp(&right.0),
-                                    )
-                                });
-                                let dropped = results.drain(max_results..);
-                                let dropped_size =
-                                    dropped.into_iter().fold(0, |acc: usize, (row, _count)| {
-                                        acc.saturating_add(
-                                            row.byte_len().saturating_add(count_byte_size),
-                                        )
-                                    });
-                                total_size = total_size.saturating_sub(dropped_size);
-                            }
-                        }
+                        // We can sort `results` and then truncate to `max_results`.
+                        // This has an effect similar to a priority queue, without
+                        // its interactive dequeueing properties.
+                        // TODO: Had we left these as `Vec<Datum>` we would avoid
+                        // the unpacking; we should consider doing that, although
+                        // it will require a re-pivot of the code to branch on this
+                        // inner test (as we prefer not to maintain `Vec<Datum>`
+                        // in the other case).
+                        results.sort_by(|left, right| {
+                            let left_datums = l_datum_vec.borrow_with(&left.0);
+                            let right_datums = r_datum_vec.borrow_with(&right.0);
+                            mz_expr::compare_columns(
+                                &peek.finishing.order_by,
+                                &left_datums,
+                                &right_datums,
+                                || left.0.cmp(&right.0),
+                            )
+                        });
+                        let dropped = results.drain(max_results..);
+                        let dropped_size =
+                            dropped.into_iter().fold(0, |acc: usize, (row, _count)| {
+                                acc.saturating_add(row.byte_len().saturating_add(count_byte_size))
+                            });
+                        total_size = total_size.saturating_sub(dropped_size);
                     }
                 }
-                cursor.step_val(&storage);
-            }
-            // The cursor doesn't have anything more to say for the current key.
-
-            if !has_literal_constraints {
-                // We are simply stepping through all the keys that the index has.
-                cursor.step_key(&storage);
             }
         }
 
-        Ok(results)
+        PeekStatus::Ready(PeekResponse::Rows(RowCollection::new(
+            results,
+            &peek.finishing.order_by,
+        )))
     }
+}
+
+/// For keeping track of the state of pending or ready peeks, and managing
+/// control flow.
+enum PeekStatus {
+    /// The frontiers of objects are not yet advanced enough, peek is still
+    /// pending.
+    NotReady,
+    /// The result size is above the configured threshold and the peek is
+    /// eligible for using the peek result stash.
+    UsePeekStash,
+    /// The peek result is ready.
+    Ready(PeekResponse),
 }
 
 /// The frontiers we have reported to the controller for a collection.
@@ -1662,6 +1708,12 @@ impl ReportedFrontier {
 pub struct CollectionState {
     /// Tracks the frontiers that have been reported to the controller.
     reported_frontiers: ReportedFrontiers,
+    /// The index of the dataflow computing this collection.
+    ///
+    /// Used for dropping the dataflow when the collection is dropped.
+    /// The Dataflow index is wrapped in an `Rc`s and can be shared between collections, to reflect
+    /// the possibility that a single dataflow can export multiple collections.
+    dataflow_index: Rc<usize>,
     /// Whether this collection is a subscribe or copy-to.
     ///
     /// The compute protocol does not allow `Frontiers` responses for subscribe and copy-to
@@ -1697,12 +1749,14 @@ pub struct CollectionState {
 
 impl CollectionState {
     fn new(
+        dataflow_index: Rc<usize>,
         is_subscribe_or_copy: bool,
         as_of: Antichain<Timestamp>,
         metrics: CollectionMetrics,
     ) -> Self {
         Self {
             reported_frontiers: ReportedFrontiers::new(),
+            dataflow_index,
             is_subscribe_or_copy,
             as_of,
             sink_token: None,

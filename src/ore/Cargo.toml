@@ -19,39 +19,39 @@ anyhow = { version = "1.0.98", optional = true }
 # The only exception to the above is the `either` crate, which itself has zero
 # dependencies and is widely considered to be basically part of the stdlib.
 async-trait = { version = "0.1.88", optional = true }
-bytemuck = { version = "1.23.0", optional = true }
+bytemuck = { version = "1.23.1", optional = true }
 bytes = { version = "1.10.1", optional = true }
 chrono = { version = "0.4.39", default-features = false, features = [
     "std",
 ], optional = true }
 clap = { version = "4.5.23", features = ["env", "string"], optional = true }
 columnation = { version = "0.1.0", optional = true }
-columnar = { version = "0.5.0", optional = true }
-compact_bytes = { version = "0.2.0", optional = true }
+columnar = { version = "0.6.0", optional = true }
+compact_bytes = { version = "0.2.1", optional = true }
 ctor = { version = "0.4.2", optional = true }
-differential-dataflow = { version = "0.15.2", optional = true }
+differential-dataflow = { version = "0.15.3", optional = true }
 derivative = { version = "2.2.0" }
 either = "1.15.0"
 futures = { version = "0.3.31", optional = true }
 hibitset = { version = "0.6.4", optional = true }
 itertools = "0.14.0"
 lgalloc = { version = "0.6", optional = true }
-libc = { version = "0.2.172", optional = true }
+libc = { version = "0.2.174", optional = true }
 mz-ore-proc = { path = "../ore-proc", default-features = false }
 num = "0.4.3"
 num-traits = { version = "0.2", optional = true }
 # The vendored feature is transitively depended upon by tokio-openssl.
 openssl = { version = "0.10.73", features = ["vendored"], optional = true }
-parquet = { version = "53.3.0", optional = true, default-features = false }
+parquet = { version = "54.3.1", optional = true, default-features = false }
 paste = "1.0.11"
 pin-project = "1.1.10"
 prometheus = { version = "0.13.4", default-features = false, optional = true }
-proptest = { version = "1.6.0", default-features = false, features = [
+proptest = { version = "1.7.0", default-features = false, features = [
     "std",
 ], optional = true }
 proptest-derive = { version = "0.5.1", optional = true }
 rand = { version = "0.8.5", optional = true }
-smallvec = { version = "1.15.0", optional = true }
+smallvec = { version = "1.15.1", optional = true }
 stacker = { version = "0.1.21", optional = true }
 sentry = { version = "0.38.1", optional = true, default-features = false, features = ["backtrace", "contexts", "debug-images", "transport"] }
 sentry-panic = { version = "0.38.1", optional = true }
@@ -90,7 +90,7 @@ tonic = { version = "0.12.1", features = ["transport"], optional = true }
 tokio-native-tls = { version = "0.3.1", optional = true }
 native-tls = { version = "0.2.14", features = ["alpn"], optional = true }
 hyper-tls = { version = "0.6.0", optional = true }
-hyper-util = { version = "0.1.12", optional = true }
+hyper-util = { version = "0.1.14", optional = true }
 opentelemetry = { version = "0.24.0", features = ["trace"], optional = true }
 opentelemetry-otlp = { version = "0.17.0", optional = true }
 opentelemetry_sdk = { version = "0.24.1", features = [
@@ -105,7 +105,7 @@ yansi = { version = "1.0.1", optional = true }
 anyhow = { version = "1.0.98" }
 criterion = { version = "0.6.0", features = ["async_tokio"] }
 mz-ore = { path = "../ore", features = ["id_gen", "chrono"] }
-proptest = { version = "1.6.0", default-features = false, features = ["std"] }
+proptest = { version = "1.7.0", default-features = false, features = ["std"] }
 scopeguard = "1.2.0"
 serde_json = "1.0.127"
 tokio = { version = "1.44.1", features = ["macros", "rt-multi-thread"] }

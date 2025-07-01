@@ -15,7 +15,7 @@ harness = false
 
 [dependencies]
 anyhow = "1.0.98"
-arrow = { version = "53.3.0", default-features = false }
+arrow = { version = "54.3.1", default-features = false }
 async-trait = "0.1.88"
 aws-config = { version = "1.2.0", default-features = false, features = ["sso"] }
 aws-credential-types = { version = "1.2.3", features = ["hardcoded-credentials"] }
@@ -25,7 +25,7 @@ bytes = "1.10.1"
 columnation = "0.1.0"
 dec = "0.4.8"
 derivative = "2.2.0"
-differential-dataflow = "0.15.2"
+differential-dataflow = "0.15.3"
 hex = "0.4.3"
 http = "1.2.0"
 itertools = { version = "0.14.0" }
@@ -58,7 +58,7 @@ mz-tls-util = { path = "../tls-util" }
 mz-tracing = { path = "../tracing" }
 native-tls = "0.2.14"
 openssl = { version = "0.10.73", features = ["vendored"] }
-proptest = { version = "1.6.0", default-features = false, features = ["std"] }
+proptest = { version = "1.7.0", default-features = false, features = ["std"] }
 proptest-derive = { version = "0.5.1", features = ["boxed_union"] }
 prost = { version = "0.13.5", features = ["no-recursion-limit"] }
 rdkafka = { version = "0.29.0", features = ["cmake-build", "ssl-vendored", "libz-static", "zstd"] }
@@ -66,8 +66,8 @@ regex = "1.11.1"
 serde = { version = "1.0.219", features = ["derive"] }
 serde_json = { version = "1.0.127", features = ["preserve_order"] }
 thiserror = "2.0.12"
-tiberius = { version = "0.12", features = ["sql-browser-tokio", "tds73"], default-features = false }
-timely = "0.21.0"
+tiberius = { version = "0.12", features = ["sql-browser-tokio", "tds73", "vendored-openssl"], default-features = false }
+timely = "0.21.3"
 tokio = { version = "1.44.1", features = ["fs", "rt", "sync", "test-util", "time"] }
 tokio-postgres = { version = "0.7.8", features = ["serde"] }
 tracing = "0.1.37"

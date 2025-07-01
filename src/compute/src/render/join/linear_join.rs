@@ -13,9 +13,7 @@
 
 use std::time::{Duration, Instant};
 
-use columnar::Columnar;
 use differential_dataflow::consolidation::ConsolidatingContainerBuilder;
-use differential_dataflow::containers::Columnation;
 use differential_dataflow::lattice::Lattice;
 use differential_dataflow::operators::arrange::arrangement::Arranged;
 use differential_dataflow::trace::TraceReader;
@@ -33,14 +31,14 @@ use timely::dataflow::channels::pact::{ExchangeCore, Pipeline};
 use timely::dataflow::operators::OkErr;
 use timely::dataflow::scopes::Child;
 use timely::dataflow::{Scope, ScopeParent};
-use timely::progress::timestamp::{Refines, Timestamp};
+use timely::progress::timestamp::Refines;
 
 use crate::extensions::arrange::MzArrangeCore;
 use crate::render::RenderTimestamp;
-use crate::render::context::{ArrangementFlavor, CollectionBundle, Context, ShutdownToken};
+use crate::render::context::{ArrangementFlavor, CollectionBundle, Context, ShutdownProbe};
 use crate::render::join::mz_join_core::mz_join_core;
 use crate::row_spine::{RowRowBuilder, RowRowSpine};
-use crate::typedefs::{RowRowAgent, RowRowEnter};
+use crate::typedefs::{MzTimestamp, RowRowAgent, RowRowEnter};
 
 /// Available linear join implementations.
 ///
@@ -97,7 +95,7 @@ impl LinearJoinSpec {
         &self,
         arranged1: &Arranged<G, Tr1>,
         arranged2: &Arranged<G, Tr2>,
-        shutdown_token: ShutdownToken,
+        shutdown_probe: ShutdownProbe,
         result: L,
     ) -> Collection<G, I::Item, Diff>
     where
@@ -122,19 +120,19 @@ impl LinearJoinSpec {
             (Materialize, Some(work_limit), Some(time_limit)) => {
                 let yield_fn =
                     move |start: Instant, work| work >= work_limit || start.elapsed() >= time_limit;
-                mz_join_core(arranged1, arranged2, shutdown_token, result, yield_fn).as_collection()
+                mz_join_core(arranged1, arranged2, shutdown_probe, result, yield_fn).as_collection()
             }
             (Materialize, Some(work_limit), None) => {
                 let yield_fn = move |_start, work| work >= work_limit;
-                mz_join_core(arranged1, arranged2, shutdown_token, result, yield_fn).as_collection()
+                mz_join_core(arranged1, arranged2, shutdown_probe, result, yield_fn).as_collection()
             }
             (Materialize, None, Some(time_limit)) => {
                 let yield_fn = move |start: Instant, _work| start.elapsed() >= time_limit;
-                mz_join_core(arranged1, arranged2, shutdown_token, result, yield_fn).as_collection()
+                mz_join_core(arranged1, arranged2, shutdown_probe, result, yield_fn).as_collection()
             }
             (Materialize, None, None) => {
                 let yield_fn = |_start, _work| false;
-                mz_join_core(arranged1, arranged2, shutdown_token, result, yield_fn).as_collection()
+                mz_join_core(arranged1, arranged2, shutdown_probe, result, yield_fn).as_collection()
             }
         }
     }
@@ -191,8 +189,8 @@ impl YieldSpec {
 enum JoinedFlavor<G, T>
 where
     G: Scope,
-    G::Timestamp: Lattice + Refines<T> + Columnation,
-    T: Timestamp + Lattice + Columnation,
+    G::Timestamp: Refines<T> + MzTimestamp,
+    T: MzTimestamp,
 {
     /// Streamed data as a collection.
     Collection(Collection<G, Row, Diff>),
@@ -206,9 +204,7 @@ impl<G, T> Context<G, T>
 where
     G: Scope,
     G::Timestamp: Lattice + Refines<T> + RenderTimestamp,
-    <G::Timestamp as Columnar>::Container: Clone + Send,
-    for<'a> <G::Timestamp as Columnar>::Ref<'a>: Ord + Copy,
-    T: Timestamp + Lattice + Columnation,
+    T: MzTimestamp,
 {
     pub(crate) fn render_join(
         &self,
@@ -496,7 +492,7 @@ where
                 .render(
                     &prev_keyed,
                     &next_input,
-                    self.shutdown_token.clone(),
+                    self.shutdown_probe.clone(),
                     move |key, old, new| {
                         let mut row_builder = SharedRow::get();
                         let temp_storage = RowArena::new();
@@ -527,7 +523,7 @@ where
             let oks = self.linear_join_spec.render(
                 &prev_keyed,
                 &next_input,
-                self.shutdown_token.clone(),
+                self.shutdown_probe.clone(),
                 move |key, old, new| {
                     let mut row_builder = SharedRow::get();
                     let temp_storage = RowArena::new();

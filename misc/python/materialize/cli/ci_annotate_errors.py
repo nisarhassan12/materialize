@@ -89,7 +89,7 @@ ERROR_RE = re.compile(
     | cannot\ load\ unknown\ system\ parameter\ from\ catalog\ storage
     | SUMMARY:\ .*Sanitizer
     | primary\ source\ \w+\ seemingly\ dropped\ before\ subsource
-    | Test\ .*\ timed\ out
+    | :\ test\ timed\ out
     # Only notifying on unexpected failures. INT, TRAP, BUS, FPE, SEGV, PIPE
     | \ ANOM_ABEND\ .*\ sig=(2|5|7|8|11|13)
     # \s\S is any character including newlines, so this matches multiline strings
@@ -117,6 +117,9 @@ ERROR_RE = re.compile(
 PANIC_IN_SERVICE_START_RE = re.compile(
     rb"^(\[)?(?P<service>[^ ]*)(\s*\||\]) \d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{6}Z  thread '.*' panicked at "
 )
+
+TIMESTAMP_IN_PANIC_RE = re.compile(rb" \d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{6}Z ")
+
 # Example 1: launchdarkly-materialized-1  | global timestamp must always go up
 # Example 2: [pod/environmentd-0/environmentd] Unknown collection identifier u2082
 SERVICES_LOG_LINE_RE = re.compile(rb"^(\[)?(?P<service>[^ ]*)(\s*\||\]) (?P<msg>.*)$")
@@ -161,7 +164,7 @@ IGNORE_RE = re.compile(
     # For tests we purposely trigger this error
     | skip-version-upgrade-materialized.* \| .* incompatible\ persist\ version\ \d+\.\d+\.\d+(-dev)?,\ current:\ \d+\.\d+\.\d+(-dev\.\d+)?,\ make\ sure\ to\ upgrade\ the\ catalog\ one\ version\ forward\ at\ a\ time
     # For 0dt upgrades
-    | halting\ process:\ (unable\ to\ confirm\ leadership|fenced\ out\ old\ deployment;\ rebooting\ as\ leader|this\ deployment\ has\ been\ fenced\ out)
+    | halting\ process:\ (unable\ to\ confirm\ leadership|fenced\ out\ old\ deployment;\ rebooting\ as\ leader|this\ deployment\ has\ been\ fenced\ out|dependency\ since\ frontier\ is\ empty\ while\ dependent\ upper\ is\ not\ empty)
     | zippy-materialized.* \| .* halting\ process:\ Server\ started\ with\ requested\ generation
     | there\ have\ been\ DDL\ that\ we\ need\ to\ react\ to;\ rebooting\ in\ read-only\ mode
     # Don't care for ssh problems
@@ -189,6 +192,7 @@ IGNORE_RE = re.compile(
 PRODUCT_LIMITS_FIND_IGNORE_RE = re.compile(
     rb"""
     ( Memory\ cgroup\ out\ of\ memory
+    | [Oo]ut\ [Oo]f\ [Mm]emory
     | limits-materialized .* \| .* fatal\ runtime\ error:\ stack\ overflow
     | limits-materialized .* \| .* has\ overflowed\ its\ stack
     )
@@ -222,6 +226,14 @@ PASSWORD_IGNORE_RE = re.compile(
 class ErrorLog:
     match: bytes
     file: str
+
+
+@dataclass
+class Secret:
+    secret: str
+    file: str
+    line: int
+    detector_name: str
 
 
 @dataclass
@@ -292,6 +304,7 @@ class ObservedError(ObservedBaseError):
 @dataclass(kw_only=True, unsafe_hash=True)
 class ObservedErrorWithIssue(ObservedError, WithIssue):
     issue_is_closed: bool
+    issue_ignore_failure: bool
 
     def _get_issue_presentation(self) -> str:
         issue_presentation = f"#{self.issue_number}"
@@ -335,6 +348,7 @@ class Annotation:
     suite_name: str
     buildkite_job_id: str
     is_failure: bool
+    ignore_failure: bool
     build_history_on_main: BuildHistory
     test_cmd: str
     test_desc: str
@@ -348,7 +362,11 @@ class Annotation:
         wrap_in_summary = only_known_errors
 
         build_link = f'<a href="#{self.buildkite_job_id}">{self.suite_name}</a>'
-        outcome = "failed" if self.is_failure else "succeeded"
+        outcome = (
+            ("would have failed" if self.ignore_failure else "failed")
+            if self.is_failure
+            else "succeeded"
+        )
 
         title = f"{build_link} {outcome}"
 
@@ -410,6 +428,7 @@ and finds associated open GitHub issues in Materialize repository.""",
     parser.add_argument("--cloud-hostname", type=str)
     parser.add_argument("--test-cmd", type=str)
     parser.add_argument("--test-desc", type=str, default="")
+    parser.add_argument("--test-result", type=int, default=0)
     parser.add_argument("log_files", nargs="+", help="log files to search in")
     args = parser.parse_args()
 
@@ -424,7 +443,7 @@ and finds associated open GitHub issues in Materialize repository.""",
             was_successful=has_successful_buildkite_status()
         )
 
-        number_of_unknown_errors = annotate_logged_errors(
+        number_of_unknown_errors, ignore_failure = annotate_logged_errors(
             args.log_files, test_analytics, args.test_cmd, args.test_desc
         )
     except Exception as e:
@@ -441,7 +460,21 @@ and finds associated open GitHub issues in Materialize repository.""",
         # An error during an upload must never cause the build to fail
         test_analytics.on_upload_failed(e)
 
-    return 1 if number_of_unknown_errors > 0 else 0
+    if ignore_failure and args.test_result:
+        print(
+            "+++ IGNORING TEST FAILURE: Caused by a known issue annotated with `ci-ignore-failure: true`",
+            file=sys.stderr,
+        )
+        return 0
+
+    if not args.test_result and number_of_unknown_errors:
+        print(
+            "+++ Test succeeded, but unknown errors found in logs, marking as failed",
+            file=sys.stderr,
+        )
+        return 1
+
+    return args.test_result
 
 
 def annotate_errors(
@@ -451,6 +484,7 @@ def annotate_errors(
     test_analytics_db: TestAnalyticsDb,
     test_cmd: str,
     test_desc: str,
+    ignore_failure: bool,
 ) -> None:
     assert len(unknown_errors) > 0 or len(known_errors) > 0
     annotation_style = "info" if not unknown_errors else "error"
@@ -462,6 +496,7 @@ def annotate_errors(
         suite_name=get_suite_name(),
         buildkite_job_id=os.getenv("BUILDKITE_JOB_ID", ""),
         is_failure=is_failure,
+        ignore_failure=ignore_failure,
         build_history_on_main=build_history_on_main,
         unknown_errors=unknown_errors,
         known_errors=known_errors,
@@ -493,17 +528,18 @@ def group_identical_errors(
 
 def annotate_logged_errors(
     log_files: list[str], test_analytics: TestAnalyticsDb, test_cmd: str, test_desc: str
-) -> int:
+) -> tuple[int, bool]:
     """
     Returns the number of unknown errors, 0 when all errors are known or there
-    were no errors logged. This will be used to fail a test even if the test
-    itself succeeded, as long as it had any unknown error logs.
+    were no errors logged as well as whether to ignore the test having failed.
+    This will be used to fail a test even if the test itself succeeded, as long
+    as it had any unknown error logs.
     """
 
     errors = get_errors(log_files)
 
     if not errors:
-        return 0
+        return (0, False)
 
     step_key: str = os.getenv("BUILDKITE_STEP_KEY", "")
     buildkite_label: str = os.getenv("BUILDKITE_LABEL", "")
@@ -519,6 +555,7 @@ def annotate_logged_errors(
     job = os.getenv("BUILDKITE_JOB_ID")
 
     known_errors: list[ObservedBaseError] = []
+    ignore_failure: bool = False
 
     # Keep track of known errors so we log each only once
     already_reported_issue_numbers: set[int] = set()
@@ -555,6 +592,7 @@ def annotate_logged_errors(
                             issue_title=issue.info["title"],
                             issue_number=issue.info["number"],
                             issue_is_closed=False,
+                            issue_ignore_failure=issue.ignore_failure,
                             location=location,
                             location_url=location_url,
                             additional_collapsed_error_details=additional_collapsed_error_details,
@@ -584,6 +622,7 @@ def annotate_logged_errors(
                                 issue_title=issue.info["title"],
                                 issue_number=issue.info["number"],
                                 issue_is_closed=True,
+                                issue_ignore_failure=False,  # Never ignore regressions
                                 location=location,
                                 location_url=location_url,
                                 additional_collapsed_error_details=additional_collapsed_error_details,
@@ -659,8 +698,36 @@ def annotate_logged_errors(
                     additional_collapsed_error_details_header=additional_collapsed_error_details_header,
                     additional_collapsed_error_details=additional_collapsed_error_details,
                 )
+        elif isinstance(error, Secret):
+            for artifact in artifacts:
+                if artifact["job_id"] == job and artifact["path"] == error.file:
+                    location: str = error.file
+                    location_url = get_artifact_url(artifact)
+                    break
+            else:
+                location: str = error.file
+                location_url = None
+
+            handle_error(
+                f"Secret found on line {error.line}: {error.secret}",
+                f"Detector: {error.detector_name}. Don't print out secrets in tests/logs and revoke them immediately. Mark false positives in misc/shlib/shlib.bash's trufflehog_jq_filter_(logs|common)",
+                location,
+                location_url,
+            )
         else:
             raise RuntimeError(f"Unexpected error type: {type(error)}")
+
+    ignore_failure = True
+    if len(unknown_errors) > 0:
+        ignore_failure = False
+    else:
+        for error in known_errors:
+            if not isinstance(error, ObservedErrorWithIssue):
+                ignore_failure = False
+                break
+            elif error.issue_ignore_failure == False:
+                ignore_failure = False
+                break
 
     build_history_on_main = get_failures_on_main(test_analytics)
     annotate_errors(
@@ -670,13 +737,8 @@ def annotate_logged_errors(
         test_analytics,
         test_cmd,
         test_desc,
+        ignore_failure,
     )
-
-    if unknown_errors:
-        print(
-            f"+++ Failing test because of {len(unknown_errors)} unknown error{'s' if len(unknown_errors) != 1 else ''}",
-            file=sys.stderr,
-        )
 
     # No need for rest of the logic as no error logs were found, but since
     # this script was called the test still failed, so showing the current
@@ -700,6 +762,7 @@ def annotate_logged_errors(
             known_errors=[],
             test_cmd=test_cmd,
             test_desc=test_desc,
+            ignore_failure=False,
         )
         add_annotation_raw(style="error", markdown=annotation.to_markdown())
 
@@ -707,14 +770,16 @@ def annotate_logged_errors(
 
     store_known_issues_in_test_analytics(test_analytics, known_issues)
 
-    return len(unknown_errors)
+    return (len(unknown_errors), ignore_failure)
 
 
-def get_errors(log_file_names: list[str]) -> list[ErrorLog | JunitError]:
+def get_errors(log_file_names: list[str]) -> list[ErrorLog | JunitError | Secret]:
     error_logs = []
     for log_file_name in log_file_names:
         if "junit_" in log_file_name:
             error_logs.extend(_get_errors_from_junit_file(log_file_name))
+        elif log_file_name == "trufflehog.log":
+            error_logs.extend(_get_errors_from_trufflehog(log_file_name))
         else:
             error_logs.extend(_get_errors_from_log_file(log_file_name))
 
@@ -742,6 +807,27 @@ def _get_errors_from_junit_file(log_file_name: str) -> list[JunitError]:
                         testcase.name,
                         (result.message or "").replace("&#10;", "\n"),
                         result.text or "",
+                    )
+                )
+    return error_logs
+
+
+def _get_errors_from_trufflehog(log_file_name: str) -> list[Secret]:
+    error_logs = []
+    with open(log_file_name) as f:
+        for line in f:
+            data = json.loads(line)
+            # Only report each secret once
+            for error_log in error_logs:
+                if error_log.secret == data["Raw"]:
+                    break
+            else:
+                error_logs.append(
+                    Secret(
+                        data["Raw"],
+                        data["SourceMetadata"]["Data"]["Filesystem"]["file"],
+                        data["SourceMetadata"]["Data"]["Filesystem"]["line"],
+                        data["DetectorName"],
                     )
                 )
     return error_logs
@@ -853,11 +939,14 @@ def _collect_service_panics_in_logs(data: Any, log_file_name: str) -> list[Error
                 # handle only the ones which are currently in a panic
                 # handler:
                 if panic_start := open_panics.get(match.group("service")):
+                    panic_without_ts = TIMESTAMP_IN_PANIC_RE.sub(b"", panic_start)
                     del open_panics[match.group("service")]
                     if IGNORE_RE.search(match.group(0)):
                         continue
                     collected_panics.append(
-                        ErrorLog(panic_start + b" " + match.group("msg"), log_file_name)
+                        ErrorLog(
+                            panic_without_ts + b" " + match.group("msg"), log_file_name
+                        )
                     )
     assert not open_panics, f"Panic log never finished: {open_panics}"
 

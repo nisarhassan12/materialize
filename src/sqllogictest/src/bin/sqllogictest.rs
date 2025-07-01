@@ -85,8 +85,11 @@ struct Args {
     /// Wrapper program to start child processes
     #[clap(long, env = "ORCHESTRATOR_PROCESS_WRAPPER")]
     orchestrator_process_wrapper: Option<String>,
-    /// Number of replicas, defaults to 2
+    /// Replica size
     #[clap(long, default_value = "2")]
+    replica_size: usize,
+    /// Replication factor
+    #[clap(long, default_value = "1")]
     replicas: usize,
     /// An list of NAME=VALUE pairs used to override static defaults
     /// for system parameters.
@@ -190,6 +193,7 @@ async fn main() -> ExitCode {
             }
         },
         replicas: args.replicas,
+        replica_size: args.replica_size,
     };
 
     if let (Some(shard), Some(shard_count)) = (args.shard, args.shard_count) {

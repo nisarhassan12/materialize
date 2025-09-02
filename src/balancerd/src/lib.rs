@@ -31,7 +31,7 @@ use anyhow::Context;
 use axum::response::IntoResponse;
 use axum::{Router, routing};
 use bytes::BytesMut;
-use domain::base::{Dname, Rtype};
+use domain::base::{Name, Rtype};
 use domain::rdata::AllRecordData;
 use domain::resolv::StubResolver;
 use futures::TryFutureExt;
@@ -66,6 +66,7 @@ use tokio::io::{self, AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::oneshot;
 use tokio::task::JoinSet;
+use tokio_metrics::TaskMetrics;
 use tokio_openssl::SslStream;
 use tokio_postgres::error::SqlState;
 use tower::Service;
@@ -452,7 +453,11 @@ impl mz_server_core::Server for InternalHttpServer {
     const NAME: &'static str = "internal_http";
 
     // TODO(jkosh44) consider forwarding the connection UUID to the adapter.
-    fn handle_connection(&self, conn: Connection) -> mz_server_core::ConnectionHandler {
+    fn handle_connection(
+        &self,
+        conn: Connection,
+        _tokio_metrics_intervals: impl Iterator<Item = TaskMetrics> + Send + 'static,
+    ) -> mz_server_core::ConnectionHandler {
         let router = self.router.clone();
         let service = hyper::service::service_fn(move |req| router.clone().call(req));
         let conn = TokioIo::new(conn);
@@ -780,7 +785,11 @@ impl PgwireBalancer {
 impl mz_server_core::Server for PgwireBalancer {
     const NAME: &'static str = "pgwire_balancer";
 
-    fn handle_connection(&self, conn: Connection) -> mz_server_core::ConnectionHandler {
+    fn handle_connection(
+        &self,
+        conn: Connection,
+        _tokio_metrics_intervals: impl Iterator<Item = TaskMetrics> + Send + 'static,
+    ) -> mz_server_core::ConnectionHandler {
         let tls = self.tls.clone();
         let internal_tls = self.internal_tls;
         let resolver = Arc::clone(&self.resolver);
@@ -1097,11 +1106,11 @@ impl HttpsBalancer {
     /// Finds the tenant of a DNS address. Errors or lack of cname resolution here are ok, because
     /// this is only used for metrics.
     async fn tenant(resolver: &StubResolver, addr: &str) -> Option<String> {
-        let Ok(dname) = Dname::<Vec<_>>::from_str(addr) else {
+        let Ok(dname) = Name::<Vec<_>>::from_str(addr) else {
             return None;
         };
         // Lookup the CNAME. If there's a CNAME, find the tenant.
-        let lookup = resolver.query((dname, Rtype::Cname)).await;
+        let lookup = resolver.query((dname, Rtype::CNAME)).await;
         if let Ok(lookup) = lookup {
             if let Ok(answer) = lookup.answer() {
                 let res = answer.limit_to::<AllRecordData<_, _>>();
@@ -1109,7 +1118,7 @@ impl HttpsBalancer {
                     let Ok(record) = record else {
                         continue;
                     };
-                    if record.rtype() != Rtype::Cname {
+                    if record.rtype() != Rtype::CNAME {
                         continue;
                     }
                     let cname = record.data();
@@ -1151,7 +1160,11 @@ impl mz_server_core::Server for HttpsBalancer {
     const NAME: &'static str = "https_balancer";
 
     // TODO(jkosh44) consider forwarding the connection UUID to the adapter.
-    fn handle_connection(&self, conn: Connection) -> mz_server_core::ConnectionHandler {
+    fn handle_connection(
+        &self,
+        conn: Connection,
+        _tokio_metrics_intervals: impl Iterator<Item = TaskMetrics> + Send + 'static,
+    ) -> mz_server_core::ConnectionHandler {
         let tls_context = self.tls.clone();
         let internal_tls = self.internal_tls.clone();
         let resolver = Arc::clone(&self.resolver);

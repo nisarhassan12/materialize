@@ -20,7 +20,11 @@ from materialize.mysql_util import (
     retrieve_invalid_ssl_context_for_mysql,
     retrieve_ssl_context_for_mysql,
 )
-from materialize.mzcompose.composition import Composition, WorkflowArgumentParser
+from materialize.mzcompose.composition import (
+    Composition,
+    Service,
+    WorkflowArgumentParser,
+)
 from materialize.mzcompose.services.materialized import Materialized
 from materialize.mzcompose.services.minio import Minio
 from materialize.mzcompose.services.mysql import MySql
@@ -32,8 +36,6 @@ from materialize.mzcompose.services.postgres import (
 from materialize.mzcompose.services.test_certs import TestCerts
 from materialize.mzcompose.services.testdrive import Testdrive
 from materialize.source_table_migration import (
-    get_new_image_for_source_table_migration_test,
-    get_old_image_for_source_table_migration_test,
     verify_sources_after_source_table_migration,
 )
 
@@ -119,8 +121,8 @@ def workflow_cdc(c: Composition, parser: WorkflowArgumentParser) -> None:
         matching_files.extend(
             glob.glob(filter, root_dir=MZ_ROOT / "test" / "mysql-cdc-old-syntax")
         )
-    sharded_files: list[str] = sorted(
-        buildkite.shard_list(matching_files, lambda file: file)
+    sharded_files: list[str] = buildkite.shard_list(
+        sorted(matching_files), lambda file: file
     )
     print(f"Files: {sharded_files}")
 
@@ -143,8 +145,8 @@ def workflow_cdc(c: Composition, parser: WorkflowArgumentParser) -> None:
                 f"--var=ssl-wrong-client-key={wrong_ssl_context.client_key}",
                 f"--var=mysql-root-password={MySql.DEFAULT_ROOT_PASSWORD}",
                 "--var=mysql-user-password=us3rp4ssw0rd",
-                f"--var=default-replica-size={Materialized.Size.DEFAULT_SIZE}-{Materialized.Size.DEFAULT_SIZE}",
-                f"--var=default-storage-size={Materialized.Size.DEFAULT_SIZE}-1",
+                f"--var=default-replica-size=scale={Materialized.Size.DEFAULT_SIZE},workers={Materialized.Size.DEFAULT_SIZE}",
+                f"--var=default-storage-size=scale={Materialized.Size.DEFAULT_SIZE},workers=1",
                 file,
             ),
         )
@@ -214,8 +216,7 @@ def workflow_many_inserts(c: Composition, parser: WorkflowArgumentParser) -> Non
     """
     mysql_version = get_targeted_mysql_version(parser)
     with c.override(create_mysql(mysql_version)):
-        c.up("materialized", "mysql")
-        c.up("testdrive", persistent=True)
+        c.up("materialized", "mysql", Service("testdrive", idle=True))
 
         # Records to before creating the source.
         (initial_sql, initial_records) = _make_inserts(txns=1, txn_size=1_000_000)
@@ -311,9 +312,8 @@ def workflow_migration(c: Composition, parser: WorkflowArgumentParser) -> None:
         matching_files.extend(
             glob.glob(filter, root_dir=MZ_ROOT / "test" / "mysql-cdc-old-syntax")
         )
-
-    sharded_files: list[str] = sorted(
-        buildkite.shard_list(matching_files, lambda file: file)
+    sharded_files: list[str] = buildkite.shard_list(
+        sorted(matching_files), lambda file: file
     )
     print(f"Files: {sharded_files}")
 
@@ -323,7 +323,6 @@ def workflow_migration(c: Composition, parser: WorkflowArgumentParser) -> None:
 
         mz_old = Materialized(
             name="materialized",
-            image=get_old_image_for_source_table_migration_test(),
             external_metadata_store=True,
             external_blob_store=True,
             additional_system_parameter_defaults={
@@ -334,7 +333,6 @@ def workflow_migration(c: Composition, parser: WorkflowArgumentParser) -> None:
 
         mz_new = Materialized(
             name="materialized",
-            image=get_new_image_for_source_table_migration_test(),
             external_metadata_store=True,
             external_blob_store=True,
             additional_system_parameter_defaults={
@@ -363,8 +361,8 @@ def workflow_migration(c: Composition, parser: WorkflowArgumentParser) -> None:
                 f"--var=ssl-wrong-client-key={wrong_ssl_context.client_key}",
                 f"--var=mysql-root-password={MySql.DEFAULT_ROOT_PASSWORD}",
                 "--var=mysql-user-password=us3rp4ssw0rd",
-                f"--var=default-replica-size={Materialized.Size.DEFAULT_SIZE}-{Materialized.Size.DEFAULT_SIZE}",
-                f"--var=default-storage-size={Materialized.Size.DEFAULT_SIZE}-1",
+                f"--var=default-replica-size=scale={Materialized.Size.DEFAULT_SIZE},workers={Materialized.Size.DEFAULT_SIZE}",
+                f"--var=default-storage-size=scale={Materialized.Size.DEFAULT_SIZE},workers=1",
                 "--no-reset",
                 file,
             )

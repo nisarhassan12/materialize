@@ -11,7 +11,6 @@
 
 import argparse
 import atexit
-import getpass
 import json
 import os
 import pathlib
@@ -24,11 +23,10 @@ import tempfile
 import time
 import uuid
 from datetime import datetime, timedelta
-from urllib.parse import parse_qsl, urlparse
+from urllib.parse import urlparse
 
-import pg8000.exceptions
-import pg8000.native
 import psutil
+import psycopg
 
 from materialize import MZ_ROOT, rustc_flags, spawn, ui
 from materialize.bazel import remote_cache_arg
@@ -52,6 +50,7 @@ SANITIZER_TARGET = (
 DEFAULT_POSTGRES = "postgres://root@localhost:26257/materialize"
 MZDATA = MZ_ROOT / "mzdata"
 DEFAULT_BLOB = f"file://{MZDATA}/persist/blob"
+RUST_MIN_STACK = os.getenv("RUST_MIN_STACK", "8388608")
 
 # sets entitlements on the built binary, e.g. environmentd, so you can inspect it with Instruments
 MACOS_ENTITLEMENTS_DATA = """
@@ -64,6 +63,32 @@ MACOS_ENTITLEMENTS_DATA = """
     </dict>
 </plist>
 """
+
+
+def update_sqlite_repo() -> None:
+    """Since the SQLite SLT repository is >2x the size of the entire Materialize repository we don't want it as a submodule for everyone to have to fetch, especially in CI. Instead only clone it when we run the tests."""
+    path = pathlib.Path(MZ_ROOT / "test" / "sqllogictest" / "sqlite")
+    if (path / ".git").is_dir():
+        if ui.env_is_truthy("CI"):
+            spawn.runv(["git", "-C", str(path), "pull"])
+        else:
+            spawn.runv(["git", "-C", str(path), "fetch"])
+            local = spawn.capture(["git", "-C", str(path), "rev-parse", "@"])
+            remote = spawn.capture(["git", "-C", str(path), "rev-parse", "@{upstream}"])
+            if local != remote:
+                spawn.runv(["git", "-C", str(path), "pull"])
+    else:
+        path.mkdir(exist_ok=True)
+        spawn.runv(
+            [
+                "git",
+                "clone",
+                # This is currently way slower, I guess GitHub doesn't have it cached:
+                # "--depth=1",
+                "https://github.com/MaterializeInc/sqllogictest",
+                str(path),
+            ]
+        )
 
 
 def main() -> int:
@@ -152,7 +177,7 @@ def main() -> int:
     parser.add_argument(
         "--coverage",
         help="Build with coverage",
-        default=False,
+        default=ui.env_is_truthy("CI_COVERAGE_ENABLED"),
         action="store_true",
     )
     parser.add_argument(
@@ -241,7 +266,6 @@ def main() -> int:
         if args.program == "environmentd":
             _handle_lingering_services(kill=args.reset)
             scratch = MZ_ROOT / "scratch"
-            urlparse(args.postgres).path.removeprefix("/")
             dbconn = _connect_sql(args.postgres)
             for schema in ["consensus", "tsoracle", "storage"]:
                 if args.reset:
@@ -298,13 +322,22 @@ def main() -> int:
             ]
             if args.monitoring:
                 command += ["--opentelemetry-endpoint=http://localhost:4317"]
+            # Common stack overflows in Debug mode
+            if not args.release and not args.optimized:
+                env["RUST_MIN_STACK"] = RUST_MIN_STACK
         elif args.program == "sqllogictest":
-            # sqllogictest creates the scratch directory in a tmpfs mount, which doesn't work well with lgalloc
-            # https://github.com/MaterializeInc/database-issues/issues/8989
+            for arg in args.args:
+                if arg.startswith("test/sqllogictest/sqlite/") or arg.startswith(
+                    "./test/sqllogictest/sqlite/"
+                ):
+                    update_sqlite_repo()
+                    break
+
             formatted_params = [
                 f"{key}={value}"
                 for key, value in get_default_system_parameters().items()
-            ] + ["enable_lgalloc=false"]
+            ]
+
             system_parameter_default = ";".join(formatted_params)
             # Connect to the database to ensure it exists.
             _connect_sql(args.postgres)
@@ -313,6 +346,9 @@ def main() -> int:
                 f"--system-parameter-default={system_parameter_default}",
                 *args.args,
             ]
+            # Common stack overflows in Debug mode
+            if not args.release and not args.optimized:
+                env["RUST_MIN_STACK"] = RUST_MIN_STACK
     elif args.program == "test":
         if args.bazel:
             raise UIError("testing with Bazel is not yet supported")
@@ -336,9 +372,9 @@ def main() -> int:
         for test in args.test:
             command += ["--test", test]
         command += args.args
-        env["COCKROACH_URL"] = args.postgres
+        env["METADATA_BACKEND_URL"] = args.postgres
         # some tests run into stack overflows
-        env["RUST_MIN_STACK"] = "4194304"
+        env["RUST_MIN_STACK"] = RUST_MIN_STACK
         dbconn = _connect_sql(args.postgres)
     else:
         raise UIError(f"unknown program {args.program}")
@@ -552,7 +588,7 @@ def _macos_codesign(path: str) -> None:
     spawn.runv(command, env=env)
 
 
-def _connect_sql(urlstr: str) -> pg8000.native.Connection:
+def _connect_sql(urlstr: str) -> psycopg.Connection:
     hint = """Have you correctly configured CockroachDB or PostgreSQL?
 
 For CockroachDB:
@@ -562,23 +598,15 @@ For PostgreSQL:
     1. Install PostgreSQL
     2. Create a database: `createdb materialize`
     3. Set the MZDEV_POSTGRES environment variable accordingly: `export MZDEV_POSTGRES=postgres://localhost/materialize`"""
-    url = urlparse(urlstr)
-    database = url.path.removeprefix("/")
     try:
-        dbconn = pg8000.native.Connection(
-            host=url.hostname or "localhost",
-            port=url.port or 5432,
-            user=url.username or getpass.getuser(),
-            password=url.password,
-            database=database,
-            startup_params={key: value for key, value in parse_qsl(url.query)},
-        )
-    except pg8000.exceptions.DatabaseError as e:
+        dbconn = psycopg.connect(urlstr)
+        dbconn.autocommit = True
+    except psycopg.DatabaseError as e:
         raise UIError(
-            f"unable to connect to metadata database: {e.args[0]['M']}",
+            f"unable to connect to metadata database: {e}",
             hint=hint,
         )
-    except pg8000.exceptions.InterfaceError as e:
+    except psycopg.InterfaceError as e:
         raise UIError(
             f"unable to connect to metadata database: {e}",
             hint=hint,
@@ -587,20 +615,27 @@ For PostgreSQL:
     # For CockroachDB, after connecting, we can ensure the database exists. For
     # PostgreSQL, the database must exist for us to connect to it at all--we
     # declare it to be the user's problem to create this database.
-    if "crdb_version" in dbconn.parameter_statuses:
-        if not database:
-            raise UIError(
-                f"database name is missing in the postgres URL: {urlstr}",
-                hint="When connecting to CockroachDB, the database name is required.",
-            )
-        _run_sql(dbconn, f"CREATE DATABASE IF NOT EXISTS {database}")
+    url = urlparse(urlstr)
+    database = url.path.removeprefix("/")
+    with dbconn.cursor() as cur:
+        try:
+            cur.execute("SHOW crdb_version")
+            if not database:
+                raise UIError(
+                    f"database name is missing in the postgres URL: {urlstr}",
+                    hint="When connecting to CockroachDB, the database name is required.",
+                )
+        except psycopg.errors.UndefinedObject:
+            return dbconn
 
+    _run_sql(dbconn, f"CREATE DATABASE IF NOT EXISTS {database}")
     return dbconn
 
 
-def _run_sql(conn: pg8000.native.Connection, sql: str) -> None:
+def _run_sql(conn: psycopg.Connection, sql: str) -> None:
     print(f"> {sql}")
-    conn.run(sql)
+    with conn.cursor() as cur:
+        cur.execute(sql.encode("utf-8"))
 
 
 def _handle_lingering_services(kill: bool = False) -> None:

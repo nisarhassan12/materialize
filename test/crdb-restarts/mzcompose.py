@@ -15,7 +15,11 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from textwrap import dedent
 
-from materialize.mzcompose.composition import Composition, WorkflowArgumentParser
+from materialize.mzcompose.composition import (
+    Composition,
+    Service,
+    WorkflowArgumentParser,
+)
 from materialize.mzcompose.service import ServiceHealthcheck
 from materialize.mzcompose.services.cockroach import Cockroach
 from materialize.mzcompose.services.materialized import Materialized
@@ -38,7 +42,7 @@ INIT_SCRIPT = dedent(
     """
     # This source will persist throughout the CRDB rolling restart
     > DROP CLUSTER IF EXISTS s_old_cluster CASCADE;
-    > CREATE CLUSTER s_old_cluster SIZE = '4-4';
+    > CREATE CLUSTER s_old_cluster SIZE = 'scale=4,workers=4';
     > CREATE SOURCE s_old IN CLUSTER s_old_cluster FROM LOAD GENERATOR COUNTER (TICK INTERVAL '0.1s');
 
     > SELECT COUNT(*) > 1 FROM s_old;
@@ -46,7 +50,7 @@ INIT_SCRIPT = dedent(
 
     # This source is recreated periodically
     > DROP CLUSTER IF EXISTS s_new_cluster CASCADE;
-    > CREATE CLUSTER s_new_cluster SIZE ='4-4';
+    > CREATE CLUSTER s_new_cluster SIZE = 'scale=4,workers=4';
     > CREATE SOURCE s_new IN CLUSTER s_new_cluster FROM LOAD GENERATOR COUNTER (TICK INTERVAL '0.1s');
 
     > SELECT COUNT(*) > 1 FROM s_new;
@@ -171,8 +175,7 @@ def run_disruption(c: Composition, d: CrdbDisruption) -> None:
     ]:
         c.exec("cockroach0", "cockroach", "sql", "--insecure", "-e", query)
 
-    c.up("materialized")
-    c.up("testdrive", persistent=True)
+    c.up("materialized", Service("testdrive", idle=True))
 
     # We expect the testdrive fragment to complete within Testdrive's default_timeout
     # This will indicate that Mz has not hung for a prolonged period of time

@@ -56,9 +56,9 @@ ExplainPlan(ExplainPlanStatement { stage: Some(GlobalPlan), with_options: [], fo
 parse-statement
 EXPLAIN PHYSICAL PLAN FOR SELECT 665
 ----
-EXPLAIN PHYSICAL PLAN FOR SELECT 665
+EXPLAIN PHYSICAL PLAN AS VERBOSE TEXT FOR SELECT 665
 =>
-ExplainPlan(ExplainPlanStatement { stage: Some(PhysicalPlan), with_options: [], format: None, explainee: Select(SelectStatement { query: Query { ctes: Simple([]), body: Select(Select { distinct: None, projection: [Expr { expr: Value(Number("665")), alias: None }], from: [], selection: None, group_by: [], having: None, qualify: None, options: [] }), order_by: [], limit: None, offset: None }, as_of: None }, false) })
+ExplainPlan(ExplainPlanStatement { stage: Some(PhysicalPlan), with_options: [], format: Some(VerboseText), explainee: Select(SelectStatement { query: Query { ctes: Simple([]), body: Select(Select { distinct: None, projection: [Expr { expr: Value(Number("665")), alias: None }], from: [], selection: None, group_by: [], having: None, qualify: None, options: [] }), order_by: [], limit: None, offset: None }, as_of: None }, false) })
 
 parse-statement
 EXPLAIN SELECT 665
@@ -353,18 +353,18 @@ EXPLAIN ANALYZE MEMORY, CPU, CPU WITH SKEW FOR MATERIALIZED VIEW w
 ----
 error: both CPU and MEMORY were specified, expected WITH SKEW or FOR
 EXPLAIN ANALYZE MEMORY, CPU, CPU WITH SKEW FOR MATERIALIZED VIEW w
-      ^
+                             ^
 
 parse-statement
 EXPLAIN ANALYZE HINTS FOR SELECT 1
 ----
-error: expected INDEX or MATERIALIZED VIEW
+error: Expected one of INDEX or MATERIALIZED, found SELECT
 EXPLAIN ANALYZE HINTS FOR SELECT 1
-    ^
+                          ^
 
 parse-statement
 EXPLAIN ANALYZE HINTS FOR idx_top_buyers
 ----
-error: expected INDEX or MATERIALIZED VIEW
+error: Expected one of INDEX or MATERIALIZED, found identifier "idx_top_buyers"
 EXPLAIN ANALYZE HINTS FOR idx_top_buyers
-    ^
+                          ^

@@ -7,6 +7,7 @@
 # the Business Source License, use of this software will be governed
 # by the Apache License, Version 2.0.
 
+$ set-sql-timeout duration=60s
 $ set-arg-default single-replica-cluster=quickstart
 #
 # Test basic connection functionality
@@ -34,12 +35,14 @@ conn   kafka
     SECURITY PROTOCOL PLAINTEXT
   )
 
+> BEGIN
 > CREATE SOURCE mz_source
   IN CLUSTER ${arg.single-replica-cluster}
   FROM KAFKA CONNECTION conn (TOPIC 'testdrive-connection_test-${testdrive.seed}')
 
 > CREATE TABLE mz_source_tbl (first, second) FROM SOURCE mz_source (REFERENCE "testdrive-connection_test-${testdrive.seed}")
   FORMAT CSV WITH 2 COLUMNS
+> COMMIT
 
 > SELECT * FROM mz_source_tbl
 first second

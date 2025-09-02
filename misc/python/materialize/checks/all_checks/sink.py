@@ -124,6 +124,7 @@ class SinkUpsert(Check):
         return Testdrive(
             dedent(
                 """
+                $ set-sql-timeout duration=60s
                 $ postgres-execute connection=postgres://mz_system@${testdrive.materialize-internal-sql-addr}
                 GRANT SELECT ON sink_source_view TO materialize
                 GRANT USAGE ON CONNECTION kafka_conn TO materialize
@@ -222,7 +223,7 @@ class SinkTables(Check):
 
                 > CREATE MATERIALIZED VIEW sink_large_transaction_view AS SELECT f1 - 1 AS f1 , f2 FROM sink_large_transaction_table;
 
-                > CREATE CLUSTER sink_large_transaction_sink1_cluster SIZE '4';
+                > CREATE CLUSTER sink_large_transaction_sink1_cluster SIZE 'scale=1,workers=4';
 
                 > CREATE SINK sink_large_transaction_sink1
                   IN CLUSTER sink_large_transaction_sink1_cluster
@@ -251,6 +252,7 @@ class SinkTables(Check):
         return Testdrive(
             dedent(
                 """
+                $ set-sql-timeout duration=60s
                 $ schema-registry-verify schema-type=avro subject=testdrive-sink-large-transaction-sink-${testdrive.seed}-value
                 {"type":"record","name":"envelope","fields":[{"name":"before","type":["null",{"type":"record","name":"row","fields":[{"name":"f1","type":"int"},{"name":"f2","type":["null","string"]}]}]},{"name":"after","type":["null","row"]}]}
 
@@ -391,6 +393,7 @@ class SinkNullDefaults(Check):
         return Testdrive(
             dedent(
                 """
+                $ set-sql-timeout duration=60s
                 $ schema-registry-verify schema-type=avro subject=sink-sink-null1-value
                 {"type":"record","name":"envelope","fields":[{"name":"before","type":["null",{"type":"record","name":"row","fields":[{"name":"l_k","type":"string"},{"name":"l_v1","type":["null","string"],"default":null},{"name":"l_v2","type":["null","long"],"default":null},{"name":"c","type":"long"}]}],"default":null},{"name":"after","type":["null","row"],"default":null}]}
 
@@ -653,6 +656,7 @@ class SinkComments(Check):
         return Testdrive(
             dedent(
                 """
+                $ set-sql-timeout duration=60s
                 $ schema-registry-verify schema-type=avro subject=sink-sink-comments1-key
                 {"type":"record","name":"row","doc":"comment on view sink_source_comments_view","fields":[{"name":"l_v2","type":["null","long"],"default":null,"doc":"key doc on l_v2"}]}
 
@@ -704,6 +708,9 @@ class SinkComments(Check):
                 U3 A <null> 1000
 
                 # We check the contents of the sink topics by re-ingesting them.
+
+                # Still needs to sleep some before the topic exists
+                $ sleep-is-probably-flaky-i-have-justified-my-need-with-a-comment duration="5s"
 
                 > CREATE SOURCE sink_view_comments1_src
                   FROM KAFKA CONNECTION kafka_conn (TOPIC 'sink-sink-comments1')
@@ -878,6 +885,7 @@ class SinkAutoCreatedTopicConfig(Check):
         return Testdrive(
             dedent(
                 """
+                $ set-sql-timeout duration=60s
                 $ kafka-verify-topic sink=materialize.public.sink_config1 partition-count=1 topic-config={"cleanup.policy": "compact"}
 
                 $ kafka-verify-topic sink=materialize.public.sink_config2 partition-count=1 topic-config={"cleanup.policy": "compact"}
@@ -964,6 +972,7 @@ class AlterSink(Check):
         return Testdrive(
             dedent(
                 """
+                $ set-sql-timeout duration=60s
                 # We check the contents of the sink topics by re-ingesting them.
 
                 > CREATE SOURCE sink_alter_source_src
@@ -1047,6 +1056,7 @@ class AlterSinkMv(Check):
         return Testdrive(
             dedent(
                 """
+                $ set-sql-timeout duration=60s
                 > CREATE SOURCE sink_alter_mv_source_src
                   FROM KAFKA CONNECTION kafka_conn (TOPIC 'sink-alter-mv')
                 > CREATE TABLE sink_alter_mv_source FROM SOURCE sink_alter_mv_source_src (REFERENCE "sink-alter-mv")
@@ -1118,6 +1128,7 @@ class AlterSinkLGSource(Check):
         return Testdrive(
             dedent(
                 """
+                $ set-sql-timeout duration=60s
                 > CREATE SOURCE sink_alter_lg_source_src
                   FROM KAFKA CONNECTION kafka_conn (TOPIC 'sink-alter-lg')
                 > CREATE TABLE sink_alter_lg_source FROM SOURCE sink_alter_lg_source_src (REFERENCE "sink-alter-lg")
@@ -1243,6 +1254,7 @@ class AlterSinkPgSource(Check):
         return Testdrive(
             dedent(
                 """
+                $ set-sql-timeout duration=60s
                 > CREATE SOURCE sink_alter_pg_source_src
                   FROM KAFKA CONNECTION kafka_conn (TOPIC 'sink-alter-pg')
                 > CREATE TABLE sink_alter_pg_source FROM SOURCE sink_alter_pg_source_src (REFERENCE "sink-alter-pg")
@@ -1271,8 +1283,8 @@ class AlterSinkWebhook(Check):
         return Testdrive(
             dedent(
                 """
-                >[version>=14700] CREATE CLUSTER sink_webhook_cluster SIZE '1', REPLICATION FACTOR 2;
-                >[version<14700] CREATE CLUSTER sink_webhook_cluster SIZE '1', REPLICATION FACTOR 1;
+                >[version>=14700] CREATE CLUSTER sink_webhook_cluster SIZE 'scale=1,workers=1', REPLICATION FACTOR 2;
+                >[version<14700] CREATE CLUSTER sink_webhook_cluster SIZE 'scale=1,workers=1', REPLICATION FACTOR 1;
                 > CREATE SOURCE webhook_alter1 IN CLUSTER sink_webhook_cluster FROM WEBHOOK BODY FORMAT TEXT;
                 > CREATE SINK sink_alter_wh FROM webhook_alter1
                   INTO KAFKA CONNECTION kafka_conn (TOPIC 'sink-alter-wh')
@@ -1323,6 +1335,9 @@ class AlterSinkWebhook(Check):
         return Testdrive(
             dedent(
                 """
+                # Can be slow in 0dt upgrade scenarios
+                $ set-sql-timeout duration=480s
+
                 > CREATE SOURCE sink_alter_wh_source_src
                   FROM KAFKA CONNECTION kafka_conn (TOPIC 'sink-alter-wh')
                 > CREATE TABLE sink_alter_wh_source FROM SOURCE sink_alter_wh_source_src (REFERENCE "sink-alter-wh")
@@ -1401,6 +1416,7 @@ class AlterSinkOrder(Check):
         return Testdrive(
             dedent(
                 """
+                $ set-sql-timeout duration=60s
                 # We check the contents of the sink topics by re-ingesting them.
 
                 > CREATE SOURCE sink_alter_order_source_src
@@ -1435,7 +1451,7 @@ class SinkFormat(Check):
                 > CREATE TABLE sink_format_table (f1 INTEGER, f2 TEXT, f3 INT, PRIMARY KEY (f1));
                 > CREATE DEFAULT INDEX ON sink_format_table;
                 > INSERT INTO sink_format_table VALUES (1, 'A', 10);
-                > CREATE CLUSTER sink_format_sink1_cluster SIZE '1';
+                > CREATE CLUSTER sink_format_sink1_cluster SIZE 'scale=1,workers=1';
 
                 > CREATE SINK sink_format_sink1
                   IN CLUSTER sink_format_sink1_cluster
@@ -1466,6 +1482,7 @@ class SinkFormat(Check):
         return Testdrive(
             dedent(
                 """
+                $ set-sql-timeout duration=60s
                 # We check the contents of the sink topics by re-ingesting them.
                 > CREATE SOURCE sink_format_source_src
                   FROM KAFKA CONNECTION kafka_conn (TOPIC 'testdrive-sink-format-sink-${testdrive.seed}')
@@ -1501,7 +1518,7 @@ class SinkPartitionByDebezium(Check):
 
                 > CREATE MATERIALIZED VIEW sink_partition_by_debezium_view AS SELECT f1 - 1 AS f1 , f2 FROM sink_partition_by_debezium_table;
 
-                > CREATE CLUSTER sink_partition_by_debezium_sink1_cluster SIZE '4';
+                > CREATE CLUSTER sink_partition_by_debezium_sink1_cluster SIZE 'scale=1,workers=4';
 
                 > CREATE SINK sink_partition_by_debezium_sink1
                   IN CLUSTER sink_partition_by_debezium_sink1_cluster

@@ -19,7 +19,11 @@ from textwrap import dedent
 
 from materialize import buildkite
 from materialize.buildkite import shard_list
-from materialize.mzcompose.composition import Composition, WorkflowArgumentParser
+from materialize.mzcompose.composition import (
+    Composition,
+    Service,
+    WorkflowArgumentParser,
+)
 from materialize.mzcompose.services.clusterd import Clusterd
 from materialize.mzcompose.services.materialized import Materialized
 from materialize.mzcompose.services.mysql import MySql
@@ -428,7 +432,8 @@ SCENARIOS = [
             """
         ),
         materialized_memory="4.5Gb",
-        clusterd_memory="1Gb",
+        # TODO: Reduce to 1Gb when https://github.com/MaterializeInc/database-issues/issues/9515 is fixed
+        clusterd_memory="2Gb",
     ),
     MySqlCdcScenario(
         name="mysql-cdc-snapshot",
@@ -794,7 +799,7 @@ SCENARIOS = [
             > INSERT INTO t (a, b) VALUES (0, 0);
 
             > DROP CLUSTER IF EXISTS idx_cluster CASCADE;
-            > CREATE CLUSTER idx_cluster SIZE '1-8G', REPLICATION FACTOR 2;
+            > CREATE CLUSTER idx_cluster SIZE 'scale=1,workers=1,mem=8GiB', REPLICATION FACTOR 2;
 
             > CREATE VIEW accumulable AS
               SELECT
@@ -1488,10 +1493,17 @@ def run_scenario(
     c.down(destroy_volumes=True)
 
     with c.override(
-        Materialized(memory=materialized_memory),
+        Materialized(memory=materialized_memory, support_external_clusterd=True),
         Clusterd(memory=clusterd_memory),
     ):
-        c.up("redpanda", "materialized", "postgres", "mysql", "clusterd")
+        c.up(
+            "redpanda",
+            "materialized",
+            "postgres",
+            "mysql",
+            "clusterd",
+            Service("testdrive", idle=True),
+        )
 
         c.sql(
             "ALTER SYSTEM SET unsafe_enable_unorchestrated_cluster_replicas = true;",
@@ -1513,7 +1525,6 @@ def run_scenario(
         testdrive_timeout_arg = "--default-timeout=5m"
         statement_timeout = "> SET statement_timeout = '600s';\n"
 
-        c.up("testdrive", persistent=True)
         c.testdrive(
             statement_timeout + scenario.pre_restart, args=[testdrive_timeout_arg]
         )

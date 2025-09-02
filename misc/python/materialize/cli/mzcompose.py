@@ -39,9 +39,14 @@ from humanize import naturalsize
 from semver.version import Version
 
 from materialize import MZ_ROOT, ci_util, mzbuild, spawn, ui
-from materialize.mzcompose.composition import Composition, UnknownCompositionError
+from materialize.mzcompose.composition import (
+    Composition,
+    UnknownCompositionError,
+)
+from materialize.mzcompose.services.sql_server import SqlServer
 from materialize.mzcompose.test_result import TestResult
 from materialize.ui import UIError
+from materialize.util import filter_cmd
 
 RECOMMENDED_MIN_MEM = 7 * 1024**3  # 7GiB
 RECOMMENDED_MIN_CPUS = 2
@@ -517,9 +522,31 @@ class SqlCommand(Command):
                     "-e=MYSQL_PWD=p@ssw0rd",
                 ],
             )
+        elif image == "materialize/mssql-server":
+            assert not args.mz_system
+            deps = composition.repo.resolve_dependencies(
+                [composition.repo.images["mssql-server"]]
+            )
+            deps.acquire()
+            deps["mssql-server"].run(
+                [
+                    "-C",
+                    "-S",
+                    service.get("hostname", args.service),
+                    "-U",
+                    SqlServer.DEFAULT_USER,
+                    "-P",
+                    SqlServer.DEFAULT_SA_PASSWORD,
+                ],
+                docker_args=[
+                    "--entrypoint=/opt/mssql-tools18/bin/sqlcmd",
+                    "--interactive",
+                    f"--network={composition.name}_default",
+                ],
+            )
         else:
             raise UIError(
-                f"cannot connect SQL shell to unhandled service {args.service!r}"
+                f"cannot connect SQL shell to unhandled service {args.service!r} (image {image}"
             )
 
 
@@ -571,23 +598,28 @@ class DockerComposeCommand(Command):
             return
 
         composition = load_composition(args)
-        ui.section("Collecting mzbuild images")
-        for d in composition.dependencies:
-            ui.say(d.spec())
+        if (
+            args.coverage
+            or not ui.env_is_truthy("CI")
+            or ui.env_is_truthy("CI_ALLOW_LOCAL_BUILD")
+        ):
+            ui.section("Collecting mzbuild images")
+            for d in composition.dependencies:
+                ui.say(d.spec())
 
-        if self.runs_containers:
-            if args.coverage:
-                # If the user has requested coverage information, create the
-                # coverage directory as the current user, so Docker doesn't create
-                # it as root.
-                (composition.path / "coverage").mkdir(exist_ok=True)
-                # Need materialize user to be able to write to coverage
-                os.chmod(composition.path / "coverage", 0o777)
-            self.check_docker_resource_limits()
-            composition.dependencies.acquire()
+            if self.runs_containers:
+                if args.coverage:
+                    # If the user has requested coverage information, create the
+                    # coverage directory as the current user, so Docker doesn't create
+                    # it as root.
+                    (composition.path / "coverage").mkdir(exist_ok=True)
+                    # Need materialize user to be able to write to coverage
+                    os.chmod(composition.path / "coverage", 0o777)
+                self.check_docker_resource_limits()
+                composition.dependencies.acquire()
 
-            if "services" in composition.compose:
-                composition.pull_if_variable(composition.compose["services"].keys())
+                if "services" in composition.compose:
+                    composition.pull_if_variable(composition.compose["services"].keys())
 
         self.handle_composition(args, composition)
 
@@ -743,8 +775,7 @@ To see the available workflows, run:
 
             if self.shall_generate_junit_report(args.find):
                 junit_suite = self.generate_junit_suite(composition)
-                junit_xml_file_path = self.write_junit_report_to_file(junit_suite)
-                ci_util.upload_junit_report("mzcompose", junit_xml_file_path)
+                self.write_junit_report_to_file(junit_suite)
 
             if any(
                 not result.is_successful()
@@ -819,6 +850,11 @@ To see the available workflows, run:
                 junit_suite.test_cases.append(test_case)
 
     def write_junit_report_to_file(self, junit_suite: junit_xml.TestSuite) -> Path:
+        for test_case in junit_suite.test_cases:
+            for obj in test_case.errors + test_case.failures + test_case.skipped:
+                for typ in ("message", "output"):
+                    if obj[typ]:
+                        obj[typ] = " ".join(filter_cmd(obj[typ].split(" ")))
         junit_report = ci_util.junit_report_filename("mzcompose")
         with junit_report.open("w") as f:
             junit_xml.to_xml_report_file(f, [junit_suite])

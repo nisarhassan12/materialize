@@ -17,14 +17,16 @@
 # tolerances into these checks that verify whether induced lag is present. A
 # threshold value of 2 seconds seems to work fine.
 
+$ set-sql-timeout duration=60s
+
 $ postgres-connect name=mz_system url=postgres://mz_system:materialize@${testdrive.materialize-internal-sql-addr}
 
 $ postgres-execute connection=mz_system
 ALTER SYSTEM SET max_clusters = 15
 
-> CREATE CLUSTER source SIZE '1'
-> CREATE CLUSTER compute SIZE '1'
-> CREATE CLUSTER sink SIZE '1'
+> CREATE CLUSTER source SIZE 'scale=1,workers=1'
+> CREATE CLUSTER compute SIZE 'scale=1,workers=1'
+> CREATE CLUSTER sink SIZE 'scale=1,workers=1'
 
 # Set up a bunch of sources and materializations that depend on each other.
 # Put them on different clusters so we can spin some down to create lag.

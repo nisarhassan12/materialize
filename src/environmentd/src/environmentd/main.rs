@@ -182,6 +182,10 @@ pub struct Args {
     /// Name of a non-default Kubernetes scheduler, if any.
     #[structopt(long, env = "ORCHESTRATOR_KUBERNETES_SCHEDULER_NAME")]
     orchestrator_kubernetes_scheduler_name: Option<String>,
+    /// Annotations to apply to all services created by the Kubernetes orchestrator
+    /// in the form `KEY=VALUE`.
+    #[structopt(long, env = "ORCHESTRATOR_KUBERNETES_SERVICE_ANNOTATION")]
+    orchestrator_kubernetes_service_annotation: Vec<KeyValueArg<String, String>>,
     /// Labels to apply to all services created by the Kubernetes orchestrator
     /// in the form `KEY=VALUE`.
     #[structopt(long, env = "ORCHESTRATOR_KUBERNETES_SERVICE_LABEL")]
@@ -464,13 +468,6 @@ pub struct Args {
     /// If specified, this file will be used instead of LaunchDarkly for configuration.
     #[clap(long, env = "CONFIG_SYNC_FILE_PATH", value_name = "PATH")]
     config_sync_file_path: Option<PathBuf>,
-    /// A scratch directory that can be used for ephemeral storage.
-    //
-    // NOTE(jkosh44): this argument is intentionally unused at present. It is
-    // future proofing for a world where `environmentd` needs to spill
-    // ephemeral state to disk.
-    #[clap(long, env = "SCRATCH_DIRECTORY", value_name = "PATH")]
-    scratch_directory: Option<PathBuf>,
 
     // === Bootstrap options. ===
     #[clap(
@@ -493,42 +490,42 @@ pub struct Args {
     #[clap(
         long,
         env = "BOOTSTRAP_DEFAULT_CLUSTER_REPLICA_SIZE",
-        default_value = "1"
+        default_value = "scale=1,workers=1"
     )]
     bootstrap_default_cluster_replica_size: String,
     /// The size of the builtin system cluster replicas if bootstrapping.
     #[clap(
         long,
         env = "BOOTSTRAP_BUILTIN_SYSTEM_CLUSTER_REPLICA_SIZE",
-        default_value = "1"
+        default_value = "scale=1,workers=1"
     )]
     bootstrap_builtin_system_cluster_replica_size: String,
     /// The size of the builtin catalog server cluster replicas if bootstrapping.
     #[clap(
         long,
         env = "BOOTSTRAP_BUILTIN_CATALOG_SERVER_CLUSTER_REPLICA_SIZE",
-        default_value = "1"
+        default_value = "scale=1,workers=1"
     )]
     bootstrap_builtin_catalog_server_cluster_replica_size: String,
     /// The size of the builtin probe cluster replicas if bootstrapping.
     #[clap(
         long,
         env = "BOOTSTRAP_BUILTIN_PROBE_CLUSTER_REPLICA_SIZE",
-        default_value = "1"
+        default_value = "scale=1,workers=1"
     )]
     bootstrap_builtin_probe_cluster_replica_size: String,
     /// The size of the builtin support cluster replicas if bootstrapping.
     #[clap(
         long,
         env = "BOOTSTRAP_BUILTIN_SUPPORT_CLUSTER_REPLICA_SIZE",
-        default_value = "1"
+        default_value = "scale=1,workers=1"
     )]
     bootstrap_builtin_support_cluster_replica_size: String,
     /// The size of the builtin analytics cluster replicas if bootstrapping.
     #[clap(
         long,
         env = "BOOTSTRAP_BUILTIN_ANALYTICS_CLUSTER_REPLICA_SIZE",
-        default_value = "1"
+        default_value = "scale=1,workers=1"
     )]
     bootstrap_builtin_analytics_cluster_replica_size: String,
     #[clap(
@@ -590,9 +587,6 @@ pub struct Args {
     /// File containing a valid Materialize license key.
     #[clap(long, env = "LICENSE_KEY")]
     license_key: Option<String>,
-    // TODO: temporary until we get the rest of the infrastructure in place
-    #[clap(long, hide = true)]
-    disable_license_key_checks: bool,
 
     // === AWS options. ===
     /// The AWS account ID, which will be used to generate ARNs for
@@ -676,9 +670,7 @@ fn run(mut args: Args) -> Result<(), anyhow::Error> {
     sys::enable_sigusr2_coverage_dump()?;
     sys::enable_termination_signal_cleanup()?;
 
-    let license_key = if args.disable_license_key_checks {
-        ValidatedLicenseKey::disabled()
-    } else if let Some(license_key_file) = args.license_key {
+    let license_key = if let Some(license_key_file) = args.license_key {
         let license_key_text = std::fs::read_to_string(&license_key_file)
             .context("failed to open license key file")?;
         let license_key = mz_license_keys::validate(
@@ -813,6 +805,11 @@ fn run(mut args: Args) -> Result<(), anyhow::Error> {
                     .block_on(KubernetesOrchestrator::new(KubernetesOrchestratorConfig {
                         context: args.orchestrator_kubernetes_context.clone(),
                         scheduler_name: args.orchestrator_kubernetes_scheduler_name,
+                        service_annotations: args
+                            .orchestrator_kubernetes_service_annotation
+                            .into_iter()
+                            .map(|l| (l.key, l.value))
+                            .collect(),
                         service_labels: args
                             .orchestrator_kubernetes_service_label
                             .into_iter()

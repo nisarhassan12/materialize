@@ -9,6 +9,9 @@
 
 mod notice;
 
+use std::cmp;
+use std::time::Duration;
+
 use bytesize::ByteSize;
 use ipnet::IpNet;
 use mz_adapter_types::compaction::CompactionWindow;
@@ -21,14 +24,14 @@ use mz_catalog::builtin::{
     MZ_CONNECTIONS, MZ_CONTINUAL_TASKS, MZ_DATABASES, MZ_DEFAULT_PRIVILEGES, MZ_EGRESS_IPS,
     MZ_FUNCTIONS, MZ_HISTORY_RETENTION_STRATEGIES, MZ_INDEX_COLUMNS, MZ_INDEXES,
     MZ_INTERNAL_CLUSTER_REPLICAS, MZ_KAFKA_CONNECTIONS, MZ_KAFKA_SINKS, MZ_KAFKA_SOURCE_TABLES,
-    MZ_KAFKA_SOURCES, MZ_LIST_TYPES, MZ_MAP_TYPES, MZ_MATERIALIZED_VIEW_REFRESH_STRATEGIES,
-    MZ_MATERIALIZED_VIEWS, MZ_MYSQL_SOURCE_TABLES, MZ_NETWORK_POLICIES, MZ_NETWORK_POLICY_RULES,
-    MZ_OBJECT_DEPENDENCIES, MZ_OPERATORS, MZ_PENDING_CLUSTER_REPLICAS, MZ_POSTGRES_SOURCE_TABLES,
-    MZ_POSTGRES_SOURCES, MZ_PSEUDO_TYPES, MZ_ROLE_MEMBERS, MZ_ROLE_PARAMETERS, MZ_ROLES,
-    MZ_SCHEMAS, MZ_SECRETS, MZ_SESSIONS, MZ_SINKS, MZ_SOURCE_REFERENCES, MZ_SOURCES,
-    MZ_SQL_SERVER_SOURCE_TABLES, MZ_SSH_TUNNEL_CONNECTIONS, MZ_STORAGE_USAGE_BY_SHARD,
-    MZ_SUBSCRIPTIONS, MZ_SYSTEM_PRIVILEGES, MZ_TABLES, MZ_TYPE_PG_METADATA, MZ_TYPES, MZ_VIEWS,
-    MZ_WEBHOOKS_SOURCES,
+    MZ_KAFKA_SOURCES, MZ_LICENSE_KEYS, MZ_LIST_TYPES, MZ_MAP_TYPES,
+    MZ_MATERIALIZED_VIEW_REFRESH_STRATEGIES, MZ_MATERIALIZED_VIEWS, MZ_MYSQL_SOURCE_TABLES,
+    MZ_NETWORK_POLICIES, MZ_NETWORK_POLICY_RULES, MZ_OBJECT_DEPENDENCIES, MZ_OPERATORS,
+    MZ_PENDING_CLUSTER_REPLICAS, MZ_POSTGRES_SOURCE_TABLES, MZ_POSTGRES_SOURCES, MZ_PSEUDO_TYPES,
+    MZ_ROLE_MEMBERS, MZ_ROLE_PARAMETERS, MZ_ROLES, MZ_SCHEMAS, MZ_SECRETS, MZ_SESSIONS, MZ_SINKS,
+    MZ_SOURCE_REFERENCES, MZ_SOURCES, MZ_SQL_SERVER_SOURCE_TABLES, MZ_SSH_TUNNEL_CONNECTIONS,
+    MZ_STORAGE_USAGE_BY_SHARD, MZ_SUBSCRIPTIONS, MZ_SYSTEM_PRIVILEGES, MZ_TABLES,
+    MZ_TYPE_PG_METADATA, MZ_TYPES, MZ_VIEWS, MZ_WEBHOOKS_SOURCES,
 };
 use mz_catalog::config::AwsPrincipalContext;
 use mz_catalog::durable::SourceReferences;
@@ -37,13 +40,17 @@ use mz_catalog::memory::objects::{
     CatalogItem, ClusterVariant, Connection, ContinualTask, DataSourceDesc, Func, Index,
     MaterializedView, Sink, Table, TableDataSource, Type, View,
 };
+use mz_compute_types::dyncfgs::{
+    MEMORY_LIMITER_INTERVAL, MEMORY_LIMITER_USAGE_BIAS, MEMORY_LIMITER_USAGE_FACTOR,
+};
 use mz_controller::clusters::{
-    ManagedReplicaAvailabilityZones, ManagedReplicaLocation, ReplicaAllocation, ReplicaLocation,
+    ManagedReplicaAvailabilityZones, ManagedReplicaLocation, ReplicaLocation,
 };
 use mz_controller_types::ClusterId;
 use mz_expr::MirScalarExpr;
+use mz_license_keys::ValidatedLicenseKey;
 use mz_orchestrator::{CpuLimit, DiskLimit, MemoryLimit};
-use mz_ore::cast::CastFrom;
+use mz_ore::cast::{CastFrom, CastLossy};
 use mz_ore::collections::CollectionExt;
 use mz_persist_client::batch::ProtoBatch;
 use mz_repr::adt::array::ArrayDimension;
@@ -285,7 +292,7 @@ impl CatalogState {
             match &cluster.config.variant {
                 ClusterVariant::Managed(config) => (
                     Some(config.size.as_str()),
-                    Some(config.disk),
+                    Some(self.cluster_replica_size_has_disk(&config.size)),
                     Some(config.replication_factor),
                     if config.availability_zones.is_empty() {
                         None
@@ -375,13 +382,12 @@ impl CatalogState {
                 size,
                 availability_zones: ManagedReplicaAvailabilityZones::FromReplica(Some(az)),
                 allocation: _,
-                disk,
                 billed_as: _,
                 internal,
                 pending,
             }) => (
                 Some(&**size),
-                Some(*disk),
+                Some(self.cluster_replica_size_has_disk(size)),
                 Some(az.as_str()),
                 *internal,
                 *pending,
@@ -390,11 +396,16 @@ impl CatalogState {
                 size,
                 availability_zones: _,
                 allocation: _,
-                disk,
                 billed_as: _,
                 internal,
                 pending,
-            }) => (Some(&**size), Some(*disk), None, *internal, *pending),
+            }) => (
+                Some(&**size),
+                Some(self.cluster_replica_size_has_disk(size)),
+                None,
+                *internal,
+                *pending,
+            ),
             _ => (None, None, None, false, false),
         };
 
@@ -817,14 +828,6 @@ impl CatalogState {
         // Use initial lcw so that we can tell apart default from non-existent windows.
         if let Some(cw) = entry.item().initial_logical_compaction_window() {
             updates.push(self.pack_history_retention_strategy_update(id, cw, diff));
-            // Propagate source export changes.
-            for (cw, mut ids) in self.source_compaction_windows([id]) {
-                // Id already accounted for above.
-                ids.remove(&id);
-                for sub_id in ids {
-                    updates.push(self.pack_history_retention_strategy_update(sub_id, cw, diff));
-                }
-            }
         }
 
         updates
@@ -1107,6 +1110,7 @@ impl CatalogState {
                     ConnectionDetails::Ssh { .. } => "ssh-tunnel",
                     ConnectionDetails::MySql { .. } => "mysql",
                     ConnectionDetails::SqlServer(_) => "sql-server",
+                    ConnectionDetails::IcebergCatalog(_) => "iceberg-catalog",
                 }),
                 Datum::String(&owner_id.to_string()),
                 privileges,
@@ -1150,7 +1154,8 @@ impl CatalogState {
             ConnectionDetails::Csr(_)
             | ConnectionDetails::Postgres(_)
             | ConnectionDetails::MySql(_)
-            | ConnectionDetails::SqlServer(_) => (),
+            | ConnectionDetails::SqlServer(_)
+            | ConnectionDetails::IcebergCatalog(_) => (),
         };
         updates
     }
@@ -1985,50 +1990,75 @@ impl CatalogState {
         Ok(BuiltinTableUpdate::row(id, row, Diff::ONE))
     }
 
+    pub fn pack_license_key_update(
+        &self,
+        license_key: &ValidatedLicenseKey,
+    ) -> Result<BuiltinTableUpdate<&'static BuiltinTable>, Error> {
+        let id = &MZ_LICENSE_KEYS;
+        let row = Row::pack_slice(&[
+            Datum::String(&license_key.id),
+            Datum::String(&license_key.organization),
+            Datum::String(&license_key.environment_id),
+            Datum::TimestampTz(
+                mz_ore::now::to_datetime(license_key.expiration * 1000)
+                    .try_into()
+                    .expect("must fit"),
+            ),
+            Datum::TimestampTz(
+                mz_ore::now::to_datetime(license_key.not_before * 1000)
+                    .try_into()
+                    .expect("must fit"),
+            ),
+        ]);
+        Ok(BuiltinTableUpdate::row(id, row, Diff::ONE))
+    }
+
     pub fn pack_all_replica_size_updates(&self) -> Vec<BuiltinTableUpdate<&'static BuiltinTable>> {
-        let id = &*MZ_CLUSTER_REPLICA_SIZES;
-        let updates = self
-            .cluster_replica_sizes
-            .0
-            .iter()
-            .filter(|(_, a)| !a.disabled)
-            .map(
-                |(
-                    size,
-                    ReplicaAllocation {
-                        memory_limit,
-                        memory_request: _,
-                        cpu_limit,
-                        disk_limit,
-                        scale,
-                        workers,
-                        credits_per_hour,
-                        cpu_exclusive: _,
-                        is_cc: _,
-                        disabled: _,
-                        selectors: _,
-                    },
-                )| {
-                    // Just invent something when the limits are `None`,
-                    // which only happens in non-prod environments (tests, process orchestrator, etc.)
-                    let cpu_limit = cpu_limit.unwrap_or(CpuLimit::MAX);
-                    let MemoryLimit(ByteSize(memory_bytes)) =
-                        (*memory_limit).unwrap_or(MemoryLimit::MAX);
-                    let DiskLimit(ByteSize(disk_bytes)) =
-                        (*disk_limit).unwrap_or(DiskLimit::ARBITRARY);
-                    let row = Row::pack_slice(&[
-                        size.as_str().into(),
-                        u64::from(*scale).into(),
-                        u64::cast_from(*workers).into(),
-                        cpu_limit.as_nanocpus().into(),
-                        memory_bytes.into(),
-                        disk_bytes.into(),
-                        (*credits_per_hour).into(),
-                    ]);
-                    BuiltinTableUpdate::row(id, row, Diff::ONE)
-                },
-            )
-            .collect();
+        let mut updates = Vec::new();
+        for (size, alloc) in &self.cluster_replica_sizes.0 {
+            if alloc.disabled {
+                continue;
+            }
+
+            // Just invent something when the limits are `None`, which only happens in non-prod
+            // environments (tests, process orchestrator, etc.)
+            let cpu_limit = alloc.cpu_limit.unwrap_or(CpuLimit::MAX);
+            let MemoryLimit(ByteSize(memory_bytes)) =
+                (alloc.memory_limit).unwrap_or(MemoryLimit::MAX);
+            let DiskLimit(ByteSize(disk_bytes)) =
+                (alloc.disk_limit).unwrap_or(DiskLimit::ARBITRARY);
+
+            let mut disk_limit = disk_bytes;
+
+            // If swap is enabled, the memory limiter configuration might further reduce the disk
+            // limit.
+            let dyncfg = self.system_config().dyncfgs();
+            if alloc.swap_enabled && MEMORY_LIMITER_INTERVAL.get(dyncfg) != Duration::ZERO {
+                let swap_memory_limit = f64::cast_lossy(memory_bytes)
+                    * MEMORY_LIMITER_USAGE_FACTOR.get(dyncfg)
+                    * MEMORY_LIMITER_USAGE_BIAS.get(dyncfg);
+                let swap_memory_limit = u64::cast_lossy(swap_memory_limit);
+                let swap_disk_limit = swap_memory_limit.saturating_sub(memory_bytes);
+                disk_limit = cmp::min(swap_disk_limit, disk_limit);
+            }
+
+            let row = Row::pack_slice(&[
+                size.as_str().into(),
+                u64::from(alloc.scale).into(),
+                u64::cast_from(alloc.workers).into(),
+                cpu_limit.as_nanocpus().into(),
+                memory_bytes.into(),
+                disk_limit.into(),
+                (alloc.credits_per_hour).into(),
+            ]);
+
+            updates.push(BuiltinTableUpdate::row(
+                &*MZ_CLUSTER_REPLICA_SIZES,
+                row,
+                Diff::ONE,
+            ));
+        }
+
         updates
     }
 

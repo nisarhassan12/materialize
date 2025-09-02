@@ -404,7 +404,6 @@ impl Cluster {
                 availability_zones,
                 logging,
                 replication_factor,
-                disk,
                 optimizer_feature_overrides,
                 schedule,
             }) => {
@@ -427,7 +426,6 @@ impl Cluster {
                     size: size.clone(),
                     availability_zones: availability_zones.clone(),
                     compute,
-                    disk: disk.clone(),
                     optimizer_feature_overrides: optimizer_feature_overrides.clone(),
                     schedule: schedule.clone(),
                 })
@@ -675,17 +673,17 @@ pub struct CatalogCollectionEntry {
 }
 
 impl CatalogCollectionEntry {
-    pub fn desc(&self, name: &FullItemName) -> Result<Cow<RelationDesc>, SqlCatalogError> {
+    pub fn desc(&self, name: &FullItemName) -> Result<Cow<'_, RelationDesc>, SqlCatalogError> {
         self.item().desc(name, self.version)
     }
 
-    pub fn desc_opt(&self) -> Option<Cow<RelationDesc>> {
+    pub fn desc_opt(&self) -> Option<Cow<'_, RelationDesc>> {
         self.item().desc_opt(self.version)
     }
 }
 
 impl mz_sql::catalog::CatalogCollectionItem for CatalogCollectionEntry {
-    fn desc(&self, name: &FullItemName) -> Result<Cow<RelationDesc>, SqlCatalogError> {
+    fn desc(&self, name: &FullItemName) -> Result<Cow<'_, RelationDesc>, SqlCatalogError> {
         CatalogCollectionEntry::desc(self, name)
     }
 
@@ -1670,7 +1668,7 @@ impl CatalogItem {
         &self,
         name: &FullItemName,
         version: RelationVersionSelector,
-    ) -> Result<Cow<RelationDesc>, SqlCatalogError> {
+    ) -> Result<Cow<'_, RelationDesc>, SqlCatalogError> {
         self.desc_opt(version)
             .ok_or_else(|| SqlCatalogError::InvalidDependency {
                 name: name.to_string(),
@@ -1678,7 +1676,7 @@ impl CatalogItem {
             })
     }
 
-    pub fn desc_opt(&self, version: RelationVersionSelector) -> Option<Cow<RelationDesc>> {
+    pub fn desc_opt(&self, version: RelationVersionSelector) -> Option<Cow<'_, RelationDesc>> {
         match &self {
             CatalogItem::Source(src) => Some(Cow::Borrowed(&src.desc)),
             CatalogItem::Log(log) => Some(Cow::Owned(log.variant.desc())),
@@ -2344,13 +2342,16 @@ impl CatalogEntry {
     /// returning an error if this [`CatalogEntry`] does not produce rows.
     ///
     /// If you need to get the [`RelationDesc`] for a specific version, see [`CatalogItem::desc`].
-    pub fn desc_latest(&self, name: &FullItemName) -> Result<Cow<RelationDesc>, SqlCatalogError> {
+    pub fn desc_latest(
+        &self,
+        name: &FullItemName,
+    ) -> Result<Cow<'_, RelationDesc>, SqlCatalogError> {
         self.item.desc(name, RelationVersionSelector::Latest)
     }
 
     /// Reports the latest [`RelationDesc`] of the rows produced by this [`CatalogEntry`], if it
     /// produces rows.
-    pub fn desc_opt_latest(&self) -> Option<Cow<RelationDesc>> {
+    pub fn desc_opt_latest(&self) -> Option<Cow<'_, RelationDesc>> {
         self.item.desc_opt(RelationVersionSelector::Latest)
     }
 
@@ -2962,7 +2963,6 @@ pub struct ClusterVariantManaged {
     pub availability_zones: Vec<String>,
     pub logging: ReplicaLogging,
     pub replication_factor: u32,
-    pub disk: bool,
     pub optimizer_feature_overrides: OptimizerFeatureOverrides,
     pub schedule: ClusterSchedule,
 }
@@ -2974,7 +2974,6 @@ impl From<ClusterVariantManaged> for durable::ClusterVariantManaged {
             availability_zones: managed.availability_zones,
             logging: managed.logging,
             replication_factor: managed.replication_factor,
-            disk: managed.disk,
             optimizer_feature_overrides: managed.optimizer_feature_overrides.into(),
             schedule: managed.schedule,
         }
@@ -2988,7 +2987,6 @@ impl From<durable::ClusterVariantManaged> for ClusterVariantManaged {
             availability_zones: managed.availability_zones,
             logging: managed.logging,
             replication_factor: managed.replication_factor,
-            disk: managed.disk,
             optimizer_feature_overrides: managed.optimizer_feature_overrides.into(),
             schedule: managed.schedule,
         }
@@ -3149,13 +3147,13 @@ impl mz_sql::catalog::CatalogCluster<'_> for Cluster {
 
     // `as` is ok to use to cast to a trait object.
     #[allow(clippy::as_conversions)]
-    fn replicas(&self) -> Vec<&dyn CatalogClusterReplica> {
+    fn replicas(&self) -> Vec<&dyn CatalogClusterReplica<'_>> {
         self.replicas()
             .map(|replica| replica as &dyn CatalogClusterReplica)
             .collect()
     }
 
-    fn replica(&self, id: ReplicaId) -> &dyn CatalogClusterReplica {
+    fn replica(&self, id: ReplicaId) -> &dyn CatalogClusterReplica<'_> {
         self.replica(id).expect("catalog out of sync")
     }
 

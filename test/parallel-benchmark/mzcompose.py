@@ -24,8 +24,12 @@ from matplotlib.markers import MarkerStyle
 from materialize import MZ_ROOT, buildkite
 from materialize.mz_env_util import get_cloud_hostname
 from materialize.mzcompose import ADDITIONAL_BENCHMARKING_SYSTEM_PARAMETERS
-from materialize.mzcompose.composition import Composition, WorkflowArgumentParser
-from materialize.mzcompose.services.azure import Azurite
+from materialize.mzcompose.composition import (
+    Composition,
+    Service,
+    WorkflowArgumentParser,
+)
+from materialize.mzcompose.services.azurite import Azurite
 from materialize.mzcompose.services.balancerd import Balancerd
 from materialize.mzcompose.services.cockroach import Cockroach
 from materialize.mzcompose.services.kafka import Kafka as KafkaService
@@ -94,7 +98,7 @@ SERVICES = [
     KafkaService(),
     SchemaRegistry(),
     Redpanda(),
-    Cockroach(setup_materialize=True),
+    Cockroach(setup_materialize=True, in_memory=True),
     Minio(setup_materialize=True),
     Azurite(),
     KgenService(),
@@ -464,7 +468,7 @@ def run_once(
     with c.override(*overrides):
         for scenario_class in scenarios:
             if target:
-                c.up("testdrive", persistent=True)
+                c.up(Service("testdrive", idle=True))
                 conn_infos = {"materialized": target}
                 conn = target.connect()
                 with conn.cursor() as cur:
@@ -478,8 +482,8 @@ def run_once(
                 mz_string = f"{mz_version} ({target.host})"
             else:
                 print("~~~ Starting up services")
-                c.up(*service_names)
-                c.up("testdrive", persistent=True)
+                c.up(*service_names, Service("testdrive", idle=True))
+                c.verify_build_profile()
 
                 mz_version = c.query_mz_version()
                 mz_string = f"{mz_version} (docker)"

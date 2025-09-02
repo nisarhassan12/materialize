@@ -87,7 +87,7 @@ contains: column "f_nonexistent" does not exist
 > COMMIT
 
 # Create a cluster, run a query on it, and drop it to ensure that we retain the cluster name
-> CREATE CLUSTER c REPLICAS (r1 (size '1'))
+> CREATE CLUSTER c REPLICAS (r1 (SIZE 'scale=1,workers=1'))
 
 > SET cluster TO c
 
@@ -131,19 +131,19 @@ serializable
 <null> c my_app 1 {} success <null> 18 1 standard true "SELECT count(*) FROM t" "strict serializable" true materialize {public}
 <null> c my_app 1 {} success <null> <null> <null> <null> true "DROP CLUSTER c" "strict serializable" <null> materialize {public}
 quickstart quickstart my_app 1 {} error "Evaluation error: division by zero" <null> <null> <null> true "SELECT f/0 FROM t" "strict serializable" true materialize {public}
-quickstart quickstart my_app 1 {} success <null> 13 1 constant true "EXECUTE p('hello world')" "strict serializable" <null> materialize {public}
+quickstart quickstart my_app 1 {} success <null> 13 1 constant true "EXECUTE p ('<REDACTED>')" "strict serializable" <null> materialize {public}
 quickstart quickstart my_app 1 {} success <null> 18 1 fast-path true "SELECT * FROM t" "strict serializable" <null> materialize {public}
 quickstart quickstart my_app 1 {} success <null> 18 1 standard true "SELECT count(*) FROM t" "strict serializable" true materialize {public}
 quickstart quickstart my_app 1 {} success <null> 4 2 constant true "FETCH c" "strict serializable" <null> materialize {public}
 quickstart quickstart my_app 1 {} success <null> <null> <null> <null> true BEGIN "strict serializable" <null> materialize {public}
 quickstart quickstart my_app 1 {} success <null> <null> <null> <null> true COMMIT "strict serializable" <null> materialize {public}
-quickstart quickstart my_app 1 {} success <null> <null> <null> <null> true "CREATE CLUSTER c REPLICAS (r1 (size '1'))" "strict serializable" <null> materialize {public}
+quickstart quickstart my_app 1 {} success <null> <null> <null> <null> true "CREATE CLUSTER c REPLICAS (r1 (SIZE 'scale=1,workers=1'))" "strict serializable" <null> materialize {public}
 quickstart quickstart my_app 1 {} success <null> <null> <null> <null> true "CREATE DEFAULT INDEX i ON t" "strict serializable" <null> materialize {public}
 quickstart quickstart my_app 1 {} success <null> <null> <null> <null> true "CREATE TABLE t(f int)" "strict serializable" <null> materialize {public}
 quickstart quickstart my_app 1 {} success <null> <null> <null> <null> true "DECLARE c CURSOR FOR VALUES (1), (2)" "strict serializable" <null> materialize {public}
 quickstart quickstart my_app 1 {} success <null> <null> <null> <null> true "FETCH c" "strict serializable" <null> materialize {public}
 quickstart quickstart my_app 1 {} success <null> <null> <null> <null> true "FETCH c" "strict serializable" <null> materialize {public}
-quickstart quickstart my_app 1 {} success <null> <null> <null> <null> true "INSERT INTO t VALUES (1)" "strict serializable" <null> materialize {public}
+quickstart quickstart my_app 1 {} success <null> <null> <null> <null> true "INSERT INTO t VALUES ('<REDACTED>')" "strict serializable" <null> materialize {public}
 quickstart quickstart my_app 1 {} success <null> <null> <null> <null> true "PREPARE p AS values ($1)" "strict serializable" <null> materialize {public}
 quickstart quickstart my_app 1 {} success <null> <null> <null> <null> true "SET cluster TO c" "strict serializable" <null> materialize {public}
 mz_catalog_server mz_catalog_server my_app 1 {} success <null> 22 1 constant true "SELECT 'beginning real test!'" "strict serializable" <null> materialize {public}
@@ -159,8 +159,8 @@ BEGIN execution-began
 BEGIN execution-finished
 COMMIT execution-began
 COMMIT execution-finished
-"CREATE CLUSTER c REPLICAS (r1 (size '1'))" execution-began
-"CREATE CLUSTER c REPLICAS (r1 (size '1'))" execution-finished
+"CREATE CLUSTER c REPLICAS (r1 (SIZE 'scale=1,workers=1'))" execution-began
+"CREATE CLUSTER c REPLICAS (r1 (SIZE 'scale=1,workers=1'))" execution-finished
 "CREATE DEFAULT INDEX i ON t" execution-began
 "CREATE DEFAULT INDEX i ON t" execution-finished
 "CREATE TABLE t(f int)" execution-began
@@ -169,11 +169,11 @@ COMMIT execution-finished
 "DECLARE c CURSOR FOR VALUES (1), (2)" execution-finished
 "DROP CLUSTER c" execution-began
 "DROP CLUSTER c" execution-finished
-"EXECUTE p('hello world')" compute-dependencies-finished
-"EXECUTE p('hello world')" execution-began
-"EXECUTE p('hello world')" execution-finished
-"EXECUTE p('hello world')" optimization-finished
-"EXECUTE p('hello world')" storage-dependencies-finished
+"EXECUTE p ('<REDACTED>')" compute-dependencies-finished
+"EXECUTE p ('<REDACTED>')" execution-began
+"EXECUTE p ('<REDACTED>')" execution-finished
+"EXECUTE p ('<REDACTED>')" optimization-finished
+"EXECUTE p ('<REDACTED>')" storage-dependencies-finished
 "FETCH c" compute-dependencies-finished
 "FETCH c" execution-began
 "FETCH c" execution-began
@@ -183,8 +183,8 @@ COMMIT execution-finished
 "FETCH c" execution-finished
 "FETCH c" optimization-finished
 "FETCH c" storage-dependencies-finished
-"INSERT INTO t VALUES (1)" execution-began
-"INSERT INTO t VALUES (1)" execution-finished
+"INSERT INTO t VALUES ('<REDACTED>')" execution-began
+"INSERT INTO t VALUES ('<REDACTED>')" execution-finished
 "PREPARE p AS values ($1)" execution-began
 "PREPARE p AS values ($1)" execution-finished
 "SELECT 'beginning real test!'" compute-dependencies-finished
@@ -271,9 +271,23 @@ ROLLBACK
 > SELECT sql FROM mz_internal.mz_recent_activity_log WHERE statement_type = 'alter_secret';
 "ALTER SECRET my_super_secret AS '<REDACTED>'"
 
-# Test that the number of rows returned in query history respects OFFSET and LIMIT.
+# Test that UPDATE redacts values.
 
 > RESET cluster
+
+> CREATE TABLE redacted_test (a TEXT);
+
+> INSERT INTO redacted_test VALUES ('should be redacted');
+
+> SELECT sql FROM mz_internal.mz_recent_activity_log WHERE statement_type = 'insert' AND sql like '%redacted_test%';
+"INSERT INTO redacted_test VALUES ('<REDACTED>')"
+
+> UPDATE redacted_test SET a = 'also redacted' WHERE a = 'should be redacted';
+
+> SELECT sql FROM mz_internal.mz_recent_activity_log WHERE statement_type = 'update';
+"UPDATE redacted_test SET a = '<REDACTED>' WHERE a = '<REDACTED>'"
+
+# Test that the number of rows returned in query history respects OFFSET and LIMIT.
 
 > CREATE TABLE t_offset_limit (a int);
 

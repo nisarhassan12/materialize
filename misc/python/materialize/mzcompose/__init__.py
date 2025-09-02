@@ -85,7 +85,8 @@ def get_minimal_system_parameters(
             "true" if version >= MzVersion.parse_mz("v0.132.0-dev") else "false"
         ),
         "enable_alter_swap": "true",
-        "enable_columnation_lgalloc": "true",
+        "enable_columnar_lgalloc": "false",
+        "enable_columnation_lgalloc": "false",
         "enable_compute_active_dataflow_cancelation": "true",
         "enable_compute_correction_v2": "true",
         "enable_compute_logical_backpressure": "true",
@@ -95,23 +96,26 @@ def get_minimal_system_parameters(
         "enable_continual_task_transform": "true",
         "enable_copy_to_expr": "true",
         "enable_create_table_from_source": "true",
-        "enable_disk_cluster_replicas": "true",
         "enable_eager_delta_joins": "true",
         "enable_envelope_debezium_in_subscribe": "true",
         "enable_expressions_in_limit_syntax": "true",
         "enable_introspection_subscribes": "true",
         "enable_kafka_sink_partition_by": "true",
+        "enable_lgalloc": "false",
         "enable_logical_compaction_window": "true",
         "enable_multi_worker_storage_persist_sink": "true",
         "enable_multi_replica_sources": "true",
+        "enable_mz_join_core_v2": "true",
         "enable_rbac_checks": "true",
         "enable_reduce_mfp_fusion": "true",
         "enable_refresh_every_mvs": "true",
         "enable_cluster_schedule_refresh": "true",
+        "enable_sql_server_source": "true",
         "enable_statement_lifecycle_logging": "true",
+        "enable_compute_temporal_bucketing": "true",
         "enable_variadic_left_join_lowering": "true",
         "enable_worker_core_affinity": "true",
-        "grpc_client_http2_keep_alive_timeout": "5",
+        "grpc_client_http2_keep_alive_timeout": "5s",
         "ore_overflowing_behavior": "panic",
         "persist_stats_audit_percent": "100",
         "unsafe_enable_table_keys": "true",
@@ -161,7 +165,6 @@ def get_variable_system_parameters(
         ),
         # -----
         # Others (ordered by name),
-        VariableSystemParameter("cluster_always_use_disk", "true", ["true", "false"]),
         VariableSystemParameter(
             "compute_dataflow_max_inflight_bytes",
             "134217728",
@@ -180,9 +183,6 @@ def get_variable_system_parameters(
             "1048576",
             # force-enabled, the in-between, and the production value
             ["0", "1048576", "314572800", "67108864"],
-        ),
-        VariableSystemParameter(
-            "disk_cluster_replicas_default", "true", ["true", "false"]
         ),
         VariableSystemParameter(
             "kafka_default_metadata_fetch_interval",
@@ -244,6 +244,16 @@ def get_variable_system_parameters(
                 if version > MzVersion.parse_mz("v0.127.0-dev")
                 else ["false"]
             ),
+        ),
+        VariableSystemParameter(
+            "persist_gc_min_versions",
+            "16",
+            ["16", "256", "1024"],
+        ),
+        VariableSystemParameter(
+            "persist_gc_max_versions",
+            "128000",
+            ["256", "128000"],
         ),
         VariableSystemParameter(
             "persist_inline_writes_single_max_bytes",
@@ -316,6 +326,9 @@ def get_variable_system_parameters(
         VariableSystemParameter(
             "persist_validate_part_bounds_on_read", "true", ["true", "false"]
         ),
+        VariableSystemParameter(
+            "persist_validate_part_bounds_on_write", "true", ["true", "false"]
+        ),
         VariableSystemParameter("pg_offset_known_interval", "1s", ["100ms", "1s"]),
         VariableSystemParameter(
             "statement_logging_default_sample_rate", "0.01", ["0", "0.01"]
@@ -339,6 +352,9 @@ def get_variable_system_parameters(
         ),
         VariableSystemParameter(
             "storage_use_continual_feedback_upsert", "true", ["true", "false"]
+        ),
+        VariableSystemParameter(
+            "sql_server_offset_known_interval", "1s", ["10ms", "100ms", "1s"]
         ),
         # End of list (ordered by name)
     ]
@@ -394,7 +410,6 @@ UNINTERESTING_SYSTEM_PARAMETERS = [
     "enable_mz_join_core",
     "enable_compute_mv_append_smearing",
     "linear_join_yielding",
-    "enable_lgalloc",
     "enable_lgalloc_eager_reclamation",
     "lgalloc_background_interval",
     "lgalloc_file_growth_dampener",
@@ -404,10 +419,14 @@ UNINTERESTING_SYSTEM_PARAMETERS = [
     "lgalloc_limiter_usage_factor",
     "lgalloc_limiter_usage_bias",
     "lgalloc_limiter_burst_factor",
-    "enable_columnar_lgalloc",
+    "memory_limiter_interval",
+    "memory_limiter_usage_factor",
+    "memory_limiter_usage_bias",
+    "memory_limiter_burst_factor",
     "compute_server_maintenance_interval",
     "compute_dataflow_max_inflight_bytes_cc",
     "compute_flat_map_fuel",
+    "compute_temporal_bucketing_summary",
     "consolidating_vec_growth_dampener",
     "copy_to_s3_parquet_row_group_file_ratio",
     "copy_to_s3_arrow_builder_buffer_ratio",
@@ -517,18 +536,18 @@ UNINTERESTING_SYSTEM_PARAMETERS = [
     "storage_server_maintenance_interval",
     "storage_sink_progress_search",
     "storage_sink_ensure_topic_config",
-    "sql_server_snapshot_max_lsn_wait",
+    "sql_server_max_lsn_wait",
     "sql_server_snapshot_progress_report_interval",
     "sql_server_cdc_poll_interval",
     "sql_server_cdc_cleanup_change_table",
     "sql_server_cdc_cleanup_change_table_max_deletes",
-    "sql_server_offset_known_interval",
     "allow_user_sessions",
     "with_0dt_deployment_ddl_check_interval",
     "enable_0dt_caught_up_check",
     "with_0dt_caught_up_check_allowed_lag",
     "with_0dt_caught_up_check_cutoff",
-    "plan_insights_notice fast_path_clusters_optimize_duration",
+    "enable_0dt_caught_up_replica_status_check",
+    "plan_insights_notice_fast_path_clusters_optimize_duration",
     "enable_continual_task_builtins",
     "enable_expression_cache",
     "enable_password_auth",
@@ -540,9 +559,11 @@ UNINTERESTING_SYSTEM_PARAMETERS = [
     "compute_peek_response_stash_read_memory_budget_bytes",
     "compute_peek_stash_num_batches",
     "compute_peek_stash_batch_size",
-    "enable_timely_init_at_process_startup",
     "persist_enable_incremental_compaction",
     "storage_statistics_retention_duration",
+    "enable_ctp_cluster_protocols",
+    "enable_paused_cluster_readhold_downgrade",
+    "force_swap_for_cc_sizes",
 ]
 
 
@@ -644,12 +665,14 @@ def bootstrap_cluster_replica_size() -> str:
 
 
 def cluster_replica_size_map() -> dict[str, dict[str, Any]]:
+    """scale=<n>,workers=<n>[,mem=<n>GiB][,legacy]"""
+
     def replica_size(
-        workers: int,
         scale: int,
+        workers: int,
         disabled: bool = False,
         is_cc: bool = True,
-        memory_limit: str | None = None,
+        memory_limit: str = "4 GiB",
     ) -> dict[str, Any]:
         return {
             "cpu_exclusive": False,
@@ -658,7 +681,7 @@ def cluster_replica_size_map() -> dict[str, dict[str, Any]]:
             "disabled": disabled,
             "disk_limit": None,
             "is_cc": is_cc,
-            "memory_limit": memory_limit or "4Gi",
+            "memory_limit": memory_limit,
             "scale": scale,
             "workers": workers,
             # "selectors": {},
@@ -666,26 +689,27 @@ def cluster_replica_size_map() -> dict[str, dict[str, Any]]:
 
     replica_sizes = {
         bootstrap_cluster_replica_size(): replica_size(1, 1),
-        "2-4": replica_size(4, 2),
+        "scale=2,workers=4": replica_size(2, 4),
+        "scale=1,workers=1,legacy": replica_size(1, 1, is_cc=False),
+        "scale=1,workers=2,legacy": replica_size(1, 2, is_cc=False),
+        # Intentionally not following the naming scheme
         "free": replica_size(0, 0, disabled=True),
-        "1cc": replica_size(1, 1),
-        "1C": replica_size(1, 1),
-        "1-no-disk": replica_size(1, 1, is_cc=False),
-        "2-no-disk": replica_size(2, 1, is_cc=False),
     }
 
     for i in range(0, 6):
         workers = 1 << i
-        replica_sizes[f"{workers}"] = replica_size(workers, 1)
+        replica_sizes[f"scale=1,workers={workers}"] = replica_size(1, workers)
         for mem in [4, 8, 16, 32]:
-            replica_sizes[f"{workers}-{mem}G"] = replica_size(
-                workers, 1, memory_limit=f"{mem} GiB"
+            replica_sizes[f"scale=1,workers={workers},mem={mem}GiB"] = replica_size(
+                1, workers, memory_limit=f"{mem} GiB"
             )
 
-        replica_sizes[f"{workers}-1"] = replica_size(1, workers)
-        replica_sizes[f"{workers}-{workers}"] = replica_size(workers, workers)
-        replica_sizes[f"mem-{workers}"] = replica_size(
-            workers, 1, memory_limit=f"{workers} GiB"
+        replica_sizes[f"scale={workers},workers=1"] = replica_size(workers, 1)
+        replica_sizes[f"scale={workers},workers={workers}"] = replica_size(
+            workers, workers
+        )
+        replica_sizes[f"scale=1,workers={workers},mem={workers}GiB"] = replica_size(
+            1, workers, memory_limit=f"{workers} GiB"
         )
 
     return replica_sizes

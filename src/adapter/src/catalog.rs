@@ -47,6 +47,7 @@ use mz_compute_types::dataflows::DataflowDescription;
 use mz_controller::clusters::ReplicaLocation;
 use mz_controller_types::{ClusterId, ReplicaId};
 use mz_expr::OptimizedMirRelationExpr;
+use mz_license_keys::ValidatedLicenseKey;
 use mz_ore::collections::HashSet;
 use mz_ore::metrics::MetricsRegistry;
 use mz_ore::now::{EpochMillis, NowFn, SYSTEM_TIME};
@@ -79,7 +80,6 @@ use mz_sql::session::vars::SystemVars;
 use mz_sql_parser::ast::QualifiedReplica;
 use mz_storage_types::connections::ConnectionContext;
 use mz_storage_types::connections::inline::{ConnectionResolver, InlinedConnection};
-use mz_storage_types::read_policy::ReadPolicy;
 use mz_transform::dataflow::DataflowMetainfo;
 use mz_transform::notice::OptimizerNotice;
 use smallvec::SmallVec;
@@ -108,6 +108,7 @@ mod migrate;
 mod apply;
 mod open;
 mod state;
+mod timeline;
 mod transact;
 
 /// A `Catalog` keeps track of the SQL objects known to the planner.
@@ -356,23 +357,6 @@ impl Catalog {
         dropped_notices
     }
 
-    /// For the Sources ids in `ids`, return the read policies for all `ids` and additional ids that
-    /// propagate from them. Specifically, if `ids` contains a source, it and all of its source exports
-    /// will be added to the result.
-    pub fn source_read_policies(
-        &self,
-        id: CatalogItemId,
-    ) -> Vec<(CatalogItemId, ReadPolicy<mz_repr::Timestamp>)> {
-        let mut policies = Vec::new();
-        let cws = self.state.source_compaction_windows([id]);
-        for (cw, items) in cws {
-            for id in items {
-                policies.push((id, cw.into()));
-            }
-        }
-        policies
-    }
-
     /// Return a set of [`GlobalId`]s for items that need to have their cache entries invalidated
     /// as a result of creating new indexes on the items in `ons`.
     ///
@@ -506,7 +490,7 @@ impl Catalog {
     }
 
     /// Creates a debug catalog from the current
-    /// `COCKROACH_URL` with parameters set appropriately for debug contexts,
+    /// `METADATA_BACKEND_URL` with parameters set appropriately for debug contexts,
     /// like in tests.
     ///
     /// WARNING! This function can arbitrarily fail because it does not make any
@@ -742,6 +726,7 @@ impl Catalog {
                 enable_0dt_deployment: true,
                 helm_chart_version: None,
                 external_login_password_mz_system: None,
+                license_key: ValidatedLicenseKey::for_tests(),
             },
         })
         .await?;
@@ -752,11 +737,11 @@ impl Catalog {
         self.state.for_session(session)
     }
 
-    pub fn for_sessionless_user(&self, role_id: RoleId) -> ConnCatalog {
+    pub fn for_sessionless_user(&self, role_id: RoleId) -> ConnCatalog<'_> {
         self.state.for_sessionless_user(role_id)
     }
 
-    pub fn for_system_session(&self) -> ConnCatalog {
+    pub fn for_system_session(&self) -> ConnCatalog<'_> {
         self.state.for_system_session()
     }
 
@@ -1973,7 +1958,7 @@ impl SessionCatalog for ConnCatalog<'_> {
     fn resolve_cluster(
         &self,
         cluster_name: Option<&str>,
-    ) -> Result<&dyn mz_sql::catalog::CatalogCluster, SqlCatalogError> {
+    ) -> Result<&dyn mz_sql::catalog::CatalogCluster<'_>, SqlCatalogError> {
         Ok(self
             .state
             .resolve_cluster(cluster_name.unwrap_or_else(|| self.active_cluster()))?)
@@ -1982,7 +1967,7 @@ impl SessionCatalog for ConnCatalog<'_> {
     fn resolve_cluster_replica(
         &self,
         cluster_replica_name: &QualifiedReplica,
-    ) -> Result<&dyn CatalogClusterReplica, SqlCatalogError> {
+    ) -> Result<&dyn CatalogClusterReplica<'_>, SqlCatalogError> {
         Ok(self.state.resolve_cluster_replica(cluster_replica_name)?)
     }
 
@@ -2114,11 +2099,11 @@ impl SessionCatalog for ConnCatalog<'_> {
             .map(|item| convert::identity::<&dyn SqlCatalogItem>(item))
     }
 
-    fn get_cluster(&self, id: ClusterId) -> &dyn mz_sql::catalog::CatalogCluster {
+    fn get_cluster(&self, id: ClusterId) -> &dyn mz_sql::catalog::CatalogCluster<'_> {
         &self.state.clusters_by_id[&id]
     }
 
-    fn get_clusters(&self) -> Vec<&dyn mz_sql::catalog::CatalogCluster> {
+    fn get_clusters(&self) -> Vec<&dyn mz_sql::catalog::CatalogCluster<'_>> {
         self.state
             .clusters_by_id
             .values()
@@ -2130,12 +2115,12 @@ impl SessionCatalog for ConnCatalog<'_> {
         &self,
         cluster_id: ClusterId,
         replica_id: ReplicaId,
-    ) -> &dyn mz_sql::catalog::CatalogClusterReplica {
+    ) -> &dyn mz_sql::catalog::CatalogClusterReplica<'_> {
         let cluster = self.get_cluster(cluster_id);
         cluster.replica(replica_id)
     }
 
-    fn get_cluster_replicas(&self) -> Vec<&dyn mz_sql::catalog::CatalogClusterReplica> {
+    fn get_cluster_replicas(&self) -> Vec<&dyn mz_sql::catalog::CatalogClusterReplica<'_>> {
         self.get_clusters()
             .into_iter()
             .flat_map(|cluster| cluster.replicas().into_iter())
@@ -2816,6 +2801,18 @@ mod tests {
 
                 let full_name = conn_catalog.resolve_full_name(item.name());
                 let actual_desc = item.desc(&full_name).expect("invalid item type");
+                for (index, ((actual_name, actual_typ), (expected_name, expected_typ))) in
+                    actual_desc.iter().zip(expected_desc.iter()).enumerate()
+                {
+                    assert_eq!(
+                        actual_name, expected_name,
+                        "item {schema}.{name} column {index} name did not match its expected name"
+                    );
+                    assert_eq!(
+                        actual_typ, expected_typ,
+                        "item {schema}.{name} column {index} ('{actual_name}') type did not match its expected type"
+                    );
+                }
                 assert_eq!(
                     &*actual_desc, expected_desc,
                     "item {schema}.{name} did not match its expected RelationDesc"
@@ -3243,6 +3240,8 @@ mod tests {
                 "avg_internal_v1",
                 "bool_and",
                 "bool_or",
+                "has_table_privilege", // > 3 s each
+                "has_type_privilege",  // > 3 s each
                 "mod",
                 "mz_panic",
                 "mz_sleep",

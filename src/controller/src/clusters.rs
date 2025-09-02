@@ -17,6 +17,7 @@ use std::sync::LazyLock;
 use std::time::Duration;
 
 use anyhow::anyhow;
+use bytesize::ByteSize;
 use chrono::{DateTime, Utc};
 use futures::stream::{BoxStream, StreamExt};
 use mz_cluster_client::client::{ClusterReplicaLocation, TimelyConfig};
@@ -26,8 +27,8 @@ use mz_compute_client::service::{ComputeClient, ComputeGrpcClient};
 use mz_compute_types::config::{ComputeReplicaConfig, ComputeReplicaLogging};
 use mz_controller_types::dyncfgs::{
     ARRANGEMENT_EXERT_PROPORTIONALITY, CONTROLLER_PAST_GENERATION_REPLICA_CLEANUP_RETRY_INTERVAL,
-    ENABLE_TIMELY_INIT_AT_PROCESS_STARTUP, ENABLE_TIMELY_ZERO_COPY,
-    ENABLE_TIMELY_ZERO_COPY_LGALLOC, TIMELY_ZERO_COPY_LIMIT,
+    ENABLE_CTP_CLUSTER_PROTOCOLS, ENABLE_TIMELY_ZERO_COPY, ENABLE_TIMELY_ZERO_COPY_LGALLOC,
+    TIMELY_ZERO_COPY_LIMIT,
 };
 use mz_controller_types::{ClusterId, ReplicaId};
 use mz_orchestrator::NamespacedOrchestrator;
@@ -76,9 +77,6 @@ pub struct ReplicaConfig {
 pub struct ReplicaAllocation {
     /// The memory limit for each process in the replica.
     pub memory_limit: Option<MemoryLimit>,
-    /// The memory limit for each process in the replica.
-    #[serde(default)]
-    pub memory_request: Option<MemoryLimit>,
     /// The CPU limit for each process in the replica.
     pub cpu_limit: Option<CpuLimit>,
     /// The disk limit for each process in the replica.
@@ -97,6 +95,9 @@ pub struct ReplicaAllocation {
     /// T-shirt size.
     #[serde(default = "default_true")]
     pub is_cc: bool,
+    /// Whether instances of this type use swap as the spill-to-disk mechanism.
+    #[serde(default)]
+    pub swap_enabled: bool,
     /// Whether instances of this type can be created.
     #[serde(default)]
     pub disabled: bool,
@@ -119,11 +120,11 @@ fn test_replica_allocation_deserialization() {
         {
             "cpu_limit": 1.0,
             "memory_limit": "10GiB",
-            "memory_request": "5GiB",
             "disk_limit": "100MiB",
             "scale": 16,
             "workers": 1,
             "credits_per_hour": "16",
+            "swap_enabled": true,
             "selectors": {
                 "key1": "value1",
                 "key2": "value2"
@@ -140,10 +141,10 @@ fn test_replica_allocation_deserialization() {
             disk_limit: Some(DiskLimit(ByteSize::mib(100))),
             disabled: false,
             memory_limit: Some(MemoryLimit(ByteSize::gib(10))),
-            memory_request: Some(MemoryLimit(ByteSize::gib(5))),
             cpu_limit: Some(CpuLimit::from_millicpus(1000)),
             cpu_exclusive: false,
             is_cc: true,
+            swap_enabled: true,
             scale: 16,
             workers: 1,
             selectors: BTreeMap::from([
@@ -175,10 +176,10 @@ fn test_replica_allocation_deserialization() {
             disk_limit: Some(DiskLimit(ByteSize::mib(0))),
             disabled: true,
             memory_limit: Some(MemoryLimit(ByteSize::gib(0))),
-            memory_request: None,
             cpu_limit: Some(CpuLimit::from_millicpus(0)),
             cpu_exclusive: true,
             is_cc: true,
+            swap_enabled: false,
             scale: 0,
             workers: 0,
             selectors: Default::default(),
@@ -224,14 +225,16 @@ impl ReplicaLocation {
         }
     }
 
-    pub fn workers(&self) -> usize {
-        let workers_per_process = match self {
+    /// Returns the number of workers specified by this replica location.
+    ///
+    /// `None` for unmanaged replicas, whose worker count we don't know.
+    pub fn workers(&self) -> Option<usize> {
+        match self {
             ReplicaLocation::Managed(ManagedReplicaLocation { allocation, .. }) => {
-                allocation.workers
+                Some(allocation.workers * self.num_processes())
             }
-            ReplicaLocation::Unmanaged(UnmanagedReplicaLocation { workers, .. }) => *workers,
-        };
-        workers_per_process * self.num_processes()
+            ReplicaLocation::Unmanaged(_) => None,
+        }
     }
 
     /// A pending replica is created as part of an alter cluster of an managed
@@ -267,17 +270,9 @@ pub struct UnmanagedReplicaLocation {
     /// The network addresses of the storagectl endpoints for each process in
     /// the replica.
     pub storagectl_addrs: Vec<String>,
-    /// The network addresses of the storage (Timely) endpoints for
-    /// each process in the replica.
-    pub storage_addrs: Vec<String>,
     /// The network addresses of the computectl endpoints for each process in
     /// the replica.
     pub computectl_addrs: Vec<String>,
-    /// The network addresses of the compute (Timely) endpoints for
-    /// each process in the replica.
-    pub compute_addrs: Vec<String>,
-    /// The workers per process in the replica.
-    pub workers: usize,
 }
 
 /// Information about availability zone constraints for replicas.
@@ -318,9 +313,7 @@ pub struct ManagedReplicaLocation {
     /// is an empty list if none are specified
     #[serde(skip)]
     pub availability_zones: ManagedReplicaAvailabilityZones,
-    /// Whether the replica needs scratch disk space.
-    pub disk: bool,
-    /// Whether the repelica is pending reconfiguration
+    /// Whether the replica is pending reconfiguration
     pub pending: bool,
 }
 
@@ -398,6 +391,8 @@ where
         &mut self,
         cluster_id: ClusterId,
         replica_id: ReplicaId,
+        cluster_name: String,
+        replica_name: String,
         role: ClusterRole,
         config: ReplicaConfig,
         enable_worker_core_affinity: bool,
@@ -406,57 +401,53 @@ where
         let compute_location: ClusterReplicaLocation;
         let metrics_task: Option<AbortOnDropHandle<()>>;
 
+        // For controller-replica communication, we select between CTP or gRPC based on a dyncfg.
+        // We need to be careful to pass the same value to both the orchestrator and the
+        // sub-controllers, to ensure they agree on which protocol to use.
+        let enable_ctp = ENABLE_CTP_CLUSTER_PROTOCOLS.get(&self.dyncfg);
+
         match config.location {
             ReplicaLocation::Unmanaged(UnmanagedReplicaLocation {
                 storagectl_addrs,
-                storage_addrs,
                 computectl_addrs,
-                compute_addrs,
-                workers,
             }) => {
                 compute_location = ClusterReplicaLocation {
                     ctl_addrs: computectl_addrs,
-                    dataflow_addrs: compute_addrs,
-                    workers,
                 };
                 storage_location = ClusterReplicaLocation {
                     ctl_addrs: storagectl_addrs,
-                    dataflow_addrs: storage_addrs,
-                    // Storage and compute on the same replica have linked sizes.
-                    workers,
                 };
                 metrics_task = None;
             }
             ReplicaLocation::Managed(m) => {
-                let workers = m.allocation.workers;
                 let (service, metrics_task_join_handle) = self.provision_replica(
                     cluster_id,
                     replica_id,
+                    cluster_name,
+                    replica_name,
                     role,
                     m,
                     enable_worker_core_affinity,
+                    enable_ctp,
                 )?;
                 storage_location = ClusterReplicaLocation {
                     ctl_addrs: service.addresses("storagectl"),
-                    dataflow_addrs: service.addresses("storage"),
-                    workers,
                 };
                 compute_location = ClusterReplicaLocation {
                     ctl_addrs: service.addresses("computectl"),
-                    dataflow_addrs: service.addresses("compute"),
-                    workers,
                 };
                 metrics_task = Some(metrics_task_join_handle);
             }
         }
 
         self.storage
-            .connect_replica(cluster_id, replica_id, storage_location);
+            .connect_replica(cluster_id, replica_id, storage_location, enable_ctp);
         self.compute.add_replica_to_instance(
             cluster_id,
             replica_id,
             compute_location,
             config.compute,
+            enable_ctp,
         )?;
 
         if let Some(task) = metrics_task {
@@ -618,9 +609,12 @@ where
         &self,
         cluster_id: ClusterId,
         replica_id: ReplicaId,
+        cluster_name: String,
+        replica_name: String,
         role: ClusterRole,
         location: ManagedReplicaLocation,
         enable_worker_core_affinity: bool,
+        enable_ctp: bool,
     ) -> Result<(Box<dyn Service>, AbortOnDropHandle<()>), anyhow::Error> {
         let service_name = ReplicaServiceName {
             cluster_id,
@@ -639,21 +633,35 @@ where
         let persist_pubsub_url = self.persist_pubsub_url.clone();
         let secrets_args = self.secrets_args.to_flags();
 
-        let mut storage_proto_timely_config = None;
-        let mut compute_proto_timely_config = None;
-        if ENABLE_TIMELY_INIT_AT_PROCESS_STARTUP.get(&self.dyncfg) {
-            // TODO(teskje): use the same values as for compute?
-            storage_proto_timely_config = Some(TimelyConfig {
-                arrangement_exert_proportionality: 1337,
-                ..Default::default()
-            });
-            compute_proto_timely_config = Some(TimelyConfig {
-                arrangement_exert_proportionality: ARRANGEMENT_EXERT_PROPORTIONALITY
-                    .get(&self.dyncfg),
-                enable_zero_copy: ENABLE_TIMELY_ZERO_COPY.get(&self.dyncfg),
-                enable_zero_copy_lgalloc: ENABLE_TIMELY_ZERO_COPY_LGALLOC.get(&self.dyncfg),
-                zero_copy_limit: TIMELY_ZERO_COPY_LIMIT.get(&self.dyncfg),
-                ..Default::default()
+        // TODO(teskje): use the same values as for compute?
+        let storage_proto_timely_config = TimelyConfig {
+            arrangement_exert_proportionality: 1337,
+            ..Default::default()
+        };
+        let compute_proto_timely_config = TimelyConfig {
+            arrangement_exert_proportionality: ARRANGEMENT_EXERT_PROPORTIONALITY.get(&self.dyncfg),
+            enable_zero_copy: ENABLE_TIMELY_ZERO_COPY.get(&self.dyncfg),
+            enable_zero_copy_lgalloc: ENABLE_TIMELY_ZERO_COPY_LGALLOC.get(&self.dyncfg),
+            zero_copy_limit: TIMELY_ZERO_COPY_LIMIT.get(&self.dyncfg),
+            ..Default::default()
+        };
+
+        let mut disk_limit = location.allocation.disk_limit;
+        let memory_limit = location.allocation.memory_limit;
+        let mut memory_request = None;
+
+        if location.allocation.swap_enabled {
+            // The disk limit we specify in the service config decides whether or not the replica
+            // gets a scratch disk attached. We want to avoid attaching disks to swap replicas, so
+            // make sure to set the disk limit accordingly.
+            disk_limit = Some(DiskLimit::ZERO);
+
+            // We want to keep the memory request equal to the memory limit, to avoid
+            // over-provisioning and ensure replicas have predictable performance. However, to
+            // enable swap, Kubernetes currently requires that request and limit are different.
+            memory_request = memory_limit.map(|MemoryLimit(limit)| {
+                let request = ByteSize::b(limit.as_u64() - 1);
+                MemoryLimit(request)
             });
         }
 
@@ -663,6 +671,17 @@ where
                 image: self.clusterd_image.clone(),
                 init_container_image: self.init_container_image.clone(),
                 args: Box::new(move |assigned| {
+                    let storage_timely_config = TimelyConfig {
+                        workers: location.allocation.workers,
+                        addresses: assigned.peer_addresses("storage"),
+                        ..storage_proto_timely_config
+                    };
+                    let compute_timely_config = TimelyConfig {
+                        workers: location.allocation.workers,
+                        addresses: assigned.peer_addresses("compute"),
+                        ..compute_proto_timely_config
+                    };
+
                     let mut args = vec![
                         format!(
                             "--storage-controller-listen-addr={}",
@@ -680,6 +699,14 @@ where
                         format!("--opentelemetry-resource=replica_id={}", replica_id),
                         format!("--persist-pubsub-url={}", persist_pubsub_url),
                         format!("--environment-id={}", environment_id),
+                        format!(
+                            "--storage-timely-config={}",
+                            storage_timely_config.to_string(),
+                        ),
+                        format!(
+                            "--compute-timely-config={}",
+                            compute_timely_config.to_string(),
+                        ),
                     ];
                     if let Some(aws_external_id_prefix) = &aws_external_id_prefix {
                         args.push(format!(
@@ -706,31 +733,11 @@ where
                         args.push("--is-cc".into());
                     }
 
+                    if enable_ctp {
+                        args.push("--use-ctp".into());
+                    }
+
                     args.extend(secrets_args.clone());
-
-                    if let Some(proto) = &storage_proto_timely_config {
-                        let storage_timely_config = TimelyConfig {
-                            workers: location.allocation.workers,
-                            addresses: assigned.peer_addresses("storage"),
-                            ..*proto
-                        };
-                        args.push(format!(
-                            "--storage-timely-config={}",
-                            storage_timely_config.to_string(),
-                        ));
-                    }
-                    if let Some(proto) = &compute_proto_timely_config {
-                        let compute_timely_config = TimelyConfig {
-                            workers: location.allocation.workers,
-                            addresses: assigned.peer_addresses("compute"),
-                            ..*proto
-                        };
-                        args.push(format!(
-                            "--compute-timely-config={}",
-                            compute_timely_config.to_string(),
-                        ));
-                    }
-
                     args
                 }),
                 ports: vec![
@@ -759,8 +766,8 @@ where
                     },
                 ],
                 cpu_limit: location.allocation.cpu_limit,
-                memory_limit: location.allocation.memory_limit,
-                memory_request: location.allocation.memory_request,
+                memory_limit,
+                memory_request,
                 scale: location.allocation.scale,
                 labels: BTreeMap::from([
                     ("replica-id".into(), replica_id.to_string()),
@@ -768,7 +775,18 @@ where
                     ("type".into(), "cluster".into()),
                     ("replica-role".into(), role_label.into()),
                     ("workers".into(), location.allocation.workers.to_string()),
-                    ("size".into(), location.size.to_string()),
+                    (
+                        "size".into(),
+                        location
+                            .size
+                            .to_string()
+                            .replace("=", "-")
+                            .replace(",", "_"),
+                    ),
+                ]),
+                annotations: BTreeMap::from([
+                    ("replica-name".into(), replica_name),
+                    ("cluster-name".into(), cluster_name),
                 ]),
                 availability_zones: match location.availability_zones {
                     ManagedReplicaAvailabilityZones::FromCluster(azs) => azs,
@@ -799,8 +817,7 @@ where
                         value: cluster_id.to_string(),
                     },
                 }],
-                disk_limit: location.allocation.disk_limit,
-                disk: location.disk,
+                disk_limit,
                 node_selector: location.allocation.selectors,
             },
         )?;

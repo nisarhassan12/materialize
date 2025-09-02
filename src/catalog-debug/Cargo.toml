@@ -1,7 +1,7 @@
 [package]
 name = "mz-catalog-debug"
 description = "Durable metadata storage debug tool."
-version = "0.149.0-dev.0"
+version = "0.156.0-dev.0"
 edition.workspace = true
 rust-version.workspace = true
 publish = false
@@ -18,6 +18,7 @@ mz-adapter-types = { path = "../adapter-types" }
 mz-build-info = { path = "../build-info" }
 mz-catalog = { path = "../catalog" }
 mz-cloud-resources = { path = "../cloud-resources" }
+mz-license-keys = { path = "../license-keys" }
 mz-orchestrator-tracing = { path = "../orchestrator-tracing" }
 mz-ore = { path = "../ore" }
 mz-storage-types = { path = "../storage-types" }

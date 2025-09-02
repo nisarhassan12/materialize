@@ -262,6 +262,7 @@ class EnvironmentdStatefulSet(K8sStatefulSet):
             "--availability-zone=1",
             "--availability-zone=2",
             "--availability-zone=3",
+            "--availability-zone=quickstart",
             "--aws-account-id=123456789000",
             "--aws-external-id-prefix=eb5cb59b-e2fe-41f3-87ca-d2176a495345",
             "--environment-id=cloudtest-test-00000000-0000-0000-0000-000000000000-0",
@@ -355,8 +356,6 @@ class EnvironmentdStatefulSet(K8sStatefulSet):
             system_parameter_defaults["log_filter"] = self.log_filter
         if self._meets_maximum_version("0.63.99"):
             system_parameter_defaults["enable_managed_clusters"] = "true"
-
-        system_parameter_defaults["upsert_rocksdb_auto_spill_to_disk"] = "false"
 
         value_from = V1EnvVarSource(
             field_ref=V1ObjectFieldSelector(field_path="metadata.name")

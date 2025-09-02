@@ -18,9 +18,13 @@ import random
 
 import requests
 
-from materialize.mzcompose.composition import Composition, WorkflowArgumentParser
-from materialize.mzcompose.service import Service
-from materialize.mzcompose.services.azure import Azurite
+from materialize.mzcompose.composition import (
+    Composition,
+    Service,
+    WorkflowArgumentParser,
+)
+from materialize.mzcompose.service import Service as MzComposeService
+from materialize.mzcompose.services.azurite import Azurite
 from materialize.mzcompose.services.cockroach import Cockroach
 from materialize.mzcompose.services.kafka import Kafka
 from materialize.mzcompose.services.materialized import Materialized
@@ -28,15 +32,21 @@ from materialize.mzcompose.services.minio import Mc, Minio
 from materialize.mzcompose.services.mysql import MySql
 from materialize.mzcompose.services.postgres import Postgres
 from materialize.mzcompose.services.schema_registry import SchemaRegistry
+from materialize.mzcompose.services.sql_server import (
+    SqlServer,
+    setup_sql_server_testing,
+)
+from materialize.mzcompose.services.testdrive import Testdrive
 from materialize.mzcompose.services.toxiproxy import Toxiproxy
 from materialize.mzcompose.services.zookeeper import Zookeeper
 from materialize.parallel_workload.parallel_workload import parse_common_args, run
 from materialize.parallel_workload.settings import Complexity, Scenario
 
 SERVICES = [
-    Cockroach(setup_materialize=True),
+    Cockroach(setup_materialize=True, in_memory=True),
     Postgres(),
     MySql(),
+    SqlServer(),
     Zookeeper(),
     Kafka(
         auto_create_topics=False,
@@ -53,12 +63,13 @@ SERVICES = [
     Mc(),
     Materialized(default_replication_factor=2),
     Materialized(name="materialized2", default_replication_factor=2),
-    Service("sqlsmith", {"mzbuild": "sqlsmith"}),
-    Service(
+    MzComposeService("sqlsmith", {"mzbuild": "sqlsmith"}),
+    MzComposeService(
         name="persistcli",
         config={"mzbuild": "jobs"},
     ),
     Toxiproxy(),
+    Testdrive(no_reset=True),
 ]
 
 
@@ -71,6 +82,7 @@ def workflow_default(c: Composition, parser: WorkflowArgumentParser) -> None:
         "cockroach",
         "postgres",
         "mysql",
+        "sql-server",
         "zookeeper",
         "kafka",
         "schema-registry",
@@ -94,13 +106,15 @@ def workflow_default(c: Composition, parser: WorkflowArgumentParser) -> None:
             sanity_restart=sanity_restart,
             metadata_store="cockroach",
             default_replication_factor=2,
+            additional_system_parameter_defaults={"memory_limiter_interval": "0"},
         ),
         Toxiproxy(seed=random.randrange(2**63)),
     ):
         toxiproxy_start(c)
         c.up(*service_names)
+        setup_sql_server_testing(c)
 
-        c.up("mc", persistent=True)
+        c.up(Service("mc", idle=True))
         c.exec(
             "mc",
             "mc",

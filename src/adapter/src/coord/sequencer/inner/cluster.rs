@@ -168,9 +168,8 @@ impl Coordinator {
             (Unmanaged, Reset) | (Unmanaged, Set(true)) => {
                 // Generate a minimal correct configuration
 
-                // Size and disk adjusted later when sequencing the actual configuration change.
+                // Size adjusted later when sequencing the actual configuration change.
                 let size = "".to_string();
-                let disk = false;
                 let logging = ReplicaLogging {
                     log_logging: false,
                     interval: Some(DEFAULT_REPLICA_LOGGING_INTERVAL),
@@ -180,7 +179,6 @@ impl Coordinator {
                     availability_zones: Default::default(),
                     logging,
                     replication_factor: 1,
-                    disk,
                     optimizer_feature_overrides: Default::default(),
                     schedule: Default::default(),
                 });
@@ -193,18 +191,12 @@ impl Coordinator {
                 availability_zones,
                 logging,
                 replication_factor,
-                disk,
                 optimizer_feature_overrides: _,
                 schedule,
             }) => {
                 match &options.size {
                     Set(s) => size.clone_from(s),
                     Reset => coord_bail!("SIZE has no default value"),
-                    Unchanged => {}
-                }
-                match &options.disk {
-                    Set(d) => *disk = *d,
-                    Reset => *disk = self.catalog.system_config().disk_cluster_replicas_default(),
                     Unchanged => {}
                 }
                 match &options.availability_zones {
@@ -630,7 +622,6 @@ impl Coordinator {
                     availability_zones: plan.availability_zones.clone(),
                     logging,
                     replication_factor: plan.replication_factor,
-                    disk: plan.disk,
                     optimizer_feature_overrides: plan.optimizer_feature_overrides.clone(),
                     schedule: plan.schedule.clone(),
                 })
@@ -670,7 +661,6 @@ impl Coordinator {
             compute,
             replication_factor,
             size,
-            disk,
             optimizer_feature_overrides: _,
             schedule: _,
         }: CreateClusterManagedPlan,
@@ -715,7 +705,6 @@ impl Coordinator {
                 } else {
                     Some(availability_zones.as_ref())
                 },
-                disk,
                 false,
                 *session.current_role_id(),
                 ReplicaCreateDropReason::Manual,
@@ -737,7 +726,6 @@ impl Coordinator {
         size: &String,
         ops: &mut Vec<Op>,
         azs: Option<&[String]>,
-        disk: bool,
         pending: bool,
         owner_id: RoleId,
         reason: ReplicaCreateDropReason,
@@ -745,7 +733,6 @@ impl Coordinator {
         let location = mz_catalog::durable::ReplicaLocation::Managed {
             availability_zone: None,
             billed_as: None,
-            disk,
             internal: false,
             size: size.clone(),
             pending,
@@ -839,18 +826,12 @@ impl Coordinator {
             let (compute, location) = match replica_config {
                 mz_sql::plan::ReplicaConfig::Unorchestrated {
                     storagectl_addrs,
-                    storage_addrs,
                     computectl_addrs,
-                    compute_addrs,
-                    workers,
                     compute,
                 } => {
                     let location = mz_catalog::durable::ReplicaLocation::Unmanaged {
                         storagectl_addrs,
-                        storage_addrs,
                         computectl_addrs,
-                        compute_addrs,
-                        workers,
                     };
                     (compute, location)
                 }
@@ -858,7 +839,6 @@ impl Coordinator {
                     availability_zone,
                     billed_as,
                     compute,
-                    disk,
                     internal,
                     size,
                 } => {
@@ -874,7 +854,6 @@ impl Coordinator {
                     let location = mz_catalog::durable::ReplicaLocation::Managed {
                         availability_zone,
                         billed_as,
-                        disk,
                         internal,
                         size: size.clone(),
                         pending: false,
@@ -941,9 +920,13 @@ impl Coordinator {
             )
             .expect("creating cluster must not fail");
 
-        let replica_ids: Vec<_> = cluster.replicas().map(|r| r.replica_id).collect();
-        for replica_id in replica_ids {
-            self.create_cluster_replica(cluster_id, replica_id).await;
+        let replica_ids: Vec<_> = cluster
+            .replicas()
+            .map(|r| (r.replica_id, format!("{}.{}", cluster.name(), &r.name)))
+            .collect();
+        for (replica_id, replica_name) in replica_ids {
+            self.create_cluster_replica(cluster_id, replica_id, replica_name)
+                .await;
         }
 
         if !introspection_source_ids.is_empty() {
@@ -970,18 +953,12 @@ impl Coordinator {
         let (compute, location) = match config {
             mz_sql::plan::ReplicaConfig::Unorchestrated {
                 storagectl_addrs,
-                storage_addrs,
                 computectl_addrs,
-                compute_addrs,
-                workers,
                 compute,
             } => {
                 let location = mz_catalog::durable::ReplicaLocation::Unmanaged {
                     storagectl_addrs,
-                    storage_addrs,
                     computectl_addrs,
-                    compute_addrs,
-                    workers,
                 };
                 (compute, location)
             }
@@ -989,7 +966,6 @@ impl Coordinator {
                 availability_zone,
                 billed_as,
                 compute,
-                disk,
                 internal,
                 size,
             } => {
@@ -1003,7 +979,6 @@ impl Coordinator {
                 let location = mz_catalog::durable::ReplicaLocation::Managed {
                     availability_zone,
                     billed_as,
-                    disk,
                     internal,
                     size,
                     pending: false,
@@ -1074,12 +1049,18 @@ impl Coordinator {
             .resolve_replica_in_cluster(&cluster_id, &name)
             .expect("just created")
             .replica_id();
-        self.create_cluster_replica(cluster_id, id).await;
+
+        self.create_cluster_replica(cluster_id, id, name).await;
 
         Ok(ExecuteResponse::CreatedClusterReplica)
     }
 
-    async fn create_cluster_replica(&mut self, cluster_id: ClusterId, replica_id: ReplicaId) {
+    async fn create_cluster_replica(
+        &mut self,
+        cluster_id: ClusterId,
+        replica_id: ReplicaId,
+        replica_name: String,
+    ) {
         let cluster = self.catalog().get_cluster(cluster_id);
         let role = cluster.role();
         let replica_config = cluster
@@ -1095,6 +1076,8 @@ impl Coordinator {
             .create_replica(
                 cluster_id,
                 replica_id,
+                cluster.name.to_owned(),
+                replica_name,
                 role,
                 replica_config,
                 enable_worker_core_affinity,
@@ -1134,7 +1117,6 @@ impl Coordinator {
             availability_zones,
             logging,
             replication_factor,
-            disk,
             optimizer_feature_overrides: _,
             schedule: _,
         }) = &cluster.config.variant
@@ -1146,7 +1128,6 @@ impl Coordinator {
             replication_factor: new_replication_factor,
             availability_zones: new_availability_zones,
             logging: new_logging,
-            disk: new_disk,
             optimizer_feature_overrides: _,
             schedule: _,
         }) = &new_config.variant
@@ -1193,7 +1174,6 @@ impl Coordinator {
         if new_size != size
             || new_availability_zones != availability_zones
             || new_logging != logging
-            || new_disk != disk
         {
             self.ensure_valid_azs(new_availability_zones.iter())?;
             // If we're not doing a zero-downtime reconfig tear down all
@@ -1221,7 +1201,6 @@ impl Coordinator {
                             new_size,
                             &mut ops,
                             Some(new_availability_zones.as_ref()),
-                            *new_disk,
                             false,
                             owner_id,
                             reason.clone(),
@@ -1239,7 +1218,6 @@ impl Coordinator {
                             new_size,
                             &mut ops,
                             Some(new_availability_zones.as_ref()),
-                            *new_disk,
                             true,
                             owner_id,
                             reason.clone(),
@@ -1277,7 +1255,6 @@ impl Coordinator {
                     // AVAILABILITY ZONES hasn't changed, so existing replicas don't need to be
                     // rescheduled.
                     Some(new_availability_zones.as_ref()),
-                    *new_disk,
                     false,
                     owner_id,
                     reason.clone(),
@@ -1292,7 +1269,7 @@ impl Coordinator {
             NeedsFinalization::No => {
                 ops.push(catalog::Op::UpdateClusterConfig {
                     id: cluster_id,
-                    name,
+                    name: name.clone(),
                     config: new_config,
                 });
             }
@@ -1305,7 +1282,8 @@ impl Coordinator {
                 .resolve_replica_in_cluster(&cluster_id, &replica_name)
                 .expect("just created")
                 .replica_id();
-            self.create_cluster_replica(cluster_id, replica_id).await;
+            self.create_cluster_replica(cluster_id, replica_id, replica_name)
+                .await;
         }
         Ok(finalization_needed)
     }
@@ -1328,7 +1306,6 @@ impl Coordinator {
             replication_factor: new_replication_factor,
             availability_zones: new_availability_zones,
             logging: _,
-            disk: new_disk,
             optimizer_feature_overrides: _,
             schedule: _,
         }) = &mut new_config.variant
@@ -1358,7 +1335,6 @@ impl Coordinator {
 
         let mut names = BTreeSet::new();
         let mut sizes = BTreeSet::new();
-        let mut disks = BTreeSet::new();
 
         self.ensure_valid_azs(new_availability_zones.iter())?;
 
@@ -1371,7 +1347,6 @@ impl Coordinator {
                 ),
                 ReplicaLocation::Managed(location) => {
                     sizes.insert(location.size.clone());
-                    disks.insert(location.disk);
 
                     if let ManagedReplicaAvailabilityZones::FromReplica(Some(az)) =
                         &location.availability_zones
@@ -1433,22 +1408,6 @@ impl Coordinator {
             );
         }
 
-        if disks.len() == 1 {
-            let disk = disks.into_iter().next().expect("must exist");
-            match &options.disk {
-                AlterOptionParameter::Set(ds) if *ds != disk => {
-                    coord_bail!(
-                        "Cluster replicas with DISK {disk} do not match expected DISK {ds}"
-                    );
-                }
-                _ => *new_disk = disk,
-            }
-        } else if !disks.is_empty() {
-            coord_bail!(
-                "Cannot convert unmanaged cluster to managed, non-unique replica DISK options"
-            );
-        }
-
         let ops = vec![catalog::Op::UpdateClusterConfig {
             id: cluster_id,
             name: cluster_name,
@@ -1502,7 +1461,7 @@ impl Coordinator {
 
     pub(crate) async fn sequence_alter_cluster_rename(
         &mut self,
-        session: &mut Session,
+        ctx: &mut ExecuteContext,
         AlterClusterRenamePlan { id, name, to_name }: AlterClusterRenamePlan,
     ) -> Result<ExecuteResponse, AdapterError> {
         let op = Op::RenameCluster {
@@ -1512,7 +1471,7 @@ impl Coordinator {
             check_reserved_names: true,
         };
         match self
-            .catalog_transact_with_ddl_transaction(session, vec![op])
+            .catalog_transact_with_ddl_transaction(ctx, vec![op], |_, _| Box::pin(async {}))
             .await
         {
             Ok(()) => Ok(ExecuteResponse::AlteredObject(ObjectType::Cluster)),
@@ -1522,7 +1481,7 @@ impl Coordinator {
 
     pub(crate) async fn sequence_alter_cluster_swap(
         &mut self,
-        session: &mut Session,
+        ctx: &mut ExecuteContext,
         AlterClusterSwapPlan {
             id_a,
             id_b,
@@ -1551,7 +1510,9 @@ impl Coordinator {
         };
 
         match self
-            .catalog_transact_with_ddl_transaction(session, vec![op_a, op_b, op_temp])
+            .catalog_transact_with_ddl_transaction(ctx, vec![op_a, op_b, op_temp], |_, _| {
+                Box::pin(async {})
+            })
             .await
         {
             Ok(()) => Ok(ExecuteResponse::AlteredObject(ObjectType::Cluster)),

@@ -7,7 +7,8 @@
 # the Business Source License, use of this software will be governed
 # by the Apache License, Version 2.0.
 
-$ set-arg-default default-replica-size=1
+$ set-sql-timeout duration=300s
+$ set-arg-default default-replica-size=scale=1,workers=1
 
 # Test for a subset of the information returned by introspection sources.
 # The test focuses on computing answers that are independent of particular
@@ -16,13 +17,14 @@ $ set-arg-default default-replica-size=1
 
 # Note that we count on the retry behavior of testdrive in this test
 # since introspection sources may take some time to catch up.
+$ set-sql-timeout duration=60s
 
 # Introspection subscribes add noise to the introspection sources, so disable them.
 $ postgres-execute connection=postgres://mz_system:materialize@${testdrive.materialize-internal-sql-addr}
 ALTER SYSTEM SET enable_introspection_subscribes = false
 
 # In case the environment has other replicas
-> CREATE CLUSTER test SIZE '4-4'
+> CREATE CLUSTER test SIZE 'scale=4,workers=4'
 > SET cluster = test
 
 > CREATE TABLE t (a int)
@@ -43,18 +45,20 @@ ALTER SYSTEM SET enable_introspection_subscribes = false
 
 > CREATE VIEW vv AS SELECT * FROM t
 
-> SELECT COUNT(*)
-  FROM (SELECT import_frontiers.export_id, import_frontiers.import_id
-        FROM
-            mz_introspection.mz_compute_import_frontiers AS import_frontiers)
+> SELECT COUNT(*) FROM (
+    SELECT import_frontiers.export_id, import_frontiers.import_id
+    FROM mz_introspection.mz_compute_import_frontiers AS import_frontiers
+    WHERE export_id LIKE 'u%'
+  )
 1
 
 > CREATE DEFAULT INDEX ON vv
 
-> SELECT COUNT(*)
-  FROM (SELECT import_frontiers.export_id, import_frontiers.import_id
-        FROM
-            mz_introspection.mz_compute_import_frontiers AS import_frontiers)
+> SELECT COUNT(*) FROM (
+    SELECT import_frontiers.export_id, import_frontiers.import_id
+    FROM mz_introspection.mz_compute_import_frontiers AS import_frontiers
+    WHERE export_id LIKE 'u%'
+  )
 2
 
 > SELECT COUNT(*)
@@ -73,34 +77,38 @@ ALTER SYSTEM SET enable_introspection_subscribes = false
 
 > CREATE MATERIALIZED VIEW mvv AS SELECT * FROM vv
 
-> SELECT COUNT(*)
-  FROM (SELECT import_frontiers.export_id, import_frontiers.import_id
-        FROM
-            mz_introspection.mz_compute_import_frontiers AS import_frontiers)
+> SELECT COUNT(*) FROM (
+    SELECT import_frontiers.export_id, import_frontiers.import_id
+    FROM mz_introspection.mz_compute_import_frontiers AS import_frontiers
+    WHERE export_id LIKE 'u%'
+  )
 3
 
 > DROP MATERIALIZED VIEW mvv
 
-> SELECT COUNT(*)
-  FROM (SELECT import_frontiers.export_id, import_frontiers.import_id
-        FROM
-            mz_introspection.mz_compute_import_frontiers AS import_frontiers)
+> SELECT COUNT(*) FROM (
+    SELECT import_frontiers.export_id, import_frontiers.import_id
+    FROM mz_introspection.mz_compute_import_frontiers AS import_frontiers
+    WHERE export_id LIKE 'u%'
+  )
 2
 
 > DROP INDEX vv_primary_idx
 
-> SELECT COUNT(*)
-  FROM (SELECT import_frontiers.export_id, import_frontiers.import_id
-        FROM
-            mz_introspection.mz_compute_import_frontiers AS import_frontiers)
+> SELECT COUNT(*) FROM (
+    SELECT import_frontiers.export_id, import_frontiers.import_id
+    FROM mz_introspection.mz_compute_import_frontiers AS import_frontiers
+    WHERE export_id LIKE 'u%'
+  )
 1
 
 > DROP MATERIALIZED VIEW mv
 
-> SELECT COUNT(*)
-  FROM (SELECT import_frontiers.export_id, import_frontiers.import_id
-        FROM
-            mz_introspection.mz_compute_import_frontiers AS import_frontiers)
+> SELECT COUNT(*) FROM (
+    SELECT import_frontiers.export_id, import_frontiers.import_id
+    FROM mz_introspection.mz_compute_import_frontiers AS import_frontiers
+    WHERE export_id LIKE 'u%'
+  )
 0
 
 # Test that frontiers of introspection sources advance at all.
@@ -217,7 +225,7 @@ true true
 > CREATE DEFAULT INDEX ii_empty ON t3
 
 > SELECT records, size < 16 * 1024, allocations < 512 FROM mz_introspection.mz_dataflow_arrangement_sizes WHERE name LIKE '%ii_empty'
-0 true true
+<null> true true
 
 # Tests that arrangement sizes are approximate
 
@@ -228,7 +236,7 @@ true true
 # We have 16 workers, and only want to ensure that the sizes are not egregious.
 
 > SELECT records, size < 16 * 1024, allocations < 512 FROM mz_introspection.mz_dataflow_arrangement_sizes WHERE name LIKE '%ii_t4'
-0 true true
+<null> true true
 
 > INSERT INTO t4 SELECT 1
 
@@ -255,7 +263,8 @@ true true true true true
 
 > CREATE INDEX vt5_idx ON vt5(a)
 
-> SELECT records, (size/1024/1024)::int FROM mz_introspection.mz_dataflow_arrangement_sizes WHERE name LIKE '%vt5_idx'
+# Cast to numeric to get its rounding behavior
+> SELECT records, (size::numeric/1024/1024)::int FROM mz_introspection.mz_dataflow_arrangement_sizes WHERE name LIKE '%vt5_idx'
 10000 1
 
 > DROP TABLE t5 CASCADE
@@ -341,7 +350,7 @@ true true true true true
 # Test mz_dataflow_arrangement_sizes with hierarchical reductions and top-k over
 # monotonic inputs. The latter is when there is a possibility for memory misestimation
 # since we include monoids in the diff field.
-> CREATE CLUSTER counter_cluster SIZE = '1';
+> CREATE CLUSTER counter_cluster SIZE = 'scale=1,workers=1';
 > CREATE SOURCE counter IN CLUSTER counter_cluster FROM LOAD GENERATOR COUNTER (TICK INTERVAL '2ms');
 
 > CREATE VIEW input AS

@@ -38,7 +38,7 @@ include!(concat!(
 /// from the compute controller.
 ///
 /// [`ComputeCommand`]: super::command::ComputeCommand
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum ComputeResponse<T = mz_repr::Timestamp> {
     /// `Frontiers` announces the advancement of the various frontiers of the specified compute
     /// collection.
@@ -322,7 +322,7 @@ impl Arbitrary for FrontiersResponse {
 ///
 /// Note that each `Peek` expects to generate exactly one `PeekResponse`, i.e.
 /// we expect a 1:1 contract between `Peek` and `PeekResponse`.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum PeekResponse {
     /// Returned rows of a successful peek.
     Rows(RowCollection),
@@ -332,6 +332,17 @@ pub enum PeekResponse {
     Error(String),
     /// The peek was canceled.
     Canceled,
+}
+
+impl PeekResponse {
+    /// Return the size of row bytes stored inline in this response.
+    pub fn inline_byte_len(&self) -> usize {
+        match self {
+            Self::Rows(rows) => rows.byte_len(),
+            Self::Stashed(stashed) => stashed.inline_rows.byte_len(),
+            Self::Error(_) | Self::Canceled => 0,
+        }
+    }
 }
 
 impl RustType<ProtoPeekResponse> for PeekResponse {
@@ -381,7 +392,7 @@ impl Arbitrary for PeekResponse {
 }
 
 /// Response from a peek whose results have been stashed into persist.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct StashedPeekResponse {
     /// The number of rows stored in response batches. This is the sum of the
     /// diff values of the contained rows.

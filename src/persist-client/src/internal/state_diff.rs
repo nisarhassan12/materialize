@@ -29,9 +29,10 @@ use crate::critical::CriticalReaderId;
 use crate::internal::paths::PartialRollupKey;
 use crate::internal::state::{
     CriticalReaderState, EncodedSchemas, HollowBatch, HollowBlobRef, HollowRollup,
-    LeasedReaderState, ProtoStateField, ProtoStateFieldDiffType, ProtoStateFieldDiffs, State,
-    StateCollections, WriterState,
+    LeasedReaderState, ProtoStateField, ProtoStateFieldDiffType, ProtoStateFieldDiffs, RunPart,
+    State, StateCollections, WriterState,
 };
+use crate::internal::trace::CompactionInput;
 use crate::internal::trace::{FueledMergeRes, SpineId, ThinMerge, ThinSpineBatch, Trace};
 use crate::read::LeasedReaderId;
 use crate::write::WriterId;
@@ -244,7 +245,7 @@ impl<T: Timestamp + Lattice + Codec64> StateDiff<T> {
         diffs
     }
 
-    pub(crate) fn blob_inserts(&self) -> impl Iterator<Item = HollowBlobRef<T>> {
+    pub(crate) fn blob_inserts(&self) -> impl Iterator<Item = HollowBlobRef<'_, T>> {
         let batches = self
             .referenced_batches()
             .filter_map(|spine_diff| match spine_diff {
@@ -263,21 +264,41 @@ impl<T: Timestamp + Lattice + Codec64> StateDiff<T> {
         batches.chain(rollups)
     }
 
-    pub(crate) fn blob_deletes(&self) -> impl Iterator<Item = HollowBlobRef<T>> {
-        let batches = self
+    pub(crate) fn part_deletes(&self) -> impl Iterator<Item = &RunPart<T>> {
+        // With the introduction of incremental compaction, we
+        // need to be more careful about what we consider "deleted".
+        // If there is a HollowBatch that we replace 2 out of the 4 runs of,
+        // we need to ensure that we only delete the runs that are actually
+        // no longer referenced.
+        let removed = self
             .referenced_batches()
             .filter_map(|spine_diff| match spine_diff {
                 Insert(_) => None,
-                Update(a, _) | Delete(a) => Some(HollowBlobRef::Batch(a)),
+                Update(a, _) | Delete(a) => Some(a.parts.iter().collect::<Vec<_>>()),
             });
-        let rollups = self
-            .rollups
+
+        let added: std::collections::BTreeSet<_> = self
+            .referenced_batches()
+            .filter_map(|spine_diff| match spine_diff {
+                Insert(a) | Update(_, a) => Some(a.parts.iter().collect::<Vec<_>>()),
+                Delete(_) => None,
+            })
+            .flatten()
+            .collect();
+
+        removed
+            .into_iter()
+            .flat_map(|x| x)
+            .filter(move |part| !added.contains(part))
+    }
+
+    pub(crate) fn rollup_deletes(&self) -> impl Iterator<Item = &HollowRollup> {
+        self.rollups
             .iter()
             .filter_map(|rollups_diff| match &rollups_diff.val {
                 Insert(_) => None,
-                Update(a, _) | Delete(a) => Some(HollowBlobRef::Rollup(a)),
-            });
-        batches.chain(rollups)
+                Update(a, _) | Delete(a) => Some(a),
+            })
     }
 
     #[cfg(any(test, debug_assertions))]
@@ -857,7 +878,11 @@ fn apply_diffs_spine<T: Timestamp + Lattice + Codec64>(
 
     // Fast-path: compaction
     if let Some((_inputs, output)) = sniff_compaction(&diffs) {
-        let res = FueledMergeRes { output };
+        let res = FueledMergeRes {
+            output,
+            input: CompactionInput::Legacy,
+            new_active_compaction: None,
+        };
         // We can't predict how spine will arrange the batches when it's
         // hydrated. This means that something that is maintaining a Spine
         // starting at some seqno may not exactly match something else
@@ -1424,7 +1449,11 @@ mod tests {
                             leader
                                 .collections
                                 .trace
-                                .apply_merge_res_unchecked(&FueledMergeRes { output });
+                                .apply_merge_res_unchecked(&FueledMergeRes {
+                                    output,
+                                    input: CompactionInput::Legacy,
+                                    new_active_compaction: None,
+                                });
                         }
                     }
                 }

@@ -21,7 +21,11 @@ from typing import Any
 
 from psycopg import Cursor
 
-from materialize.mzcompose.composition import Composition, WorkflowArgumentParser
+from materialize.mzcompose.composition import (
+    Composition,
+    Service,
+    WorkflowArgumentParser,
+)
 from materialize.mzcompose.services.clusterd import Clusterd
 from materialize.mzcompose.services.kafka import Kafka
 from materialize.mzcompose.services.localstack import Localstack
@@ -40,6 +44,7 @@ SERVICES = [
         additional_system_parameter_defaults={
             "log_filter": "mz_cluster::client=debug,info",
         },
+        support_external_clusterd=True,
     ),
     Clusterd(name="clusterd_1_1"),
     Clusterd(name="clusterd_1_2"),
@@ -216,7 +221,7 @@ def populate(c: Composition) -> None:
             $ kafka-create-topic topic=source1
             $ kafka-ingest format=bytes topic=source1 repeat=1000000
             A${kafka-ingest.iteration}
-            > CREATE CLUSTER c SIZE '1';
+            > CREATE CLUSTER c SIZE 'scale=1,workers=1';
             > CREATE CONNECTION IF NOT EXISTS kafka_conn
               TO KAFKA (BROKER '${testdrive.kafka-addr}', SECURITY PROTOCOL PLAINTEXT)
             > CREATE SOURCE source1
@@ -469,13 +474,13 @@ def run_test(c: Composition, disruption: Disruption, id: int) -> None:
             process_names=["clusterd_2_1", "clusterd_2_2"],
         ),
     ):
-        c.up("testdrive", persistent=True)
         c.up(
             "materialized",
             "clusterd_1_1",
             "clusterd_1_2",
             "clusterd_2_1",
             "clusterd_2_2",
+            Service("testdrive", idle=True),
         )
 
         c.sql(

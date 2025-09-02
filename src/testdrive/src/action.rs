@@ -213,6 +213,8 @@ pub struct State {
     consistency_checks_adhoc_skip: bool,
     regex: Option<Regex>,
     regex_replacement: String,
+    error_line_count: usize,
+    error_string: String,
 
     // === Materialize state. ===
     materialize: MaterializeState,
@@ -814,6 +816,7 @@ impl Run for PosCommand {
                     "skip-end" => skip_end::run_skip_end(),
                     "sql-server-connect" => sql_server::run_connect(builtin, state).await,
                     "sql-server-execute" => sql_server::run_execute(builtin, state).await,
+                    "sql-server-set-from-sql" => sql_server::run_set_from_sql(builtin, state).await,
                     "persist-force-compaction" => {
                         persist::run_force_compaction(builtin, state).await
                     }
@@ -1037,6 +1040,8 @@ pub async fn create_state(
         regex: None,
         regex_replacement: set::DEFAULT_REGEX_REPLACEMENT.into(),
         rewrite_results: config.rewrite_results,
+        error_line_count: 0,
+        error_string: "".to_string(),
 
         // === Materialize state. ===
         materialize: materialize_state,

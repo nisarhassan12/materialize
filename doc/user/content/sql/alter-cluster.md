@@ -132,26 +132,19 @@ any time. You should not rely on them for any kind of capacity planning.
 
 #### Downtime
 
-Depending on the type of objects in a cluster, a resizing operation might incur
-**downtime**.
-
-* For clusters that contain sources and/or sinks, resizing requires the cluster
-  to **restart**. This operation incurs downtime for the duration it takes for
-  all objects in the cluster to hydrate.
-
-* For clusters that **do not contain sources or sinks**, it's possible to avoid
-  downtime by performing a [zero-downtime cluster
-  resizing](#zero-downtime-cluster-resizing).
+Resizing operation can incur downtime unless used with WAIT UNTIL READY option.
+See [zero-downtime cluster resizing](#zero-downtime-cluster-resizing) for
+details.
 
 #### Zero-downtime cluster resizing
 
 {{< private-preview />}}
 
-For clusters that do not contain sources or sinks, you can use the `WAIT UNTIL
-READY` option to perform a zero-downtime resizing, which incurs **no
-downtime**. Instead of restarting the cluster, this approach spins up an
-additional cluster replica under the covers with the desired new size, waits
-for the replica to be hydrated, and then replaces the original replica.
+You can use the `WAIT UNTIL READY` option to perform a zero-downtime resizing,
+which incurs **no downtime**. Instead of restarting the cluster, this approach
+spins up an additional cluster replica under the covers with the desired new
+size, waits for the replica to be hydrated, and then replaces the original
+replica.
 
 ```sql
 ALTER CLUSTER c1
@@ -163,6 +156,8 @@ becomes ready. This could take as long as the specified timeout. During this
 operation, any other reconfiguration command issued against this cluster will
 fail. Additionally, any connection interruption or statement cancelation will
 cause a rollback — no size change will take effect in that case.
+
+{{< include-md file="shared-content/alter-cluster-wait-until-ready-note.md" >}}
 
 ### Replication factor
 
@@ -210,23 +205,12 @@ When provisioning replicas,
 - For clusters sized at **`3200cc` and above**, even distribution of replicas
   across availability zones **cannot** be guaranteed.
 
-#### Clusters with sources and sinks
-
-Clusters containing sources and sinks can only have a replication factor of `0`
-or `1`.
 
 ## Required privileges
 
 To execute the `ALTER CLUSTER` command, you need:
 
-- Ownership of the cluster.
-
-In addition,
-
-- To rename a cluster, you must also have membership in the `<new_owner_role>`.
-
-- To swap names with another cluster, you must also have ownership of the other
-  cluster.
+{{< include-md file="shared-content/sql-command-privileges/alter-cluster.md" >}}
 
 See also:
 
@@ -247,31 +231,30 @@ ALTER CLUSTER c1 SET (REPLICATION FACTOR 2);
 Increasing the `REPLICATION FACTOR` increases the cluster's [fault
 tolerance](#replication-factor-and-fault-tolerance), not its work capacity.
 
-{{< note >}}
-Clusters containing sources and sinks can only have a replication factor of `0`
-or `1`.
-{{</ note >}}
 
 ### Resizing
 
-- For clusters **without any sources or sinks**, you can alter the cluster size
-  with **no downtime** (i.e., [zero-downtime cluster
-  resizing](#zero-downtime-cluster-resizing)) by running the `ALTER CLUSTER`
-  command with the `WAIT UNTIL READY` [option](#with-options):
+You can alter the cluster size with **no downtime** (i.e., [zero-downtime
+cluster resizing](#zero-downtime-cluster-resizing)) by running the `ALTER
+CLUSTER` command with the `WAIT UNTIL READY` [option](#with-options):
 
-  ```mzsql
-  ALTER CLUSTER c1
-  SET (SIZE '100CC') WITH (WAIT UNTIL READY (TIMEOUT = '10m', ON TIMEOUT = 'COMMIT'));
-  ````
+```mzsql
+ALTER CLUSTER c1
+SET (SIZE '100CC') WITH (WAIT UNTIL READY (TIMEOUT = '10m', ON TIMEOUT = 'COMMIT'));
+```
 
-- For clusters **with sources or sinks**, it's not yet possible to perform
-  zero-downtime cluster resizing. This means that resizing clusters with
-  sources or sinks requires a cluster **restart**, which incurs **downtime**.
-  You can alter the cluster size by running the `ALTER CLUSTER` command:
+{{< include-md file="shared-content/alter-cluster-wait-until-ready-note.md" >}}
 
-  ```mzsql
-  ALTER CLUSTER c1 SET (SIZE '100cc');
-  ```
+Alternatively, you can alter the cluster size immediately, without waiting, by
+running the `ALTER CLUSTER` command:
+
+```mzsql
+ALTER CLUSTER c1 SET (SIZE '100cc');
+```
+
+This will incur downtime when the cluster contains objects that need
+re-hydration before they are ready. This includes indexes, materialized views,
+and some types of sources.
 
 ### Schedule
 
@@ -291,13 +274,13 @@ scheduled clusters.
 
 ### Converting unmanaged to managed clusters
 
-{{< warning >}}
-[Unmanaged clusters](/sql/create-cluster-replica) are a deprecated feature of
-Materialize that required manual management of cluster replicas.
+{{< note >}}
 
-We recommend converting any unmanaged clusters to managed clusters
-by following the instructions below.
-{{< /warning >}}
+When getting started with Materialize, we recommend using managed clusters. You
+can convert any unmanaged clusters to managed clusters by following the
+instructions below.
+
+{{< /note >}}
 
 Alter the `managed` status of a cluster to managed:
 

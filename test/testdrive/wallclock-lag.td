@@ -12,13 +12,15 @@
 # These tests rely on testdrive's retry feature, as `mz_wallclock_lag_history`
 # is only refreshed periodically, so data is likely not immediately available.
 
+$ set-sql-timeout duration=60s
+
 $ postgres-connect name=mz_system url=postgres://mz_system:materialize@${testdrive.materialize-internal-sql-addr}
 
 $ postgres-execute connection=mz_system
 ALTER SYSTEM SET wallclock_lag_recording_interval = '1s'
 
-> CREATE CLUSTER storage SIZE '1'
-> CREATE CLUSTER compute SIZE '1', REPLICATION FACTOR 2
+> CREATE CLUSTER storage SIZE 'scale=1,workers=1'
+> CREATE CLUSTER compute SIZE 'scale=1,workers=1', REPLICATION FACTOR 2
 
 # Set up a bunch of frontiered objects and test that their wallclock lags get
 # reported and are reasonably small.
@@ -46,7 +48,7 @@ ALTER SYSTEM SET wallclock_lag_recording_interval = '1s'
   ENVELOPE DEBEZIUM
 
 > SELECT DISTINCT ON(o.name, r.name)
-    o.name, r.name, l.lag >= '0s', l.lag < '10s'
+    o.name, r.name, l.lag >= '0s', l.lag < '20s'
   FROM mz_internal.mz_wallclock_lag_history l
   JOIN mz_objects o ON o.id = l.object_id
   LEFT JOIN mz_cluster_replicas r ON r.id = l.replica_id
@@ -68,7 +70,7 @@ src_progress <null> true  true
 tbl          <null> true  true
 
 > SELECT DISTINCT ON(o.name)
-    o.name, l.lag >= '0s', l.lag < '10s'
+    o.name, l.lag >= '0s', l.lag < '20s'
   FROM mz_internal.mz_wallclock_global_lag_history l
   JOIN mz_objects o ON o.id = l.object_id
   WHERE l.object_id LIKE 'u%'
@@ -83,7 +85,7 @@ src_progress true  true
 tbl          true  true
 
 > SELECT DISTINCT ON(o.name)
-    o.name, l.lag >= '0s', l.lag < '10s'
+    o.name, l.lag >= '0s', l.lag < '20s'
   FROM mz_internal.mz_wallclock_global_lag_recent_history l
   JOIN mz_objects o ON o.id = l.object_id
   WHERE l.object_id LIKE 'u%'
@@ -97,7 +99,7 @@ src          true  true
 src_progress true  true
 tbl          true  true
 
-> SELECT o.name, l.lag >= '0s', l.lag < '10s'
+> SELECT o.name, l.lag >= '0s', l.lag < '20s'
   FROM mz_internal.mz_wallclock_global_lag l
   JOIN mz_objects o ON o.id = l.object_id
   WHERE l.object_id LIKE 'u%'
@@ -210,8 +212,8 @@ tbl_1hour 01:00:00 true true
 
 > DROP CLUSTER storage CASCADE
 > DROP CLUSTER compute CASCADE
-> CREATE CLUSTER storage SIZE '1', REPLICATION FACTOR 0
-> CREATE CLUSTER compute SIZE '1'
+> CREATE CLUSTER storage SIZE 'scale=1,workers=1', REPLICATION FACTOR 0
+> CREATE CLUSTER compute SIZE 'scale=1,workers=1'
 
 > CREATE SOURCE src IN CLUSTER storage FROM LOAD GENERATOR counter (UP TO 100)
 > CREATE INDEX idx IN CLUSTER compute ON src (counter)

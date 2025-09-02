@@ -20,7 +20,11 @@ from typing import Protocol
 
 from materialize import buildkite
 from materialize.checks.common import KAFKA_SCHEMA_WITH_SINGLE_STRING_FIELD
-from materialize.mzcompose.composition import Composition, WorkflowArgumentParser
+from materialize.mzcompose.composition import (
+    Composition,
+    Service,
+    WorkflowArgumentParser,
+)
 from materialize.mzcompose.services.clusterd import Clusterd
 from materialize.mzcompose.services.kafka import Kafka
 from materialize.mzcompose.services.materialized import Materialized
@@ -38,7 +42,7 @@ def schema() -> str:
 
 SERVICES = [
     Redpanda(),
-    Materialized(),
+    Materialized(support_external_clusterd=True),
     Testdrive(),
     Clusterd(),
     Postgres(),
@@ -73,7 +77,7 @@ class KafkaTransactionLogGreaterThan1:
         print(f"+++ Running disruption scenario {self.name}")
         seed = random.randint(0, 256**4)
 
-        c.up("testdrive", persistent=True)
+        c.up(Service("testdrive", idle=True))
 
         with c.override(
             Testdrive(
@@ -89,7 +93,6 @@ class KafkaTransactionLogGreaterThan1:
             c.up("zookeeper", "badkafka", "schema-registry", "materialized")
             self.populate(c)
             self.assert_error(c, "transaction error", "running a single Kafka broker")
-            c.down(sanity_restart_mz=False)
 
     def populate(self, c: Composition) -> None:
         # Create a source and a sink
@@ -121,6 +124,7 @@ class KafkaTransactionLogGreaterThan1:
         c.testdrive(
             dedent(
                 f"""
+                $ set-sql-timeout duration=120s
                 > SELECT bool_or(error ~* '{error}'), bool_or(details::json#>>'{{hints,0}}' ~* '{hint}')
                   FROM mz_internal.mz_sink_status_history
                   JOIN mz_sinks ON mz_sinks.id = sink_id
@@ -142,9 +146,12 @@ class KafkaDisruption:
         print(f"+++ Running disruption scenario {self.name}")
         seed = random.randint(0, 256**4)
 
-        c.down(destroy_volumes=True, sanity_restart_mz=False)
-        c.up("testdrive", persistent=True)
-        c.up("redpanda", "materialized", "clusterd")
+        c.up(
+            "redpanda",
+            "materialized",
+            "clusterd",
+            Service("testdrive", idle=True),
+        )
 
         with c.override(
             Testdrive(
@@ -214,6 +221,7 @@ class KafkaDisruption:
         c.testdrive(
             dedent(
                 f"""
+                $ set-sql-timeout duration=60s
                 > SELECT status, error ~* '{error}'
                   FROM mz_internal.mz_source_statuses
                   WHERE name = 'source1'
@@ -252,9 +260,12 @@ class KafkaSinkDisruption:
         print(f"+++ Running Kafka sink disruption scenario {self.name}")
         seed = random.randint(0, 256**4)
 
-        c.down(destroy_volumes=True, sanity_restart_mz=False)
-        c.up("testdrive", persistent=True)
-        c.up("redpanda", "materialized", "clusterd")
+        c.up(
+            "redpanda",
+            "materialized",
+            "clusterd",
+            Service("testdrive", idle=True),
+        )
 
         with c.override(
             Testdrive(
@@ -320,6 +331,7 @@ class KafkaSinkDisruption:
         c.testdrive(
             dedent(
                 f"""
+                $ set-sql-timeout duration=60s
                 # Sinks generally halt after receiving an error, which means that they may alternate
                 # between `stalled` and `starting`. Instead of relying on the current status, we
                 # check that there is a stalled status with the expected error.
@@ -356,9 +368,12 @@ class PgDisruption:
         print(f"+++ Running disruption scenario {self.name}")
         seed = random.randint(0, 256**4)
 
-        c.down(destroy_volumes=True, sanity_restart_mz=False)
-        c.up("testdrive", persistent=True)
-        c.up("postgres", "materialized", "clusterd")
+        c.up(
+            "postgres",
+            "materialized",
+            "clusterd",
+            Service("testdrive", idle=True),
+        )
 
         with c.override(
             Testdrive(
@@ -412,6 +427,7 @@ class PgDisruption:
         c.testdrive(
             dedent(
                 f"""
+                $ set-sql-timeout duration=60s
                 # Postgres sources may halt after receiving an error, which means that they may alternate
                 # between `stalled` and `starting`. Instead of relying on the current status, we
                 # check that the latest stall has the error we expect.
@@ -562,6 +578,7 @@ def workflow_default(c: Composition, parser: WorkflowArgumentParser) -> None:
             f"Disruption '{disruption.name}' in workflow_default"
         )
         disruption.run_test(c)
+        c.down(sanity_restart_mz=False)
 
 
 def delete_sink_topic(c: Composition, seed: int) -> None:

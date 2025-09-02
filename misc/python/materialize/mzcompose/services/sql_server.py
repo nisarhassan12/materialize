@@ -8,9 +8,9 @@
 # by the Apache License, Version 2.0.
 
 
-from materialize.mzcompose.service import (
-    Service,
-)
+from materialize import MZ_ROOT
+from materialize.mzcompose.composition import Composition
+from materialize.mzcompose.service import Service
 
 
 class SqlServer(Service):
@@ -23,14 +23,13 @@ class SqlServer(Service):
         # lowercase letters, base-10 digits and/or non-alphanumeric symbols.
         sa_password: str = DEFAULT_SA_PASSWORD,
         name: str = "sql-server",
-        image: str = "mcr.microsoft.com/mssql/server",
         environment_extra: list[str] = [],
         volumes_extra: list[str] = [],
     ) -> None:
         super().__init__(
             name=name,
             config={
-                "image": image,
+                "mzbuild": "mssql-server",
                 "ports": [1433],
                 "volumes": volumes_extra,
                 "environment": [
@@ -40,6 +39,23 @@ class SqlServer(Service):
                     f"SA_PASSWORD={sa_password}",
                     *environment_extra,
                 ],
+                "healthcheck": {
+                    "test": f"/opt/mssql-tools18/bin/sqlcmd -C -S localhost -U sa -P '{sa_password}' -Q 'SELECT 1'",
+                    "interval": "1s",
+                    "start_period": "30s",
+                },
             },
         )
         self.sa_password = sa_password
+
+
+def setup_sql_server_testing(c: Composition) -> None:
+    with open(MZ_ROOT / "test" / "sql-server-cdc" / "setup" / "setup.td") as f:
+        c.testdrive(
+            f.read(),
+            args=[
+                "--max-errors=1",
+                f"--var=default-sql-server-user={SqlServer.DEFAULT_USER}",
+                f"--var=default-sql-server-password={SqlServer.DEFAULT_SA_PASSWORD}",
+            ],
+        )

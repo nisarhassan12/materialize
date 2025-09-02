@@ -29,7 +29,6 @@ use mz_ore::collections::{CollectionExt, HashSet};
 use mz_ore::num::NonNeg;
 use mz_ore::soft_panic_or_log;
 use mz_ore::str::StrExt;
-use mz_ore::vec::VecExt;
 use mz_postgres_util::tunnel::PostgresFlavor;
 use mz_proto::RustType;
 use mz_repr::adt::interval::Interval;
@@ -111,7 +110,9 @@ use mz_storage_types::sources::postgres::{
     PostgresSourceConnection, PostgresSourcePublicationDetails,
     ProtoPostgresSourcePublicationDetails,
 };
-use mz_storage_types::sources::sql_server::SqlServerSourceExportDetails;
+use mz_storage_types::sources::sql_server::{
+    ProtoSqlServerSourceExtras, SqlServerSourceExportDetails,
+};
 use mz_storage_types::sources::{
     GenericSourceConnection, MySqlSourceExportDetails, PostgresSourceExportDetails,
     ProtoSourceExportStatementDetails, SourceConnection, SourceDesc, SourceExportDataConfig,
@@ -970,7 +971,7 @@ pub fn plan_create_source(
         }
         CreateSourceConnection::SqlServer {
             connection,
-            options: _,
+            options,
         } => {
             let connection_item = scx.get_item_by_resolved_name(connection)?;
             match connection_item.connection()? {
@@ -980,9 +981,20 @@ pub fn plan_create_source(
                     scx.catalog.resolve_full_name(connection_item.name())
                 ),
             };
-            // TODO(sql_server2): Handle SQL Server connection options.
 
-            let extras = SqlServerSourceExtras {};
+            let SqlServerConfigOptionExtracted { details, .. } = options.clone().try_into()?;
+            let details = details
+                .as_ref()
+                .ok_or_else(|| sql_err!("internal error: SQL Server source missing details"))?;
+            let extras = hex::decode(details)
+                .map_err(|e| sql_err!("{e}"))
+                .and_then(|raw| {
+                    ProtoSqlServerSourceExtras::decode(&*raw).map_err(|e| sql_err!("{e}"))
+                })
+                .and_then(|proto| {
+                    SqlServerSourceExtras::from_proto(proto).map_err(|e| sql_err!("{e}"))
+                })?;
+
             let connection =
                 GenericSourceConnection::<ReferencedConnection>::from(SqlServerSource {
                     catalog_id: connection_item.id(),
@@ -1539,6 +1551,7 @@ generate_extracted_config!(
     CreateSubsourceOption,
     (Progress, bool, Default(false)),
     (ExternalReference, UnresolvedItemName),
+    (RetainHistory, OptionalDuration),
     (TextColumns, Vec::<Ident>, Default(vec![])),
     (ExcludeColumns, Vec::<Ident>, Default(vec![])),
     (Details, String)
@@ -1559,6 +1572,7 @@ pub fn plan_create_subsource(
 
     let CreateSubsourceOptionExtracted {
         progress,
+        retain_history,
         external_reference,
         text_columns,
         exclude_columns,
@@ -1629,9 +1643,11 @@ pub fn plan_create_subsource(
             SourceExportStatementDetails::SqlServer {
                 table,
                 capture_instance,
+                initial_lsn,
             } => SourceExportDetails::SqlServer(SqlServerSourceExportDetails {
                 capture_instance,
                 table,
+                initial_lsn,
                 text_columns: text_columns.into_iter().map(|c| c.into_string()).collect(),
                 exclude_columns: exclude_columns
                     .into_iter()
@@ -1669,11 +1685,12 @@ pub fn plan_create_subsource(
 
     let create_sql = normalize::create_statement(scx, Statement::CreateSubsource(stmt))?;
 
+    let compaction_window = plan_retain_history_option(scx, retain_history)?;
     let source = Source {
         create_sql,
         data_source,
         desc,
-        compaction_window: None,
+        compaction_window,
     };
 
     Ok(Plan::CreateSource(CreateSourcePlan {
@@ -1690,6 +1707,7 @@ generate_extracted_config!(
     (TextColumns, Vec::<Ident>, Default(vec![])),
     (ExcludeColumns, Vec::<Ident>, Default(vec![])),
     (PartitionBy, Vec<Ident>),
+    (RetainHistory, OptionalDuration),
     (Details, String)
 );
 
@@ -1719,6 +1737,7 @@ pub fn plan_create_table_from_source(
     let TableFromSourceOptionExtracted {
         text_columns,
         exclude_columns,
+        retain_history,
         partition_by,
         details,
         seen: _,
@@ -1781,9 +1800,11 @@ pub fn plan_create_table_from_source(
         SourceExportStatementDetails::SqlServer {
             table,
             capture_instance,
+            initial_lsn,
         } => SourceExportDetails::SqlServer(SqlServerSourceExportDetails {
             table,
             capture_instance,
+            initial_lsn,
             text_columns: text_columns.into_iter().map(|c| c.into_string()).collect(),
             exclude_columns: exclude_columns
                 .into_iter()
@@ -1935,11 +1956,12 @@ pub fn plan_create_table_from_source(
 
     let create_sql = normalize::create_statement(scx, Statement::CreateTableFromSource(stmt))?;
 
+    let compaction_window = plan_retain_history_option(scx, retain_history)?;
     let table = Table {
         create_sql,
         desc: VersionedRelationDesc::new(desc),
         temporary: false,
-        compaction_window: None,
+        compaction_window,
         data_source: TableDataSource::DataSource {
             desc: data_source,
             timeline,
@@ -4578,7 +4600,7 @@ pub fn plan_create_cluster_inner(
         replication_factor,
         seen: _,
         size,
-        disk: disk_in,
+        disk,
         schedule,
         workload_class,
     }: ClusterOptionExtracted = options.try_into()?;
@@ -4605,27 +4627,19 @@ pub fn plan_create_cluster_inner(
             sql_bail!("SIZE must be specified for managed clusters");
         };
 
-        let mut disk_default = scx.catalog.system_vars().disk_cluster_replicas_default();
-        // HACK(benesch): disk is always enabled for v2 cluster sizes, and it
-        // is an error to specify `DISK = FALSE` or `DISK = TRUE` explicitly.
-        //
-        // The long term plan is to phase out the v1 cluster sizes, at which
-        // point we'll be able to remove the `DISK` option entirely and simply
-        // always enable disk.
-        if scx.catalog.is_cluster_size_cc(&size) {
-            if disk_in == Some(false) {
+        if disk.is_some() {
+            // The `DISK` option is a no-op for legacy cluster sizes and was never allowed for
+            // `cc` sizes. The long term plan is to phase out the legacy sizes, at which point
+            // we'll be able to remove the `DISK` option entirely.
+            if scx.catalog.is_cluster_size_cc(&size) {
                 sql_bail!(
-                    "DISK option disabled is not supported for non-legacy cluster sizes because disk is always enabled"
+                    "DISK option not supported for modern cluster sizes because disk is always enabled"
                 );
             }
-            disk_default = true;
+
+            scx.catalog
+                .add_notice(PlanNotice::ReplicaDiskOptionDeprecated);
         }
-        // Only require the feature flag if `DISK` was explicitly specified and it does not match
-        // the default value.
-        if matches!(disk_in, Some(disk) if disk != disk_default) {
-            scx.require_feature_flag(&vars::ENABLE_DISK_CLUSTER_REPLICAS)?;
-        }
-        let disk = disk_in.unwrap_or(disk_default);
 
         let compute = plan_compute_replica_config(
             introspection_interval,
@@ -4687,7 +4701,6 @@ pub fn plan_create_cluster_inner(
                 size,
                 availability_zones,
                 compute,
-                disk,
                 optimizer_feature_overrides,
                 schedule,
             }),
@@ -4712,7 +4725,7 @@ pub fn plan_create_cluster_inner(
         if size.is_some() {
             sql_bail!("SIZE not supported for unmanaged clusters");
         }
-        if disk_in.is_some() {
+        if disk.is_some() {
             sql_bail!("DISK not supported for unmanaged clusters");
         }
         if !features.is_empty() {
@@ -4754,12 +4767,12 @@ pub fn unplan_create_cluster(
             size,
             availability_zones,
             compute,
-            disk,
             optimizer_feature_overrides,
             schedule,
         }) => {
             let schedule = unplan_cluster_schedule(schedule);
             let OptimizerFeatureOverrides {
+                enable_guard_subquery_tablefunc: _,
                 enable_consolidate_after_union_negate: _,
                 enable_reduce_mfp_fusion: _,
                 enable_cardinality_estimates: _,
@@ -4774,6 +4787,8 @@ pub fn unplan_create_cluster(
                 enable_projection_pushdown_after_relation_cse,
                 enable_less_reduce_in_eqprop: _,
                 enable_dequadratic_eqprop_map: _,
+                enable_eq_classes_withholding_errors: _,
+                enable_fast_path_plan_insights: _,
             } = optimizer_feature_overrides;
             // The ones from above that don't occur below are not wired up to cluster features.
             let features_extracted = ClusterFeatureExtracted {
@@ -4812,7 +4827,7 @@ pub fn unplan_create_cluster(
                 // Seen is ignored when unplanning.
                 seen: Default::default(),
                 availability_zones,
-                disk: Some(disk),
+                disk: None,
                 introspection_debugging: Some(introspection_debugging),
                 introspection_interval,
                 managed: Some(true),
@@ -4859,81 +4874,56 @@ fn plan_replica_config(
     let ReplicaOptionExtracted {
         availability_zone,
         billed_as,
-        compute_addresses,
         computectl_addresses,
-        disk: disk_in,
+        disk,
         internal,
         introspection_debugging,
         introspection_interval,
         size,
-        storage_addresses,
         storagectl_addresses,
-        workers,
         ..
     }: ReplicaOptionExtracted = options.try_into()?;
 
     let compute = plan_compute_replica_config(introspection_interval, introspection_debugging)?;
-
-    if disk_in.is_some() {
-        scx.require_feature_flag(&vars::ENABLE_DISK_CLUSTER_REPLICAS)?;
-    }
 
     match (
         size,
         availability_zone,
         billed_as,
         storagectl_addresses,
-        storage_addresses,
         computectl_addresses,
-        compute_addresses,
-        workers,
     ) {
         // Common cases we expect end users to hit.
-        (None, _, None, None, None, None, None, None) => {
+        (None, _, None, None, None) => {
             // We don't mention the unmanaged options in the error message
             // because they are only available in unsafe mode.
             sql_bail!("SIZE option must be specified");
         }
-        (Some(size), availability_zone, billed_as, None, None, None, None, None) => {
-            let disk_default = scx.catalog.system_vars().disk_cluster_replicas_default();
-            let mut disk = disk_in.unwrap_or(disk_default);
-
-            // HACK(benesch): disk is always enabled for v2 cluster sizes, and
-            // it is an error to specify `DISK = FALSE` or `DISK = TRUE`
-            // explicitly.
-            //
-            // The long term plan is to phase out the v1 cluster sizes, at which
-            // point we'll be able to remove the `DISK` option entirely and
-            // simply always enable disk.
-            if scx.catalog.is_cluster_size_cc(&size) {
-                if disk_in.is_some() {
+        (Some(size), availability_zone, billed_as, None, None) => {
+            if disk.is_some() {
+                // The `DISK` option is a no-op for legacy cluster sizes and was never allowed for
+                // `cc` sizes. The long term plan is to phase out the legacy sizes, at which point
+                // we'll be able to remove the `DISK` option entirely.
+                if scx.catalog.is_cluster_size_cc(&size) {
                     sql_bail!(
-                        "DISK option not supported for non-legacy cluster sizes because disk is always enabled"
+                        "DISK option not supported for modern cluster sizes because disk is always enabled"
                     );
                 }
-                disk = true;
+
+                scx.catalog
+                    .add_notice(PlanNotice::ReplicaDiskOptionDeprecated);
             }
 
             Ok(ReplicaConfig::Orchestrated {
                 size,
                 availability_zone,
                 compute,
-                disk,
                 billed_as,
                 internal,
             })
         }
 
-        (
-            None,
-            None,
-            None,
-            storagectl_addresses,
-            storage_addresses,
-            computectl_addresses,
-            compute_addresses,
-            workers,
-        ) => {
+        (None, None, None, storagectl_addresses, computectl_addresses) => {
             scx.require_feature_flag(&vars::UNSAFE_ENABLE_UNORCHESTRATED_CLUSTER_REPLICAS)?;
 
             // When manually testing Materialize in unsafe mode, it's easy to
@@ -4942,43 +4932,23 @@ fn plan_replica_config(
             let Some(storagectl_addrs) = storagectl_addresses else {
                 sql_bail!("missing STORAGECTL ADDRESSES option");
             };
-            let Some(storage_addrs) = storage_addresses else {
-                sql_bail!("missing STORAGE ADDRESSES option");
-            };
             let Some(computectl_addrs) = computectl_addresses else {
                 sql_bail!("missing COMPUTECTL ADDRESSES option");
             };
-            let Some(compute_addrs) = compute_addresses else {
-                sql_bail!("missing COMPUTE ADDRESSES option");
-            };
-            let workers = workers.unwrap_or(1);
 
-            if computectl_addrs.len() != compute_addrs.len() {
-                sql_bail!("COMPUTECTL ADDRESSES and COMPUTE ADDRESSES must have the same length");
-            }
-            if storagectl_addrs.len() != storage_addrs.len() {
-                sql_bail!("STORAGECTL ADDRESSES and STORAGE ADDRESSES must have the same length");
-            }
             if storagectl_addrs.len() != computectl_addrs.len() {
                 sql_bail!(
                     "COMPUTECTL ADDRESSES and STORAGECTL ADDRESSES must have the same length"
                 );
             }
 
-            if workers == 0 {
-                sql_bail!("WORKERS must be greater than 0");
-            }
-
-            if disk_in.is_some() {
+            if disk.is_some() {
                 sql_bail!("DISK can't be specified for unorchestrated clusters");
             }
 
             Ok(ReplicaConfig::Unorchestrated {
                 storagectl_addrs,
-                storage_addrs,
                 computectl_addrs,
-                compute_addrs,
-                workers: workers.into(),
                 compute,
             })
         }
@@ -6137,22 +6107,6 @@ pub fn plan_alter_cluster(
                 options.replication_factor = AlterOptionParameter::Set(replication_factor);
             }
             if let Some(size) = &size {
-                // HACK(benesch): disk is always enabled for v2 cluster sizes,
-                // and it is an error to specify `DISK = FALSE` or `DISK = TRUE`
-                // explicitly.
-                //
-                // The long term plan is to phase out the v1 cluster sizes, at
-                // which point we'll be able to remove the `DISK` option
-                // entirely and simply always enable disk.
-                if scx.catalog.is_cluster_size_cc(size) {
-                    if disk.is_some() {
-                        sql_bail!(
-                            "DISK option not supported for modern cluster sizes because disk is always enabled"
-                        );
-                    } else {
-                        options.disk = AlterOptionParameter::Set(true);
-                    }
-                }
                 options.size = AlterOptionParameter::Set(size.clone());
             }
             if let Some(availability_zones) = availability_zones {
@@ -6165,14 +6119,10 @@ pub fn plan_alter_cluster(
             if let Some(introspection_interval) = introspection_interval {
                 options.introspection_interval = AlterOptionParameter::Set(introspection_interval);
             }
-            if let Some(disk) = disk {
-                // HACK(benesch): disk is always enabled for v2 cluster sizes,
-                // and it is an error to specify `DISK = FALSE` or `DISK = TRUE`
-                // explicitly.
-                //
-                // The long term plan is to phase out the v1 cluster sizes, at
-                // which point we'll be able to remove the `DISK` option
-                // entirely and simply always enable disk.
+            if disk.is_some() {
+                // The `DISK` option is a no-op for legacy cluster sizes and was never allowed for
+                // `cc` sizes. The long term plan is to phase out the legacy sizes, at which point
+                // we'll be able to remove the `DISK` option entirely.
                 let size = size.as_deref().unwrap_or_else(|| {
                     cluster.managed_size().expect("cluster known to be managed")
                 });
@@ -6182,10 +6132,8 @@ pub fn plan_alter_cluster(
                     );
                 }
 
-                if disk {
-                    scx.require_feature_flag(&vars::ENABLE_DISK_CLUSTER_REPLICAS)?;
-                }
-                options.disk = AlterOptionParameter::Set(disk);
+                scx.catalog
+                    .add_notice(PlanNotice::ReplicaDiskOptionDeprecated);
             }
             if !replicas.is_empty() {
                 options.replicas = AlterOptionParameter::Set(replicas);
@@ -6210,7 +6158,9 @@ pub fn plan_alter_cluster(
             for option in reset_options {
                 match option {
                     AvailabilityZones => options.availability_zones = Reset,
-                    Disk => options.disk = Reset,
+                    Disk => scx
+                        .catalog
+                        .add_notice(PlanNotice::ReplicaDiskOptionDeprecated),
                     IntrospectionInterval => options.introspection_interval = Reset,
                     IntrospectionDebugging => options.introspection_debugging = Reset,
                     Managed => options.managed = Reset,
@@ -6850,6 +6800,7 @@ pub fn plan_alter_connection(
         Connection::Ssh(_) => CreateConnectionType::Ssh,
         Connection::MySql(_) => CreateConnectionType::MySql,
         Connection::SqlServer(_) => CreateConnectionType::SqlServer,
+        Connection::IcebergCatalog(_) => CreateConnectionType::IcebergCatalog,
     };
 
     // Collect all options irrespective of action taken on them.
@@ -6995,7 +6946,7 @@ pub fn plan_alter_sink(
             // And then we find the existing version of the sink and increase it by one
             let cur_version = stmt
                 .with_options
-                .drain_filter_swapping(|o| o.name == CreateSinkOptionName::Version)
+                .extract_if(.., |o| o.name == CreateSinkOptionName::Version)
                 .map(|o| u64::try_from_value(o.value).expect("invalid sink create_sql"))
                 .max()
                 .unwrap_or(0);

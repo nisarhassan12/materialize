@@ -329,35 +329,13 @@ impl NamespacedOrchestrator for NamespacedProcessOrchestrator {
         id: &str,
         config: ServiceConfig,
     ) -> Result<Box<dyn Service>, anyhow::Error> {
-        let always_use_disk = self
-            .scheduling_config
-            .read()
-            .expect("poisoned")
-            .always_use_disk;
-
         let service = ProcessService {
             run_dir: self.config.service_run_dir(id),
             scale: config.scale,
         };
-        // Determining whether to enable disk is subtle because we need to
-        // support historical sizes in the managed service and custom sizes in
-        // self hosted deployments.
-        let disk = {
-            // Whether the user specified `DISK = TRUE` when creating the
-            // replica OR whether the feature flag to force disk is enabled.
-            let user_requested_disk = config.disk || always_use_disk;
-            // Whether the cluster replica size map provided by the
-            // administrator explicitly indicates that the size does not support
-            // disk.
-            let size_disables_disk = config.disk_limit == Some(DiskLimit::ZERO);
-            // Enable disk if the user requested it and the size does not
-            // disable it.
-            //
-            // Arguably we should not allow the user to request disk with sizes
-            // that have a zero disk limit, but configuring disk on a replica by
-            // replica basis is a legacy option that we hope to remove someday.
-            user_requested_disk && !size_disables_disk
-        };
+
+        // Enable disk if the size does not disable it.
+        let disk = config.disk_limit != Some(DiskLimit::ZERO);
 
         let config = EnsureServiceConfig {
             image: config.image,

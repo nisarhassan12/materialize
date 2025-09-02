@@ -60,7 +60,7 @@ resource "azurerm_resource_group" "materialize" {
 }
 
 module "materialize" {
-  source = "git::https://github.com/MaterializeInc/terraform-azurerm-materialize.git?ref=v0.4.5"
+  source = "git::https://github.com/MaterializeInc/terraform-azurerm-materialize.git?ref=v0.4.9"
   resource_group_name = azurerm_resource_group.materialize.name
   location            = "eastus2"
   prefix              = "mz-tf-test"
@@ -73,6 +73,22 @@ module "materialize" {
 
   install_cert_manager = false
   use_self_signed_cluster_issuer = false
+
+  helm_values = {
+      operator = {
+        args = {
+          enableLicenseKeyChecks = true
+        }
+      },
+      clusters = {
+        defaultReplicationFactor = {
+            system = 1
+            probe = 1
+            support = 1
+            analytics = 1
+        }
+      }
+  }
 
   materialize_instances = var.materialize_instances
 

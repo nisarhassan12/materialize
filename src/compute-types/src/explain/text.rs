@@ -26,6 +26,7 @@ use std::ops::Deref;
 use itertools::{Itertools, izip};
 use mz_expr::explain::{HumanizedExplain, HumanizerMode, fmt_text_constant_rows};
 use mz_expr::{Id, MirScalarExpr};
+use mz_ore::soft_assert_or_log;
 use mz_ore::str::{IndentLike, StrExt, separated};
 use mz_repr::explain::text::DisplayText;
 use mz_repr::explain::{
@@ -118,7 +119,7 @@ impl Plan {
                         }
                     }
                     GetPlan::Arrangement(key, Some(val), mfp) => {
-                        if !mfp.expressions.is_empty() || !mfp.predicates.is_empty() {
+                        if !mfp.is_identity() {
                             writeln!(f, "{}→Fused Map/Filter/Project", ctx.indent)?;
                             ctx.indent += 1;
                             mode.expr(mfp, None).fmt_default_text(f, ctx)?;
@@ -133,7 +134,7 @@ impl Plan {
                         writeln!(f, "Value: {val}")?;
                     }
                     GetPlan::Arrangement(key, None, mfp) => {
-                        if !mfp.expressions.is_empty() || !mfp.predicates.is_empty() {
+                        if !mfp.is_identity() {
                             writeln!(f, "{}→Fused Map/Filter/Project", ctx.indent)?;
                             ctx.indent += 1;
                             mode.expr(mfp, None).fmt_default_text(f, ctx)?;
@@ -146,7 +147,7 @@ impl Plan {
                         writeln!(f, "{}Key: ({key})", ctx.indent)?;
                     }
                     GetPlan::Collection(mfp) => {
-                        if !mfp.expressions.is_empty() || !mfp.predicates.is_empty() {
+                        if !mfp.is_identity() {
                             writeln!(f, "{}→Fused Map/Filter/Project", ctx.indent)?;
                             ctx.indent += 1;
                             mode.expr(mfp, None).fmt_default_text(f, ctx)?;
@@ -216,18 +217,18 @@ impl Plan {
                 mode.expr(mfp, None).fmt_default_text(f, ctx)?;
 
                 // one more nesting level if we showed anything for the MFP
-                if !mfp.expressions.is_empty() || !mfp.predicates.is_empty() {
+                if !mfp.is_identity() {
                     ctx.indent += 1;
                 }
                 input.fmt_text(f, ctx)?;
                 ctx.indent.reset();
             }
             FlatMap {
-                input,
-                func,
-                exprs,
-                mfp_after,
                 input_key: _,
+                input,
+                exprs,
+                func,
+                mfp_after,
             } => {
                 ctx.indent.set();
                 if !mfp_after.expressions.is_empty() || !mfp_after.predicates.is_empty() {
@@ -285,10 +286,10 @@ impl Plan {
                 })?;
             }
             Reduce {
+                input_key: _,
                 input,
                 key_val_plan,
                 plan,
-                input_key: _,
                 mfp_after,
             } => {
                 ctx.indent.set();
@@ -365,15 +366,11 @@ impl Plan {
 
                 ctx.indented(|ctx| {
                     let kvp = key_val_plan.key_plan.deref();
-                    if !kvp.expressions.is_empty() || !kvp.predicates.is_empty() {
-                        writeln!(
-                            f,
-                            "{}Aggregate Key Map/Filter/Project{annotations}",
-                            ctx.indent
-                        )?;
+                    if !kvp.is_identity() {
+                        writeln!(f, "{}Key:", ctx.indent)?;
                         ctx.indented(|ctx| {
-                            let key_plan = mode.expr(key_val_plan.key_plan.deref(), None);
-                            key_plan.fmt_text(f, ctx)
+                            let key_plan = mode.expr(kvp, None);
+                            key_plan.fmt_default_text(f, ctx)
                         })?;
                     }
 
@@ -492,23 +489,36 @@ impl Plan {
                 })?;
             }
             ArrangeBy {
-                input,
-                forms,
                 input_key: _,
+                input,
                 input_mfp,
+                forms,
             } => {
                 if forms.raw && forms.arranged.is_empty() {
+                    soft_assert_or_log!(forms.raw, "raw stream with no arrangements");
                     writeln!(f, "{}→Unarranged Raw Stream{annotations}", ctx.indent)?;
                 } else {
-                    writeln!(f, "{}→Arrange{annotations}", ctx.indent)?;
+                    write!(f, "{}→Arrange", ctx.indent)?;
+
+                    if !forms.arranged.is_empty() {
+                        let mode = HumanizedExplain::new(ctx.config.redacted);
+                        for (key, _, _) in &forms.arranged {
+                            if !key.is_empty() {
+                                let key = mode.seq(key, None);
+                                let key = CompactScalars(key);
+                                write!(f, " ({key})")?;
+                            } else {
+                                write!(f, " (empty key)")?;
+                            }
+                        }
+                    }
+                    writeln!(f, "{annotations}")?;
                 }
+
                 ctx.indented(|ctx| {
                     if !input_mfp.expressions.is_empty() || !input_mfp.predicates.is_empty() {
                         writeln!(f, "{}Pre-process Map/Filter/Project", ctx.indent)?;
                         ctx.indented(|ctx| mode.expr(input_mfp, None).fmt_default_text(f, ctx))?;
-                    }
-                    if !forms.arranged.is_empty() {
-                        forms.fmt_text(f, ctx)?;
                     }
 
                     input.fmt_text(f, ctx)
@@ -680,11 +690,11 @@ impl Plan {
                 })?;
             }
             FlatMap {
-                input,
-                func,
-                exprs,
-                mfp_after,
                 input_key,
+                input,
+                exprs,
+                func,
+                mfp_after,
             } => {
                 let exprs = mode.seq(exprs, None);
                 let exprs = CompactScalars(exprs);
@@ -694,14 +704,14 @@ impl Plan {
                     ctx.indent, func, exprs, annotations
                 )?;
                 ctx.indented(|ctx| {
-                    if !mfp_after.is_identity() {
-                        writeln!(f, "{}mfp_after", ctx.indent)?;
-                        ctx.indented(|ctx| mode.expr(mfp_after, None).fmt_text(f, ctx))?;
-                    }
                     if let Some(key) = input_key {
                         let key = mode.seq(key, None);
                         let key = CompactScalars(key);
                         writeln!(f, "{}input_key={}", ctx.indent, key)?;
+                    }
+                    if !mfp_after.is_identity() {
+                        writeln!(f, "{}mfp_after", ctx.indent)?;
+                        ctx.indented(|ctx| mode.expr(mfp_after, None).fmt_text(f, ctx))?;
                     }
                     input.fmt_text(f, ctx)
                 })?;
@@ -726,10 +736,10 @@ impl Plan {
                 })?;
             }
             Reduce {
+                input_key,
                 input,
                 key_val_plan,
                 plan,
-                input_key,
                 mfp_after,
             } => {
                 use crate::plan::reduce::ReducePlan;
@@ -755,14 +765,10 @@ impl Plan {
                     }
                 }
                 ctx.indented(|ctx| {
-                    if key_val_plan.val_plan.deref().is_identity() {
-                        writeln!(f, "{}val_plan=id", ctx.indent)?;
-                    } else {
-                        writeln!(f, "{}val_plan", ctx.indent)?;
-                        ctx.indented(|ctx| {
-                            let val_plan = mode.expr(key_val_plan.val_plan.deref(), None);
-                            val_plan.fmt_text(f, ctx)
-                        })?;
+                    if let Some(key) = input_key {
+                        let key = mode.seq(key, None);
+                        let key = CompactScalars(key);
+                        writeln!(f, "{}input_key={}", ctx.indent, key)?;
                     }
                     if key_val_plan.key_plan.deref().is_identity() {
                         writeln!(f, "{}key_plan=id", ctx.indent)?;
@@ -773,10 +779,14 @@ impl Plan {
                             key_plan.fmt_text(f, ctx)
                         })?;
                     }
-                    if let Some(key) = input_key {
-                        let key = mode.seq(key, None);
-                        let key = CompactScalars(key);
-                        writeln!(f, "{}input_key={}", ctx.indent, key)?;
+                    if key_val_plan.val_plan.deref().is_identity() {
+                        writeln!(f, "{}val_plan=id", ctx.indent)?;
+                    } else {
+                        writeln!(f, "{}val_plan", ctx.indent)?;
+                        ctx.indented(|ctx| {
+                            let val_plan = mode.expr(key_val_plan.val_plan.deref(), None);
+                            val_plan.fmt_text(f, ctx)
+                        })?;
                     }
                     if !mfp_after.is_identity() {
                         writeln!(f, "{}mfp_after", ctx.indent)?;
@@ -890,10 +900,10 @@ impl Plan {
                 })?;
             }
             ArrangeBy {
-                input,
-                forms,
                 input_key,
+                input,
                 input_mfp,
+                forms,
             } => {
                 writeln!(f, "{}ArrangeBy{}", ctx.indent, annotations)?;
                 ctx.indented(|ctx| {
@@ -974,23 +984,6 @@ impl AvailableCollections {
             write!(f, "{}arrangements[{}]=", ctx.indent, i)?;
             arrangement.fmt_text(f, ctx)?;
             writeln!(f, "")?;
-        }
-        // types field
-        if let Some(types) = self.types.as_ref() {
-            if types.len() > 0 {
-                write!(f, "{}types=[", ctx.indent)?;
-                write!(
-                    f,
-                    "{}",
-                    separated(
-                        ", ",
-                        types
-                            .iter()
-                            .map(|c| ctx.humanizer.humanize_column_type(c, false))
-                    )
-                )?;
-                writeln!(f, "]")?;
-            }
         }
         Ok(())
     }

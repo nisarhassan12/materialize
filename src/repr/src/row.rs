@@ -423,6 +423,7 @@ mod columnation {
 }
 
 mod columnar {
+    use columnar::common::PushIndexAs;
     use columnar::{
         AsBytes, Clear, Columnar, Container, FromBytes, HeapSize, Index, IndexAs, Len, Push,
     };
@@ -439,19 +440,18 @@ mod columnar {
     }
 
     impl Columnar for Row {
-        type Ref<'a> = &'a RowRef;
         #[inline(always)]
-        fn copy_from(&mut self, other: Self::Ref<'_>) {
+        fn copy_from(&mut self, other: columnar::Ref<'_, Self>) {
             self.clear();
             self.data.extend_from_slice(other.data());
         }
         #[inline(always)]
-        fn into_owned(other: Self::Ref<'_>) -> Self {
+        fn into_owned(other: columnar::Ref<'_, Self>) -> Self {
             other.to_owned()
         }
         type Container = Rows;
         #[inline(always)]
-        fn reborrow<'b, 'a: 'b>(thing: Self::Ref<'a>) -> Self::Ref<'b>
+        fn reborrow<'b, 'a: 'b>(thing: columnar::Ref<'a, Self>) -> columnar::Ref<'b, Self>
         where
             Self: 'a,
         {
@@ -459,34 +459,12 @@ mod columnar {
         }
     }
 
-    impl<'b, BC: Container<u64>> Container<Row> for Rows<BC, &'b [u8]> {
+    impl<BC: PushIndexAs<u64>> Container for Rows<BC, Vec<u8>> {
+        type Ref<'a> = &'a RowRef;
         type Borrowed<'a>
             = Rows<BC::Borrowed<'a>, &'a [u8]>
         where
             Self: 'a;
-        #[inline(always)]
-        fn borrow<'a>(&'a self) -> Self::Borrowed<'a> {
-            Rows {
-                bounds: self.bounds.borrow(),
-                values: self.values,
-            }
-        }
-        #[inline(always)]
-        fn reborrow<'c, 'a: 'c>(item: Self::Borrowed<'a>) -> Self::Borrowed<'c>
-        where
-            Self: 'a,
-        {
-            Rows {
-                bounds: BC::reborrow(item.bounds),
-                values: item.values,
-            }
-        }
-    }
-    impl<BC: Container<u64>> Container<Row> for Rows<BC, Vec<u8>> {
-        type Borrowed<'a>
-            = Rows<BC::Borrowed<'a>, &'a [u8]>
-        where
-            BC: 'a;
         #[inline(always)]
         fn borrow<'a>(&'a self) -> Self::Borrowed<'a> {
             Rows {
@@ -503,6 +481,22 @@ mod columnar {
                 bounds: BC::reborrow(item.bounds),
                 values: item.values,
             }
+        }
+
+        fn reborrow_ref<'b, 'a: 'b>(item: Self::Ref<'a>) -> Self::Ref<'b>
+        where
+            Self: 'a,
+        {
+            item
+        }
+
+        fn reserve_for<'a, I>(&mut self, selves: I)
+        where
+            Self: 'a,
+            I: Iterator<Item = Self::Borrowed<'a>> + Clone,
+        {
+            self.bounds.reserve_for(selves.clone().map(|r| r.bounds));
+            self.values.reserve_for(selves.map(|r| r.values));
         }
     }
 
@@ -567,11 +561,11 @@ mod columnar {
             self.bounds.push(u64::cast_from(self.values.len()));
         }
     }
-    impl<BC: Push<u64>> Push<&RowRef> for Rows<BC> {
+    impl<BC: for<'a> Push<&'a u64>> Push<&RowRef> for Rows<BC> {
         #[inline(always)]
         fn push(&mut self, item: &RowRef) {
             self.values.extend_from_slice(item.data());
-            self.bounds.push(u64::cast_from(self.values.len()));
+            self.bounds.push(&u64::cast_from(self.values.len()));
         }
     }
     impl<BC: Clear, VC: Clear> Clear for Rows<BC, VC> {
@@ -611,7 +605,7 @@ impl RowRef {
     }
 
     /// Unpack `self` into a `Vec<Datum>` for efficient random access.
-    pub fn unpack(&self) -> Vec<Datum> {
+    pub fn unpack(&self) -> Vec<Datum<'_>> {
         // It's usually cheaper to unpack twice to figure out the right length than it is to grow the vec as we go
         let len = self.iter().count();
         let mut vec = Vec::with_capacity(len);
@@ -622,12 +616,12 @@ impl RowRef {
     /// Return the first [`Datum`] in `self`
     ///
     /// Panics if the [`RowRef`] is empty.
-    pub fn unpack_first(&self) -> Datum {
+    pub fn unpack_first(&self) -> Datum<'_> {
         self.iter().next().unwrap()
     }
 
     /// Iterate the [`Datum`] elements of the [`RowRef`].
-    pub fn iter(&self) -> DatumListIter {
+    pub fn iter(&self) -> DatumListIter<'_> {
         DatumListIter { data: &self.0 }
     }
 
@@ -1965,7 +1959,7 @@ impl RowPacker<'_> {
     /// This function is intentionally somewhat inconvenient to call. You
     /// usually want to call [`Row::packer`] instead to start packing from
     /// scratch.
-    pub fn for_existing_row(row: &mut Row) -> RowPacker {
+    pub fn for_existing_row(row: &mut Row) -> RowPacker<'_> {
         RowPacker { row }
     }
 

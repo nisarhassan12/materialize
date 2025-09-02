@@ -19,29 +19,27 @@ FROM materialize/console:25.2.3 AS console
 
 MZFROM ubuntu-base
 
-RUN groupadd --system --gid=999 materialize \
-    && useradd --system --gid=999 --uid=999 --create-home materialize
-
 ARG CI_SANITIZER=none
 
-RUN apt-get update \
+RUN groupadd --system --gid=999 materialize \
+    && useradd --system --gid=999 --uid=999 --create-home materialize \
+    && apt-get update \
     && TZ=UTC DEBIAN_FRONTEND=noninteractive apt-get -qy install --no-install-recommends \
         ca-certificates \
         curl \
         gettext-base \
         nginx \
         postgresql \
-        postgresql-contrib \
-        tini \
         ssh \
+        tini \
     && if [ "$CI_SANITIZER" != "none" ]; then \
         TZ=UTC DEBIAN_FRONTEND=noninteractive apt-get -qy install --no-install-recommends llvm; \
        fi \
     && rm -rf /var/lib/apt/lists/* \
     && apt-get clean \
-    && mkdir -p /mzdata /scratch /var/lib/postgresql/data /var/run/postgresql /var/lib/nginx /var/log/nginx \
+    && mkdir -p /mzdata /scratch /var/lib/postgresql/data /var/run/postgresql /var/lib/nginx /var/log/nginx /etc/postgresql/16/main \
     && touch /run/nginx.pid \
-    && chown -R materialize /mzdata /scratch /var/lib/postgresql/data /var/run/postgresql /var/log/postgresql /var/lib/postgresql/16/main /var/lib/nginx /var/log/nginx /run/nginx.pid
+    && chown -R materialize /mzdata /scratch /var/lib/postgresql/data /var/run/postgresql /var/log/postgresql /var/lib/postgresql/16/main /var/lib/nginx /var/log/nginx /run/nginx.pid /etc/postgresql/16/main
 
 COPY postgresql.conf pg_hba.conf /etc/postgresql/16/main/
 
@@ -57,7 +55,3 @@ RUN MZ_ENDPOINT=http://localhost:6876 \
     && rm /etc/nginx/templates/default.conf.template
 
 USER materialize
-
-RUN pg_ctlcluster 16 main start \
-    && psql -U postgres -c "CREATE ROLE root WITH LOGIN PASSWORD 'root'" \
-    && psql -U postgres -c "CREATE DATABASE root OWNER root"

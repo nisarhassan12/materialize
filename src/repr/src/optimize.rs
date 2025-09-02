@@ -92,6 +92,10 @@ macro_rules! optimizer_feature_flags {
 }
 
 optimizer_feature_flags!({
+    // Use `EquivalenceClassesWithholdingErrors` instead of raw
+    // `EquivalenceClasses` during eq prop for joins.
+    enable_eq_classes_withholding_errors: bool,
+    enable_guard_subquery_tablefunc: bool,
     // Enable consolidation of unions that happen immediately after negate.
     //
     // The refinement happens in the LIR ⇒ LIR phase.
@@ -126,6 +130,7 @@ optimizer_feature_flags!({
     enable_less_reduce_in_eqprop: bool,
     // See the feature flag of the same name.
     enable_dequadratic_eqprop_map: bool,
+    enable_fast_path_plan_insights: bool,
 });
 
 /// A trait used to implement layered config construction.

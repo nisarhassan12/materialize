@@ -9,16 +9,21 @@
 
 //! Useful queries to inspect the state of a SQL Server instance.
 
+use anyhow::Context;
+use chrono::NaiveDateTime;
 use futures::Stream;
 use itertools::Itertools;
 use mz_ore::cast::CastFrom;
+use mz_ore::retry::RetryResult;
 use smallvec::SmallVec;
 use std::collections::BTreeMap;
 use std::fmt;
 use std::sync::Arc;
+use std::time::Duration;
+use tiberius::numeric::Numeric;
 
 use crate::cdc::{Lsn, RowFilterOption};
-use crate::desc::{SqlServerColumnRaw, SqlServerTableRaw};
+use crate::desc::{SqlServerCaptureInstanceRaw, SqlServerColumnRaw, SqlServerTableRaw};
 use crate::{Client, SqlServerError};
 
 /// Returns the minimum log sequence number for the specified `capture_instance`.
@@ -34,16 +39,131 @@ pub async fn get_min_lsn(
     mz_ore::soft_assert_eq_or_log!(result.len(), 1);
     parse_lsn(&result[..1])
 }
+/// Returns the minimum log sequence number for the specified `capture_instance`, retrying
+/// if the log sequence number is not available.
+///
+/// See: <https://learn.microsoft.com/en-us/sql/relational-databases/system-functions/sys-fn-cdc-get-min-lsn-transact-sql?view=sql-server-ver16>
+pub async fn get_min_lsn_retry(
+    client: &mut Client,
+    capture_instance: &str,
+    max_retry_duration: Duration,
+) -> Result<Lsn, SqlServerError> {
+    let (_client, lsn_result) = mz_ore::retry::Retry::default()
+        .max_duration(max_retry_duration)
+        .retry_async_with_state(client, |_, client| async {
+            let result = crate::inspect::get_min_lsn(client, capture_instance).await;
+            (client, map_null_lsn_to_retry(result))
+        })
+        .await;
+    let Ok(lsn) = lsn_result else {
+        tracing::warn!("database did not report a minimum LSN in time");
+        return lsn_result;
+    };
+    Ok(lsn)
+}
 
 /// Returns the maximum log sequence number for the entire database.
+/// This implementation relies on CDC, which is asynchronous, so may
+/// return an LSN that is less than the maximum LSN of SQL server.
 ///
-/// See: <https://learn.microsoft.com/en-us/sql/relational-databases/system-functions/sys-fn-cdc-get-max-lsn-transact-sql?view=sql-server-ver16>
+/// See:
+/// - <https://learn.microsoft.com/en-us/sql/relational-databases/system-functions/sys-fn-cdc-get-max-lsn-transact-sql?view=sql-server-ver16>
+/// - <https://groups.google.com/g/debezium/c/47Yg2r166KM/m/lHqtRF2xAQAJ?pli=1>
 pub async fn get_max_lsn(client: &mut Client) -> Result<Lsn, SqlServerError> {
     static MAX_LSN_QUERY: &str = "SELECT sys.fn_cdc_get_max_lsn();";
     let result = client.simple_query(MAX_LSN_QUERY).await?;
 
     mz_ore::soft_assert_eq_or_log!(result.len(), 1);
     parse_lsn(&result[..1])
+}
+
+/// Retrieves the minumum [`Lsn`] (start_lsn field) from `cdc.change_tables`
+/// for the specified capture instances.
+///
+/// This is based on the `sys.fn_cdc_get_min_lsn` implementation, which has logic
+/// that we want to bypass. Specifically, `sys.fn_cdc_get_min_lsn` returns NULL
+/// if the `start_lsn` in `cdc.change_tables` is less than or equal to the LSN
+/// returned by `sys.fn_cdc_get_max_lsn`.
+///
+/// See: <https://learn.microsoft.com/en-us/sql/relational-databases/system-tables/cdc-change-tables-transact-sql?view=sql-server-ver16>
+pub async fn get_min_lsns(
+    client: &mut Client,
+    capture_instances: impl IntoIterator<Item = &str>,
+) -> Result<BTreeMap<Arc<str>, Lsn>, SqlServerError> {
+    let capture_instances: SmallVec<[_; 1]> = capture_instances.into_iter().collect();
+    let values: Vec<_> = capture_instances
+        .iter()
+        .map(|ci| {
+            let ci: &dyn tiberius::ToSql = ci;
+            ci
+        })
+        .collect();
+    let args = (0..capture_instances.len())
+        .map(|i| format!("@P{}", i + 1))
+        .collect::<Vec<_>>()
+        .join(",");
+    let stmt = format!(
+        "SELECT capture_instance, start_lsn FROM cdc.change_tables WHERE capture_instance IN ({args});"
+    );
+    let result = client.query(stmt, &values).await?;
+    let min_lsns = result
+        .into_iter()
+        .map(|row| {
+            let capture_instance: Arc<str> = row
+                .try_get::<&str, _>("capture_instance")?
+                .ok_or_else(|| {
+                    SqlServerError::ProgrammingError(
+                        "missing column 'capture_instance'".to_string(),
+                    )
+                })?
+                .into();
+            let start_lsn: &[u8] = row.try_get("start_lsn")?.ok_or_else(|| {
+                SqlServerError::ProgrammingError("missing column 'start_lsn'".to_string())
+            })?;
+            let min_lsn = Lsn::try_from(start_lsn).map_err(|msg| SqlServerError::InvalidData {
+                column_name: "lsn".to_string(),
+                error: format!("Error parsing LSN for {capture_instance}: {msg}"),
+            })?;
+            Ok::<_, SqlServerError>((capture_instance, min_lsn))
+        })
+        .collect::<Result<_, _>>()?;
+
+    Ok(min_lsns)
+}
+
+/// Returns the maximum log sequence number for the entire database, retrying
+/// if the log sequence number is not available. This implementation relies on
+/// CDC, which is asynchronous, so may return an LSN that is less than the
+/// maximum LSN of SQL server.
+///
+/// See:
+/// - <https://learn.microsoft.com/en-us/sql/relational-databases/system-functions/sys-fn-cdc-get-max-lsn-transact-sql?view=sql-server-ver16>
+/// - <https://groups.google.com/g/debezium/c/47Yg2r166KM/m/lHqtRF2xAQAJ?pli=1>
+pub async fn get_max_lsn_retry(
+    client: &mut Client,
+    max_retry_duration: Duration,
+) -> Result<Lsn, SqlServerError> {
+    let (_client, lsn_result) = mz_ore::retry::Retry::default()
+        .max_duration(max_retry_duration)
+        .retry_async_with_state(client, |_, client| async {
+            let result = crate::inspect::get_max_lsn(client).await;
+            (client, map_null_lsn_to_retry(result))
+        })
+        .await;
+
+    let Ok(lsn) = lsn_result else {
+        tracing::warn!("database did not report a maximum LSN in time");
+        return lsn_result;
+    };
+    Ok(lsn)
+}
+
+fn map_null_lsn_to_retry<T>(result: Result<T, SqlServerError>) -> RetryResult<T, SqlServerError> {
+    match result {
+        Ok(val) => RetryResult::Ok(val),
+        Err(err @ SqlServerError::NullLsn) => RetryResult::RetryableErr(err),
+        Err(other) => RetryResult::FatalErr(other),
+    }
 }
 
 /// Increments the log sequence number.
@@ -57,6 +177,28 @@ pub async fn increment_lsn(client: &mut Client, lsn: Lsn) -> Result<Lsn, SqlServ
 
     mz_ore::soft_assert_eq_or_log!(result.len(), 1);
     parse_lsn(&result[..1])
+}
+
+/// Parse an [`Lsn`] in Decimal(25,0) format of the provided [`tiberius::Row`].
+///
+/// Returns an error if the provided slice doesn't have exactly one row.
+pub(crate) fn parse_numeric_lsn(row: &[tiberius::Row]) -> Result<Lsn, SqlServerError> {
+    match row {
+        [r] => {
+            let numeric_lsn = r
+                .try_get::<Numeric, _>(0)?
+                .ok_or_else(|| SqlServerError::NullLsn)?;
+            let lsn = Lsn::try_from(numeric_lsn).map_err(|msg| SqlServerError::InvalidData {
+                column_name: "lsn".to_string(),
+                error: msg,
+            })?;
+            Ok(lsn)
+        }
+        other => Err(SqlServerError::InvalidData {
+            column_name: "lsn".to_string(),
+            error: format!("expected 1 column, got {other:?}"),
+        }),
+    }
 }
 
 /// Parse an [`Lsn`] from the first column of the provided [`tiberius::Row`].
@@ -213,101 +355,28 @@ SELECT @mz_cleanup_status_bit;
     }
 }
 
-/// Returns the `(capture_instance, schema_name, table_name)` for the tables
-/// that are tracked by the specified `capture_instance`s.
-pub async fn get_tables_for_capture_instance<'a>(
-    client: &mut Client,
-    capture_instances: impl IntoIterator<Item = &str>,
-) -> Result<Vec<(Arc<str>, Arc<str>, Arc<str>)>, SqlServerError> {
-    // SQL Server does not have support for array types, so we need to manually construct
-    // the parameterized query.
-    let params: SmallVec<[_; 1]> = capture_instances.into_iter().collect();
-    // If there are no tables to check for just return an empty list.
-    if params.is_empty() {
-        return Ok(Vec::default());
-    }
-
-    // TODO(sql_server3): Remove this redundant collection.
-    #[allow(clippy::as_conversions)]
-    let params_dyn: SmallVec<[_; 1]> = params
-        .iter()
-        .map(|instance| instance as &dyn tiberius::ToSql)
-        .collect();
-    let param_indexes = params
-        .iter()
-        .enumerate()
-        // Params are 1-based indexed.
-        .map(|(idx, _)| format!("@P{}", idx + 1))
-        .join(", ");
-
-    let table_for_capture_instance_query = format!(
-        "
-SELECT c.capture_instance, SCHEMA_NAME(o.schema_id) as schema_name, o.name as obj_name
-FROM sys.objects o
-JOIN cdc.change_tables c
-ON o.object_id = c.source_object_id
-WHERE c.capture_instance IN ({param_indexes});"
-    );
-
-    let result = client
-        .query(&table_for_capture_instance_query, &params_dyn[..])
-        .await?;
-    let tables = result
-        .into_iter()
-        .map(|row| {
-            let capture_instance: &str = row.try_get("capture_instance")?.ok_or_else(|| {
-                SqlServerError::ProgrammingError("missing column 'capture_instance'".to_string())
-            })?;
-            let schema_name: &str = row.try_get("schema_name")?.ok_or_else(|| {
-                SqlServerError::ProgrammingError("missing column 'schema_name'".to_string())
-            })?;
-            let table_name: &str = row.try_get("obj_name")?.ok_or_else(|| {
-                SqlServerError::ProgrammingError("missing column 'schema_name'".to_string())
-            })?;
-
-            Ok::<_, SqlServerError>((
-                capture_instance.into(),
-                schema_name.into(),
-                table_name.into(),
-            ))
-        })
-        .collect::<Result<_, _>>()?;
-
-    Ok(tables)
-}
-
-/// Ensure change data capture (CDC) is enabled for the database the provided
-/// `client` is currently connected to.
-///
-/// See: <https://learn.microsoft.com/en-us/sql/relational-databases/track-changes/enable-and-disable-change-data-capture-sql-server?view=sql-server-ver16>
-pub async fn ensure_database_cdc_enabled(client: &mut Client) -> Result<(), SqlServerError> {
-    static DATABASE_CDC_ENABLED_QUERY: &str =
-        "SELECT is_cdc_enabled FROM sys.databases WHERE database_id = DB_ID();";
-    let result = client.simple_query(DATABASE_CDC_ENABLED_QUERY).await?;
-
-    check_system_result(&result, "database CDC".to_string(), true)?;
-    Ok(())
-}
-
-/// Ensure the `SNAPSHOT` transaction isolation level is enabled for the
-/// database the provided `client` is currently connected to.
-///
-/// See: <https://learn.microsoft.com/en-us/sql/t-sql/statements/set-transaction-isolation-level-transact-sql?view=sql-server-ver16>
-pub async fn ensure_snapshot_isolation_enabled(client: &mut Client) -> Result<(), SqlServerError> {
-    static SNAPSHOT_ISOLATION_QUERY: &str =
-        "SELECT snapshot_isolation_state FROM sys.databases WHERE database_id = DB_ID();";
-    let result = client.simple_query(SNAPSHOT_ISOLATION_QUERY).await?;
-
-    check_system_result(&result, "snapshot isolation".to_string(), 1u8)?;
-    Ok(())
-}
-
-pub async fn get_tables(client: &mut Client) -> Result<Vec<SqlServerTableRaw>, SqlServerError> {
-    static GET_TABLES_QUERY: &str = "
+// Retrieves all columns in tables that have CDC (Change Data Capture) enabled.
+//
+// Returns metadata needed to create an instance of ['SqlServerTableRaw`].
+//
+// The query joins several system tables:
+// - sys.tables: Source tables in the database
+// - sys.schemas: Schema information for proper table identification
+// - sys.columns: Column definitions including nullability
+// - sys.types: Data type information for each column
+// - cdc.change_tables: CDC configuration linking capture instances to source tables
+// - information_schema views: To identify primary key constraints
+//
+// For each column, it returns:
+// - Table identification (schema_name, table_name, capture_instance)
+// - Column metadata (name, type, nullable, max_length, precision, scale)
+// - Primary key information (constraint name if the column is part of a PK)
+static GET_COLUMNS_FOR_TABLES_WITH_CDC_QUERY: &str = "
 SELECT
     s.name as schema_name,
     t.name as table_name,
     ch.capture_instance as capture_instance,
+    ch.create_date as capture_instance_create_date,
     c.name as col_name,
     ty.name as col_type,
     c.is_nullable as col_nullable,
@@ -330,8 +399,111 @@ LEFT JOIN information_schema.table_constraints tc
     AND tc.constraint_name = kc.constraint_name
     AND tc.table_schema = kc.table_schema
     AND tc.table_name = kc.table_name
-    AND tc.constraint_type = 'PRIMARY KEY';
+    AND tc.constraint_type = 'PRIMARY KEY'
 ";
+
+/// Returns the table metadata for the tables that are tracked by the specified `capture_instance`s.
+pub async fn get_tables_for_capture_instance<'a>(
+    client: &mut Client,
+    capture_instances: impl IntoIterator<Item = &str>,
+) -> Result<Vec<SqlServerTableRaw>, SqlServerError> {
+    // SQL Server does not have support for array types, so we need to manually construct
+    // the parameterized query.
+    let params: SmallVec<[_; 1]> = capture_instances.into_iter().collect();
+    // If there are no tables to check for just return an empty list.
+    if params.is_empty() {
+        return Ok(Vec::default());
+    }
+
+    // TODO(sql_server3): Remove this redundant collection.
+    #[allow(clippy::as_conversions)]
+    let params_dyn: SmallVec<[_; 1]> = params
+        .iter()
+        .map(|instance| instance as &dyn tiberius::ToSql)
+        .collect();
+    let param_indexes = params
+        .iter()
+        .enumerate()
+        // Params are 1-based indexed.
+        .map(|(idx, _)| format!("@P{}", idx + 1))
+        .join(", ");
+
+    let table_for_capture_instance_query = format!(
+        "{GET_COLUMNS_FOR_TABLES_WITH_CDC_QUERY} WHERE ch.capture_instance IN ({param_indexes});"
+    );
+
+    let result = client
+        .query(&table_for_capture_instance_query, &params_dyn[..])
+        .await?;
+
+    let tables = deserialize_table_columns_to_raw_tables(&result)?;
+
+    Ok(tables)
+}
+
+/// Ensure change data capture (CDC) is enabled for the database the provided
+/// `client` is currently connected to.
+///
+/// See: <https://learn.microsoft.com/en-us/sql/relational-databases/track-changes/enable-and-disable-change-data-capture-sql-server?view=sql-server-ver16>
+pub async fn ensure_database_cdc_enabled(client: &mut Client) -> Result<(), SqlServerError> {
+    static DATABASE_CDC_ENABLED_QUERY: &str =
+        "SELECT is_cdc_enabled FROM sys.databases WHERE database_id = DB_ID();";
+    let result = client.simple_query(DATABASE_CDC_ENABLED_QUERY).await?;
+
+    check_system_result(&result, "database CDC".to_string(), true)?;
+    Ok(())
+}
+
+/// Retrieves the largest `restore_history_id` from SQL Server for the current database.  The
+/// `restore_history_id` column is of type `IDENTITY(1,1)` based on `EXEC sp_help restorehistory`.
+/// We expect it to start at 1 and be incremented by 1, with possible gaps in values.
+/// See:
+/// - <https://learn.microsoft.com/en-us/sql/relational-databases/system-tables/restorehistory-transact-sql?view=sql-server-ver17>
+/// - <https://learn.microsoft.com/en-us/sql/t-sql/statements/create-table-transact-sql-identity-property?view=sql-server-ver17>
+pub async fn get_latest_restore_history_id(
+    client: &mut Client,
+) -> Result<Option<i32>, SqlServerError> {
+    static LATEST_RESTORE_ID_QUERY: &str = "SELECT TOP 1 restore_history_id \
+        FROM msdb.dbo.restorehistory \
+        WHERE destination_database_name = DB_NAME() \
+        ORDER BY restore_history_id DESC;";
+    let result = client.simple_query(LATEST_RESTORE_ID_QUERY).await?;
+
+    match &result[..] {
+        [] => Ok(None),
+        [row] => Ok(row.try_get::<i32, _>(0)?),
+        other => Err(SqlServerError::InvariantViolated(format!(
+            "expected one row, got {other:?}"
+        ))),
+    }
+}
+
+/// Ensure the `SNAPSHOT` transaction isolation level is enabled for the
+/// database the provided `client` is currently connected to.
+///
+/// See: <https://learn.microsoft.com/en-us/sql/t-sql/statements/set-transaction-isolation-level-transact-sql?view=sql-server-ver16>
+pub async fn ensure_snapshot_isolation_enabled(client: &mut Client) -> Result<(), SqlServerError> {
+    static SNAPSHOT_ISOLATION_QUERY: &str =
+        "SELECT snapshot_isolation_state FROM sys.databases WHERE database_id = DB_ID();";
+    let result = client.simple_query(SNAPSHOT_ISOLATION_QUERY).await?;
+
+    check_system_result(&result, "snapshot isolation".to_string(), 1u8)?;
+    Ok(())
+}
+
+pub async fn get_tables(client: &mut Client) -> Result<Vec<SqlServerTableRaw>, SqlServerError> {
+    let result = client
+        .simple_query(&format!("{GET_COLUMNS_FOR_TABLES_WITH_CDC_QUERY};"))
+        .await?;
+
+    let tables = deserialize_table_columns_to_raw_tables(&result)?;
+
+    Ok(tables)
+}
+
+fn deserialize_table_columns_to_raw_tables(
+    rows: &[tiberius::Row],
+) -> Result<Vec<SqlServerTableRaw>, SqlServerError> {
     fn get_value<'a, T: tiberius::FromSql<'a>>(
         row: &'a tiberius::Row,
         name: &'static str,
@@ -340,27 +512,27 @@ LEFT JOIN information_schema.table_constraints tc
             .ok_or(SqlServerError::MissingColumn(name))
     }
 
-    let result = client.simple_query(GET_TABLES_QUERY).await?;
-
     // Group our columns by (schema, name).
     let mut tables = BTreeMap::default();
-    for row in result {
-        let schema_name: Arc<str> = get_value::<&str>(&row, "schema_name")?.into();
-        let table_name: Arc<str> = get_value::<&str>(&row, "table_name")?.into();
-        let capture_instance: Arc<str> = get_value::<&str>(&row, "capture_instance")?.into();
+    for row in rows {
+        let schema_name: Arc<str> = get_value::<&str>(row, "schema_name")?.into();
+        let table_name: Arc<str> = get_value::<&str>(row, "table_name")?.into();
+        let capture_instance: Arc<str> = get_value::<&str>(row, "capture_instance")?.into();
+        let capture_instance_create_date: NaiveDateTime =
+            get_value::<NaiveDateTime>(row, "capture_instance_create_date")?;
         let primary_key_constraint: Option<Arc<str>> = row
             .try_get::<&str, _>("col_primary_key_constraint")?
             .map(|v| v.into());
 
-        let column_name = get_value::<&str>(&row, "col_name")?.into();
+        let column_name = get_value::<&str>(row, "col_name")?.into();
         let column = SqlServerColumnRaw {
             name: Arc::clone(&column_name),
-            data_type: get_value::<&str>(&row, "col_type")?.into(),
-            is_nullable: get_value(&row, "col_nullable")?,
+            data_type: get_value::<&str>(row, "col_type")?.into(),
+            is_nullable: get_value(row, "col_nullable")?,
             primary_key_constraint,
-            max_length: get_value(&row, "col_max_length")?,
-            precision: get_value(&row, "col_precision")?,
-            scale: get_value(&row, "col_scale")?,
+            max_length: get_value(row, "col_max_length")?,
+            precision: get_value(row, "col_precision")?,
+            scale: get_value(row, "col_scale")?,
         };
 
         let columns: &mut Vec<_> = tables
@@ -368,25 +540,31 @@ LEFT JOIN information_schema.table_constraints tc
                 Arc::clone(&schema_name),
                 Arc::clone(&table_name),
                 Arc::clone(&capture_instance),
+                capture_instance_create_date,
             ))
             .or_default();
         columns.push(column);
     }
 
     // Flatten into our raw Table description.
-    let tables = tables
+    let raw_tables = tables
         .into_iter()
-        .map(|((schema, name, capture_instance), columns)| {
-            Ok::<_, SqlServerError>(SqlServerTableRaw {
-                schema_name: schema,
-                name,
-                capture_instance,
-                columns: columns.into(),
-            })
-        })
-        .collect::<Result<_, _>>()?;
+        .map(
+            |((schema, name, capture_instance, capture_instance_create_date), columns)| {
+                SqlServerTableRaw {
+                    schema_name: schema,
+                    name,
+                    capture_instance: Arc::new(SqlServerCaptureInstanceRaw {
+                        name: capture_instance,
+                        create_date: capture_instance_create_date.into(),
+                    }),
+                    columns: columns.into(),
+                }
+            },
+        )
+        .collect::<Vec<SqlServerTableRaw>>();
 
-    Ok(tables)
+    Ok(raw_tables)
 }
 
 /// Return a [`Stream`] that is the entire snapshot of the specified table.
@@ -452,4 +630,91 @@ where
             "expected 1 row, got {other:?}"
         ))),
     }
+}
+
+/// Return a Result that is empty if all tables, columns, and capture instances
+/// have the necessary permissions to and an error if any table, column,
+/// or capture instance does not have the necessary permissions
+/// for tracking changes.
+pub async fn validate_source_privileges<'a>(
+    client: &mut Client,
+    capture_instances: impl IntoIterator<Item = &str>,
+) -> Result<(), SqlServerError> {
+    let params: SmallVec<[_; 1]> = capture_instances.into_iter().collect();
+
+    if params.is_empty() {
+        return Ok(());
+    }
+
+    let params_dyn: SmallVec<[_; 1]> = params
+        .iter()
+        .map(|instance| {
+            let instance: &dyn tiberius::ToSql = instance;
+            instance
+        })
+        .collect();
+
+    let param_indexes = (1..params.len() + 1)
+        .map(|idx| format!("@P{}", idx))
+        .join(", ");
+
+    // NB(ptravers): we rely on HAS_PERMS_BY_NAME to check both table and column permissions.
+    let capture_instance_query = format!(
+            "
+        SELECT
+            SCHEMA_NAME(o.schema_id) + '.' + o.name AS qualified_table_name,
+            ct.capture_instance AS capture_instance,
+            COALESCE(HAS_PERMS_BY_NAME(SCHEMA_NAME(o.schema_id) + '.' + o.name, 'OBJECT', 'SELECT'), 0) AS table_select,
+            COALESCE(HAS_PERMS_BY_NAME('cdc.' + ct.capture_instance + '_CT', 'OBJECT', 'SELECT'), 0) AS capture_table_select
+        FROM cdc.change_tables ct
+        JOIN sys.objects o ON o.object_id = ct.source_object_id
+        WHERE ct.capture_instance IN ({param_indexes});
+            "
+        );
+
+    let rows = client
+        .query(capture_instance_query, &params_dyn[..])
+        .await?;
+
+    let mut capture_instances_without_perms = vec![];
+    let mut tables_without_perms = vec![];
+
+    for row in rows {
+        let table: &str = row
+            .try_get("qualified_table_name")
+            .context("getting table column")?
+            .ok_or_else(|| anyhow::anyhow!("no table column?"))?;
+
+        let capture_instance: &str = row
+            .try_get("capture_instance")
+            .context("getting capture_instance column")?
+            .ok_or_else(|| anyhow::anyhow!("no capture_instance column?"))?;
+
+        let permitted_table: i32 = row
+            .try_get("table_select")
+            .context("getting table_select column")?
+            .ok_or_else(|| anyhow::anyhow!("no table_select column?"))?;
+
+        let permitted_capture_instance: i32 = row
+            .try_get("capture_table_select")
+            .context("getting capture_table_select column")?
+            .ok_or_else(|| anyhow::anyhow!("no capture_table_select column?"))?;
+
+        if permitted_table == 0 {
+            tables_without_perms.push(table.to_string());
+        }
+
+        if permitted_capture_instance == 0 {
+            capture_instances_without_perms.push(capture_instance.to_string());
+        }
+    }
+
+    if !capture_instances_without_perms.is_empty() || !tables_without_perms.is_empty() {
+        return Err(SqlServerError::AuthorizationError {
+            tables: tables_without_perms.join(", "),
+            capture_instances: capture_instances_without_perms.join(", "),
+        });
+    }
+
+    Ok(())
 }

@@ -49,6 +49,7 @@ from materialize.parallel_workload.database import (
     MAX_ROLES,
     MAX_ROWS,
     MAX_SCHEMAS,
+    MAX_SQL_SERVER_SOURCES,
     MAX_TABLES,
     MAX_VIEWS,
     MAX_WEBHOOK_SOURCES,
@@ -64,6 +65,7 @@ from materialize.parallel_workload.database import (
     PostgresSource,
     Role,
     Schema,
+    SqlServerSource,
     Table,
     View,
     WebhookSource,
@@ -148,7 +150,8 @@ class Action:
                     "the transaction's active cluster has been dropped",  # cluster was dropped
                     "was removed",  # dependency was removed, started with moving optimization off main thread, see database-issues#7285
                     "real-time source dropped before ingesting the upstream system's visible frontier",  # Expected, see https://buildkite.com/materialize/nightly/builds/9399#0191be17-1f4c-4321-9b51-edc4b08b71c5
-                    "object state changed while transaction was in progress",
+                    "object state changed while transaction was in progress",  # Old error msg, can remove this ignore later
+                    "another session modified the catalog while this DDL transaction was open",
                 ]
             )
         if exe.db.scenario == Scenario.Cancel:
@@ -524,14 +527,22 @@ class SourceInsertAction(Action):
         with exe.db.lock:
             sources = [
                 source
-                for source in exe.db.kafka_sources + exe.db.postgres_sources
+                for source in exe.db.kafka_sources
+                + exe.db.postgres_sources
+                + exe.db.mysql_sources
+                + exe.db.sql_server_sources
                 if source.num_rows < MAX_ROWS
             ]
             if not sources:
                 return False
             source = self.rng.choice(sources)
         with source.lock:
-            if source not in [*exe.db.kafka_sources, *exe.db.postgres_sources]:
+            if source not in [
+                *exe.db.kafka_sources,
+                *exe.db.postgres_sources,
+                *exe.db.mysql_sources,
+                *exe.db.sql_server_sources,
+            ]:
                 return False
 
             transaction = next(source.generator)
@@ -686,6 +697,8 @@ class DropTableAction(Action):
         with table.lock:
             # Was dropped while we were acquiring lock
             if table not in exe.db.tables:
+                return False
+            if len(exe.db.tables) <= 2:
                 return False
 
             query = f"DROP TABLE {table}"
@@ -883,6 +896,8 @@ class DropDatabaseAction(Action):
             # Was dropped while we were acquiring lock
             if db not in exe.db.dbs:
                 return False
+            if len(exe.db.dbs) <= 1:
+                return False
 
             query = f"DROP DATABASE {db} RESTRICT"
             exe.execute(query, http=Http.RANDOM)
@@ -917,6 +932,8 @@ class DropSchemaAction(Action):
         with schema.lock:
             # Was dropped while we were acquiring lock
             if schema not in exe.db.schemas:
+                return False
+            if len(exe.db.schemas) <= 1:
                 return False
 
             query = f"DROP SCHEMA {schema}"
@@ -1081,6 +1098,9 @@ class FlipFlagsAction(Action):
         self.flags_with_values["persist_validate_part_bounds_on_read"] = (
             BOOLEAN_FLAG_VALUES
         )
+        self.flags_with_values["persist_validate_part_bounds_on_write"] = (
+            BOOLEAN_FLAG_VALUES
+        )
         self.flags_with_values["compute_apply_column_demands"] = BOOLEAN_FLAG_VALUES
         self.flags_with_values["enable_alter_table_add_column"] = BOOLEAN_FLAG_VALUES
         self.flags_with_values["enable_compute_active_dataflow_cancelation"] = (
@@ -1116,6 +1136,10 @@ class FlipFlagsAction(Action):
             "lgalloc_limiter_usage_factor",
             "lgalloc_limiter_usage_bias",
             "lgalloc_limiter_burst_factor",
+            "memory_limiter_interval",
+            "memory_limiter_usage_factor",
+            "memory_limiter_usage_bias",
+            "memory_limiter_burst_factor",
             "enable_columnation_lgalloc",
             "enable_columnar_lgalloc",
             "compute_server_maintenance_interval",
@@ -1130,6 +1154,8 @@ class FlipFlagsAction(Action):
             "enable_compute_replica_expiration",
             "compute_replica_expiration_offset",
             "enable_compute_render_fueled_as_specific_collection",
+            "enable_compute_temporal_bucketing",
+            "compute_temporal_bucketing_summary",
             "enable_compute_logical_backpressure",
             "compute_logical_backpressure_max_retained_capabilities",
             "compute_logical_backpressure_inflight_slack",
@@ -1197,6 +1223,8 @@ class FlipFlagsAction(Action):
             "persist_rollup_use_active_rollup",
             "persist_gc_fallback_threshold_ms",
             "persist_gc_use_active_gc",
+            "persist_gc_min_versions",
+            "persist_gc_max_versions",
             "persist_compaction_minimum_timeout",
             "persist_compaction_use_most_recent_schema",
             "persist_compaction_check_process_flag",
@@ -1214,6 +1242,7 @@ class FlipFlagsAction(Action):
             "persist_enable_arrow_lgalloc_noncc_sizes",
             "controller_past_generation_replica_cleanup_retry_interval",
             "enable_0dt_deployment_sources",
+            "enable_0dt_caught_up_replica_status_check",
             "wallclock_lag_recording_interval",
             "enable_wallclock_lag_histogram_collection",
             "wallclock_lag_histogram_period_interval",
@@ -1255,7 +1284,7 @@ class FlipFlagsAction(Action):
             "storage_sink_progress_search",
             "storage_sink_ensure_topic_config",
             "ore_overflowing_behavior",
-            "sql_server_snapshot_max_lsn_wait",
+            "sql_server_max_lsn_wait",
             "sql_server_snapshot_progress_report_interval",
             "sql_server_cdc_poll_interval",
             "sql_server_cdc_cleanup_change_table",
@@ -1271,7 +1300,7 @@ class FlipFlagsAction(Action):
             "with_0dt_caught_up_check_cutoff",
             "enable_statement_lifecycle_logging",
             "enable_introspection_subscribes",
-            "plan_insights_notice fast_path_clusters_optimize_duration",
+            "plan_insights_notice_fast_path_clusters_optimize_duration",
             "enable_continual_task_builtins",
             "enable_expression_cache",
             "enable_multi_replica_sources",
@@ -1286,9 +1315,13 @@ class FlipFlagsAction(Action):
             "compute_peek_response_stash_batch_max_runs",
             "compute_peek_response_stash_read_batch_size_bytes",
             "compute_peek_response_stash_read_memory_budget_bytes",
-            "enable_timely_init_at_process_startup",
             "persist_enable_incremental_compaction",
             "storage_statistics_retention_duration",
+            "enable_ctp_cluster_protocols",
+            "enable_paused_cluster_readhold_downgrade",
+            "enable_mz_join_core_v2",
+            "force_swap_for_cc_sizes",
+            "enable_with_ordinality_legacy_fallback",
         ]
 
     def run(self, exe: Executor) -> bool:
@@ -1482,6 +1515,10 @@ class DropClusterAction(Action):
         with cluster.lock:
             # Was dropped while we were acquiring lock
             if cluster not in exe.db.clusters:
+                return False
+
+            # Avoid removing all clusters
+            if len(exe.db.clusters) <= 1:
                 return False
 
             query = f"DROP CLUSTER {cluster}"
@@ -1839,7 +1876,7 @@ class KillAction(Action):
     ):
         super().__init__(rng, composition)
         self.system_param_fn = system_param_fn
-        self.system_parameters = {}
+        self.system_parameters = {"memory_limiter_interval": "0"}
         self.azurite = azurite
         self.sanity_restart = sanity_restart
 
@@ -1910,11 +1947,12 @@ class ZeroDowntimeDeployAction(Action):
                 healthcheck=LEADER_STATUS_HEALTHCHECK,
                 metadata_store="cockroach",
                 default_replication_factor=2,
+                additional_system_parameter_defaults={"memory_limiter_interval": "0"},
             ),
         ):
             self.composition.up(mz_service, detach=True)
             self.composition.await_mz_deployment_status(
-                DeploymentStatus.READY_TO_PROMOTE, mz_service
+                DeploymentStatus.READY_TO_PROMOTE, mz_service, timeout=1800
             )
             self.composition.promote_mz(mz_service)
             self.composition.await_mz_deployment_status(
@@ -2207,6 +2245,69 @@ class DropPostgresSourceAction(Action):
         return True
 
 
+class CreateSqlServerSourceAction(Action):
+    def run(self, exe: Executor) -> bool:
+        # See database-issues#6881, not expected to work
+        if exe.db.scenario == Scenario.BackupRestore:
+            return False
+
+        with exe.db.lock:
+            if len(exe.db.sql_server_sources) >= MAX_SQL_SERVER_SOURCES:
+                return False
+            source_id = exe.db.sql_server_source_id
+            exe.db.sql_server_source_id += 1
+            schema = self.rng.choice(exe.db.schemas)
+            cluster = self.rng.choice(exe.db.clusters)
+        with schema.lock, cluster.lock:
+            if schema not in exe.db.schemas:
+                return False
+            if cluster not in exe.db.clusters:
+                return False
+
+            try:
+                assert self.composition
+                source = SqlServerSource(
+                    source_id,
+                    cluster,
+                    schema,
+                    exe.db.ports,
+                    self.rng,
+                    self.composition,
+                )
+                source.create(exe)
+                exe.db.sql_server_sources.append(source)
+            except:
+                if exe.db.scenario not in (
+                    Scenario.Kill,
+                    Scenario.ZeroDowntimeDeploy,
+                ):
+                    raise
+        return True
+
+
+class DropSqlServerSourceAction(Action):
+    def errors_to_ignore(self, exe: Executor) -> list[str]:
+        return [
+            "still depended upon by",
+        ] + super().errors_to_ignore(exe)
+
+    def run(self, exe: Executor) -> bool:
+        with exe.db.lock:
+            if not exe.db.sql_server_sources:
+                return False
+            source = self.rng.choice(exe.db.sql_server_sources)
+        with source.lock:
+            # Was dropped while we were acquiring lock
+            if source not in exe.db.sql_server_sources:
+                return False
+
+            query = f"DROP SOURCE {source.executor.source}"
+            exe.execute(query, http=Http.RANDOM)
+            exe.db.sql_server_sources.remove(source)
+            source.executor.mz_conn.close()
+        return True
+
+
 class CreateKafkaSinkAction(Action):
     def errors_to_ignore(self, exe: Executor) -> list[str]:
         return [
@@ -2336,6 +2437,8 @@ class StatisticsAction(Action):
             ("views", exe.db.views),
             ("kafka_sources", exe.db.kafka_sources),
             ("postgres_sources", exe.db.postgres_sources),
+            ("mysql_sources", exe.db.mysql_sources),
+            ("sql_server_sources", exe.db.sql_server_sources),
             ("webhook_sources", exe.db.webhook_sources),
         ]:
             counts = []
@@ -2439,6 +2542,9 @@ ddl_action_list = ActionList(
         # (DropMySqlSourceAction, 4),
         (CreatePostgresSourceAction, 4),
         (DropPostgresSourceAction, 4),
+        # TODO: Reenable when database-issues#9620 is fixed
+        # (CreateSqlServerSourceAction, 4),
+        # (DropSqlServerSourceAction, 4),
         (GrantPrivilegesAction, 4),
         (RevokePrivilegesAction, 1),
         (ReconnectAction, 1),

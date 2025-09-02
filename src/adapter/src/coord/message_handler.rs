@@ -61,7 +61,7 @@ impl Coordinator {
                 span.in_scope(|| otel_ctx.attach_as_parent());
                 self.message_command(cmd).instrument(span).await
             }
-            Message::ControllerReady => {
+            Message::ControllerReady { controller: _ } => {
                 let Coordinator {
                     controller,
                     catalog,
@@ -576,7 +576,7 @@ impl Coordinator {
 
         let result = self
             .sequence_create_connection_stage_finish(
-                ctx.session_mut(),
+                &mut ctx,
                 connection_id,
                 connection_gid,
                 plan,

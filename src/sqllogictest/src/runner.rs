@@ -878,7 +878,7 @@ impl<'a> Runner<'a> {
             for (i, row) in rows.iter().enumerate() {
                 let name: &str = row.get("name");
                 let size: &str = row.get("size");
-                if name != format!("r{i}") || size != self.config.replica_size.to_string() {
+                if name != format!("r{i}") || size != self.config.replica_size {
                     needs_default_replica = true;
                     break;
                 }
@@ -973,6 +973,7 @@ impl<'a> RunnerInner<'a> {
         let environment_id = EnvironmentId::for_tests();
         let (consensus_uri, timestamp_oracle_url): (SensitiveUrl, SensitiveUrl) = {
             let postgres_url = &config.postgres_url;
+            let prefix = &config.prefix;
             info!(%postgres_url, "starting server");
             let (client, conn) = Retry::default()
                 .max_tries(5)
@@ -992,17 +993,17 @@ impl<'a> RunnerInner<'a> {
                 }
             });
             client
-                .batch_execute(
-                    "DROP SCHEMA IF EXISTS sqllogictest_tsoracle CASCADE;
-                     CREATE SCHEMA IF NOT EXISTS sqllogictest_consensus;
-                     CREATE SCHEMA sqllogictest_tsoracle;",
-                )
+                .batch_execute(&format!(
+                    "DROP SCHEMA IF EXISTS {prefix}_tsoracle CASCADE;
+                     CREATE SCHEMA IF NOT EXISTS {prefix}_consensus;
+                     CREATE SCHEMA {prefix}_tsoracle;"
+                ))
                 .await?;
             (
-                format!("{postgres_url}?options=--search_path=sqllogictest_consensus")
+                format!("{postgres_url}?options=--search_path={prefix}_consensus")
                     .parse()
                     .expect("invalid consensus URI"),
-                format!("{postgres_url}?options=--search_path=sqllogictest_tsoracle")
+                format!("{postgres_url}?options=--search_path={prefix}_tsoracle")
                     .parse()
                     .expect("invalid timestamp oracle URI"),
             )
@@ -1167,30 +1168,30 @@ impl<'a> RunnerInner<'a> {
             now,
             environment_id,
             cluster_replica_sizes: ClusterReplicaSizeMap::for_tests(),
-            bootstrap_default_cluster_replica_size: config.replica_size.to_string(),
+            bootstrap_default_cluster_replica_size: config.replica_size.clone(),
             bootstrap_default_cluster_replication_factor: config
                 .replicas
                 .try_into()
                 .expect("replicas must fit"),
             bootstrap_builtin_system_cluster_config: BootstrapBuiltinClusterConfig {
                 replication_factor: SYSTEM_CLUSTER_DEFAULT_REPLICATION_FACTOR,
-                size: config.replica_size.to_string(),
+                size: config.replica_size.clone(),
             },
             bootstrap_builtin_catalog_server_cluster_config: BootstrapBuiltinClusterConfig {
                 replication_factor: CATALOG_SERVER_CLUSTER_DEFAULT_REPLICATION_FACTOR,
-                size: config.replica_size.to_string(),
+                size: config.replica_size.clone(),
             },
             bootstrap_builtin_probe_cluster_config: BootstrapBuiltinClusterConfig {
                 replication_factor: PROBE_CLUSTER_DEFAULT_REPLICATION_FACTOR,
-                size: config.replica_size.to_string(),
+                size: config.replica_size.clone(),
             },
             bootstrap_builtin_support_cluster_config: BootstrapBuiltinClusterConfig {
                 replication_factor: SUPPORT_CLUSTER_DEFAULT_REPLICATION_FACTOR,
-                size: config.replica_size.to_string(),
+                size: config.replica_size.clone(),
             },
             bootstrap_builtin_analytics_cluster_config: BootstrapBuiltinClusterConfig {
                 replication_factor: ANALYTICS_CLUSTER_DEFAULT_REPLICATION_FACTOR,
-                size: config.replica_size.to_string(),
+                size: config.replica_size.clone(),
             },
             system_parameter_defaults: {
                 let mut params = BTreeMap::new();
@@ -1930,6 +1931,7 @@ pub struct RunConfig<'a> {
     pub stderr: &'a dyn WriteFmt,
     pub verbosity: u8,
     pub postgres_url: String,
+    pub prefix: String,
     pub no_fail: bool,
     pub fail_fast: bool,
     pub auto_index_tables: bool,
@@ -1946,7 +1948,7 @@ pub struct RunConfig<'a> {
     /// - It's safe for different databases to reference the same state: all data is scoped by UUID.
     pub persist_dir: TempDir,
     pub replicas: usize,
-    pub replica_size: usize,
+    pub replica_size: String,
 }
 
 fn print_record(config: &RunConfig<'_>, record: &Record) {
@@ -1975,7 +1977,7 @@ const INCONSISTENT_VIEW_OUTCOME_WARNING_REGEXPS: [&str; 9] = [
     "SHOW commands are not allowed in views",
     "cannot create view with unstable dependencies",
     "cannot use wildcard expansions or NATURAL JOINs in a view that depends on system objects",
-    "no schema has been selected to create in",
+    "no valid schema selected",
     r#"system schema '\w+' cannot be modified"#,
     r#"permission denied for (SCHEMA|CLUSTER) "(\w+\.)?\w+""#,
     // NOTE(vmarcos): Column ambiguity that could not be eliminated by our

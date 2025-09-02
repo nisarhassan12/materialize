@@ -13,20 +13,20 @@ workspace = true
 # don't leak in dependencies on other Materialize packages.
 [dependencies]
 anyhow = "1.0.98"
-arrow = { version = "54.3.1", default-features = false }
+arrow = { version = "55.2.0", default-features = false }
 bytes = { version = "1.10.1", features = ["serde"] }
 chrono = { version = "0.4.39", default-features = false, features = ["std"] }
 hex = "0.4.3"
 itertools = "0.14.0"
 mz-ore = { path = "../ore", features = ["metrics", "test"], default-features = false }
 mz-proto = { path = "../proto", default-features = false }
-parquet = { version = "54.3.1", default-features = false, features = ["arrow"] }
+parquet = { version = "55.2.0", default-features = false, features = ["arrow"] }
 proptest = { version = "1.7.0", default-features = false, features = ["std"] }
 proptest-derive = { version = "0.5.1", features = ["boxed_union"] }
 prost = { version = "0.13.5", features = ["no-recursion-limit"] }
 serde = { version = "1.0.219", features = ["derive"] }
 serde_json = { version = "1.0.140" }
-timely = "0.21.3"
+timely = "0.23.0"
 tracing = "0.1.37"
 uuid = { version = "1.17.0", features = ["v4"] }
 workspace-hack = { version = "0.0.0", path = "../workspace-hack", optional = true }

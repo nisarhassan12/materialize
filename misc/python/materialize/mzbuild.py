@@ -22,8 +22,8 @@ import hashlib
 import json
 import multiprocessing
 import os
+import platform
 import re
-import shlex
 import shutil
 import stat
 import subprocess
@@ -32,17 +32,20 @@ import tarfile
 import time
 from collections import OrderedDict
 from collections.abc import Callable, Iterable, Iterator, Sequence
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from enum import Enum, auto
 from functools import cache
 from pathlib import Path
 from tempfile import TemporaryFile
+from threading import Lock
 from typing import IO, Any, cast
 
+import requests
 import yaml
+from requests.auth import HTTPBasicAuth
 
+from materialize import MZ_ROOT, buildkite, cargo, git, rustc_flags, spawn, ui, xcompile
 from materialize import bazel as bazel_utils
-from materialize import cargo, git, rustc_flags, spawn, ui, xcompile
 from materialize.rustc_flags import Sanitizer
 from materialize.xcompile import Arch, target
 
@@ -83,6 +86,7 @@ class RepositoryDetails:
         image_prefix: A prefix to apply to all Docker image names.
         bazel: Whether or not to use Bazel as the build system instead of Cargo.
         bazel_remote_cache: URL of a Bazel Remote Cache that we can build with.
+        bazel_lto: Force LTO build
     """
 
     def __init__(
@@ -96,6 +100,7 @@ class RepositoryDetails:
         image_prefix: str,
         bazel: bool,
         bazel_remote_cache: str | None,
+        bazel_lto: bool,
     ):
         self.root = root
         self.arch = arch
@@ -107,6 +112,11 @@ class RepositoryDetails:
         self.image_prefix = image_prefix
         self.bazel = bazel
         self.bazel_remote_cache = bazel_remote_cache
+        self.bazel_lto = (
+            bazel_lto
+            or ui.env_is_truthy("BUILDKITE_TAG")
+            or ui.env_is_truthy("CI_RELEASE_LTO_BUILD")
+        )
 
     def build(
         self,
@@ -138,7 +148,16 @@ class RepositoryDetails:
         if self.bazel:
             return ["bazel", "run", f"@//misc/bazel/tools:{name}", "--"]
         else:
-            return xcompile.tool(self.arch, name)
+            if platform.system() != "Linux":
+                # We can't use the local tools from macOS to build a Linux executable
+                return ["bin/ci-builder", "run", "stable", name]
+            # If we're on Linux, trust that the tools are installed instead of
+            # loading the slow ci-builder. If you don't have compilation tools
+            # installed you can still run `bin/ci-builder run stable
+            # bin/mzcompose ...`, and most likely the Cargo build will already
+            # fail earlier if you don't have compilation tools installed and
+            # run without the ci-builder.
+            return [name]
 
     def cargo_target_dir(self) -> Path:
         """Determine the path to the target directory for Cargo."""
@@ -156,7 +175,7 @@ class RepositoryDetails:
             # If we're a tagged build, then we'll use stamping to update our
             # build info, otherwise we'll use our side channel/best-effort
             # approach to update it.
-            if ui.env_is_truthy("BUILDKITE_TAG"):
+            if self.bazel_lto:
                 flags.append("--config=release-tagged")
             else:
                 flags.append("--config=release-dev")
@@ -203,18 +222,87 @@ def docker_images() -> set[str]:
     )
 
 
+KNOWN_DOCKER_IMAGES_FILE = Path(MZ_ROOT / "known-docker-images.txt")
+_known_docker_images: set[str] | None = None
+_known_docker_images_lock = Lock()
+
+
 def is_docker_image_pushed(name: str) -> bool:
     """Check whether the named image is pushed to Docker Hub.
 
     Note that this operation requires a rather slow network request.
     """
-    proc = subprocess.run(
-        ["docker", "manifest", "inspect", name],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        env=dict(os.environ, DOCKER_CLI_EXPERIMENTAL="enabled"),
-    )
-    return proc.returncode == 0
+    global _known_docker_images
+
+    if _known_docker_images is None:
+        with _known_docker_images_lock:
+            if not KNOWN_DOCKER_IMAGES_FILE.exists():
+                _known_docker_images = set()
+            else:
+                with KNOWN_DOCKER_IMAGES_FILE.open() as f:
+                    _known_docker_images = set(line.strip() for line in f)
+
+    if name in _known_docker_images:
+        return True
+
+    if ":" not in name:
+        image, tag = name, "latest"
+    else:
+        image, tag = name.rsplit(":", 1)
+
+    dockerhub_username = os.getenv("DOCKERHUB_USERNAME")
+    dockerhub_token = os.getenv("DOCKERHUB_ACCESS_TOKEN")
+
+    exists: bool = False
+
+    try:
+        if dockerhub_username and dockerhub_token:
+            response = requests.head(
+                f"https://registry-1.docker.io/v2/{image}/manifests/{tag}",
+                headers={
+                    "Accept": "application/vnd.docker.distribution.manifest.v2+json",
+                },
+                auth=HTTPBasicAuth(dockerhub_username, dockerhub_token),
+            )
+        else:
+            token = requests.get(
+                "https://auth.docker.io/token",
+                params={
+                    "service": "registry.docker.io",
+                    "scope": f"repository:{image}:pull",
+                },
+            ).json()["token"]
+            response = requests.head(
+                f"https://registry-1.docker.io/v2/{image}/manifests/{tag}",
+                headers={
+                    "Accept": "application/vnd.docker.distribution.manifest.v2+json",
+                    "Authorization": f"Bearer {token}",
+                },
+            )
+
+        if response.status_code in (401, 429, 500, 502, 503, 504):
+            # Fall back to 5x slower method
+            proc = subprocess.run(
+                ["docker", "manifest", "inspect", name],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                env=dict(os.environ, DOCKER_CLI_EXPERIMENTAL="enabled"),
+            )
+            exists = proc.returncode == 0
+        else:
+            exists = response.status_code == 200
+
+    except Exception as e:
+        print(f"Error checking Docker image: {e}")
+        return False
+
+    if exists:
+        with _known_docker_images_lock:
+            _known_docker_images.add(name)
+            with KNOWN_DOCKER_IMAGES_FILE.open("a") as f:
+                print(name, file=f)
+
+    return exists
 
 
 def chmod_x(path: Path) -> None:
@@ -675,6 +763,7 @@ class CargoBuild(CargoPreImage):
         super().run(prep)
         self.build(prep)
 
+    @cache
     def inputs(self) -> set[str]:
         deps = set()
 
@@ -686,6 +775,7 @@ class CargoBuild(CargoPreImage):
             deps |= self.rd.cargo_workspace.transitive_path_dependencies(
                 crate, dev=True
             )
+
         inputs = super().inputs() | set(inp for dep in deps for inp in dep.inputs())
         # Even though we are not always building with Bazel, consider its
         # inputs so that developers with CI_BAZEL_BUILD=0 can still
@@ -812,6 +902,7 @@ class ResolvedImage:
         """Whether the underlying image should be pushed to Docker Hub."""
         return self.image.publish
 
+    @cache
     def spec(self) -> str:
         """Return the "spec" for the image.
 
@@ -839,7 +930,7 @@ class ResolvedImage:
         f.seek(0)
         return f
 
-    def build(self, prep: dict[type[PreImage], Any]) -> None:
+    def build(self, prep: dict[type[PreImage], Any], push: bool = False) -> None:
         """Build the image from source.
 
         Requires that the caller has already acquired all dependencies and
@@ -852,22 +943,51 @@ class ResolvedImage:
             pre_image.run(prep[type(pre_image)])
         build_args = {
             **self.image.build_args,
+            "BUILD_PROFILE": self.image.rd.profile.name,
             "ARCH_GCC": str(self.image.rd.arch),
             "ARCH_GO": self.image.rd.arch.go_str(),
             "CI_SANITIZER": str(self.image.rd.sanitizer),
         }
         f = self.write_dockerfile()
-        cmd: Sequence[str] = [
-            "docker",
-            "build",
-            "-f",
-            "-",
-            *(f"--build-arg={k}={v}" for k, v in build_args.items()),
-            "-t",
-            self.spec(),
-            f"--platform=linux/{self.image.rd.arch.go_str()}",
-            str(self.image.path),
-        ]
+
+        try:
+            spawn.capture(["docker", "buildx", "version"])
+        except subprocess.CalledProcessError:
+            if push:
+                print(
+                    "docker buildx not found, required to push images. Installation: https://github.com/docker/buildx?tab=readme-ov-file#installing"
+                )
+                raise
+            print(
+                "docker buildx not found, you can install it to build faster. Installation: https://github.com/docker/buildx?tab=readme-ov-file#installing"
+            )
+            print("Falling back to docker build")
+            cmd: Sequence[str] = [
+                "docker",
+                "build",
+                "-f",
+                "-",
+                *(f"--build-arg={k}={v}" for k, v in build_args.items()),
+                "-t",
+                self.spec(),
+                f"--platform=linux/{self.image.rd.arch.go_str()}",
+                str(self.image.path),
+            ]
+        else:
+            cmd: Sequence[str] = [
+                "docker",
+                "buildx",
+                "build",
+                "--progress=plain",  # less noisy
+                "-f",
+                "-",
+                *(f"--build-arg={k}={v}" for k, v in build_args.items()),
+                "-t",
+                self.spec(),
+                f"--platform=linux/{self.image.rd.arch.go_str()}",
+                str(self.image.path),
+                *(["--push"] if push else ["--load"]),
+            ]
         spawn.runv(cmd, stdin=f, stdout=sys.stderr.buffer)
 
     def try_pull(self, max_retries: int) -> bool:
@@ -884,18 +1004,41 @@ class ResolvedImage:
                 try:
                     spawn.runv(
                         command,
+                        stdin=subprocess.DEVNULL,
                         stdout=sys.stderr.buffer,
                     )
                     self.acquired = True
+                    break
                 except subprocess.CalledProcessError:
                     if retry < max_retries:
                         # There seems to be no good way to tell what error
                         # happened based on error code
                         # (https://github.com/docker/cli/issues/538) and we
                         # want to print output directly to terminal.
-                        print(f"Retrying in {sleep_time}s ...")
-                        time.sleep(sleep_time)
-                        sleep_time *= 2
+                        if build := os.getenv("CI_WAITING_FOR_BUILD"):
+                            for retry in range(max_retries):
+                                try:
+                                    build_status = buildkite.get_build_status(build)
+                                except subprocess.CalledProcessError:
+                                    time.sleep(sleep_time)
+                                    sleep_time = min(sleep_time * 2, 10)
+                                    break
+                                print(f"Build {build} status: {build_status}")
+                                if build_status == "failed":
+                                    print(
+                                        f"Build {build} has been marked as failed, exiting hard"
+                                    )
+                                    sys.exit(1)
+                                elif build_status == "success":
+                                    break
+                                assert (
+                                    build_status == "pending"
+                                ), f"Unknown build status {build_status}"
+                                time.sleep(1)
+                        else:
+                            print(f"Retrying in {sleep_time}s ...")
+                            time.sleep(sleep_time)
+                            sleep_time = min(sleep_time * 2, 10)
                         continue
                     else:
                         break
@@ -944,6 +1087,7 @@ class ResolvedImage:
                 out |= dep.list_dependencies(transitive)
         return out
 
+    @cache
     def inputs(self, transitive: bool = False) -> set[str]:
         """List the files tracked as inputs to the image.
 
@@ -1007,6 +1151,7 @@ class ResolvedImage:
             self_hash.update(pre_image.extra().encode())
             self_hash.update(b"\0")
 
+        self_hash.update(f"profile={self.image.rd.profile}".encode())
         self_hash.update(f"arch={self.image.rd.arch}".encode())
         self_hash.update(f"coverage={self.image.rd.coverage}".encode())
         self_hash.update(f"sanitizer={self.image.rd.sanitizer}".encode())
@@ -1064,15 +1209,34 @@ class DependencySet:
 
         # Only retry in CI runs since we struggle with flaky docker pulls there
         if not max_retries:
-            max_retries = 5 if ui.env_is_truthy("CI") else 1
+            max_retries = (
+                90
+                if os.getenv("CI_WAITING_FOR_BUILD")
+                else (
+                    5
+                    if ui.env_is_truthy("CI")
+                    and not ui.env_is_truthy("CI_ALLOW_LOCAL_BUILD")
+                    else 1
+                )
+            )
         assert max_retries > 0
 
-        deps_to_build = [
-            dep for dep in self if not dep.publish or not dep.try_pull(max_retries)
-        ]
+        deps_to_check = [dep for dep in self if dep.publish]
+        deps_to_build = [dep for dep in self if not dep.publish]
+        if len(deps_to_check):
+            with ThreadPoolExecutor(max_workers=len(deps_to_check)) as executor:
+                futures = [
+                    executor.submit(dep.try_pull, max_retries) for dep in deps_to_check
+                ]
+                for dep, future in zip(deps_to_check, futures):
+                    try:
+                        if not future.result():
+                            deps_to_build.append(dep)
+                    except Exception:
+                        deps_to_build.append(dep)
 
         # Don't attempt to build in CI, as our timeouts and small machines won't allow it anyway
-        if ui.env_is_truthy("CI"):
+        if ui.env_is_truthy("CI") and not ui.env_is_truthy("CI_ALLOW_LOCAL_BUILD"):
             expected_deps = [dep for dep in deps_to_build if dep.publish]
             if expected_deps:
                 print(
@@ -1094,51 +1258,53 @@ class DependencySet:
             post_build: A callback to invoke with each dependency that was built
                 locally.
         """
-        deps_to_build = [dep for dep in self if not dep.is_published_if_necessary()]
-        prep = self._prepare_batch(deps_to_build)
+        num_deps = len(list(self))
+        if not num_deps:
+            deps_to_build = []
+        else:
+            with ThreadPoolExecutor(max_workers=num_deps) as executor:
+                futures = list(
+                    executor.map(
+                        lambda dep: (dep, not dep.is_published_if_necessary()), self
+                    )
+                )
 
-        images_to_push = []
-        for dep in deps_to_build:
-            dep.build(prep)
+            deps_to_build = [dep for dep, should_build in futures if should_build]
+
+        prep = self._prepare_batch(deps_to_build)
+        lock = Lock()
+        built_deps: set[str] = set([dep.name for dep in self]) - set(
+            [dep.name for dep in deps_to_build]
+        )
+
+        def build_dep(dep):
+            end_time = time.time() + 600
+            while True:
+                if time.time() > end_time:
+                    raise TimeoutError(
+                        f"Timed out in {dep.name} waiting for {[dep2.name for dep2 in dep.dependencies if dep2 not in built_deps]}"
+                    )
+                with lock:
+                    if all(dep2 in built_deps for dep2 in dep.dependencies):
+                        break
+                time.sleep(0.01)
+            for attempts_remaining in reversed(range(3)):
+                try:
+                    dep.build(prep, push=dep.publish)
+                    with lock:
+                        built_deps.add(dep.name)
+                    break
+                except Exception:
+                    if not dep.publish or attempts_remaining == 0:
+                        raise
             if post_build:
                 post_build(dep)
-            if dep.publish:
-                images_to_push.append(dep.spec())
 
-        # Push all Docker images in parallel to minimize build time.
-        ui.section("Pushing images")
-        # Attempt to upload images a maximum of 3 times before giving up.
-        for attempts_remaining in reversed(range(3)):
-            pushes: list[subprocess.Popen] = []
-            for image in images_to_push:
-                # Piping through `cat` disables terminal control codes, and so the
-                # interleaved progress output from multiple pushes is less hectic.
-                # We don't use `docker push --quiet`, as that disables progress
-                # output entirely. Use `set -o pipefail` so the return code of
-                # `docker push` is passed through.
-                push = subprocess.Popen(
-                    [
-                        "/bin/bash",
-                        "-c",
-                        f"set -o pipefail; docker push {shlex.quote(image)} | cat",
-                    ]
-                )
-                pushes.append(push)
-
-            for i, push in reversed(list(enumerate(pushes))):
-                returncode = push.wait()
-                if returncode:
-                    if attempts_remaining == 0:
-                        # Last attempt, fail
-                        raise subprocess.CalledProcessError(returncode, push.args)
-                    else:
-                        print(f"docker push {push.args} failed: {returncode}")
-                else:
-                    del images_to_push[i]
-
-            if images_to_push:
-                time.sleep(10)
-                print("Retrying in 10 seconds")
+        if deps_to_build:
+            with ThreadPoolExecutor(max_workers=len(deps_to_build)) as executor:
+                futures = [executor.submit(build_dep, dep) for dep in deps_to_build]
+                for future in as_completed(futures):
+                    future.result()
 
     def check(self) -> bool:
         """Check all publishable images in this dependency set exist on Docker
@@ -1187,13 +1353,16 @@ class Repository:
         self,
         root: Path,
         arch: Arch = Arch.host(),
-        profile: Profile = Profile.RELEASE,
+        profile: Profile = (
+            Profile.RELEASE if ui.env_is_truthy("CI_BAZEL_LTO") else Profile.OPTIMIZED
+        ),
         coverage: bool = False,
         sanitizer: Sanitizer = Sanitizer.none,
         image_registry: str = "materialize",
         image_prefix: str = "",
         bazel: bool = False,
         bazel_remote_cache: str | None = None,
+        bazel_lto: bool = False,
     ):
         self.rd = RepositoryDetails(
             root,
@@ -1205,6 +1374,7 @@ class Repository:
             image_prefix,
             bazel,
             bazel_remote_cache,
+            bazel_lto,
         )
         self.images: dict[str, Image] = {}
         self.compositions: dict[str, Path] = {}
@@ -1314,6 +1484,11 @@ class Repository:
             default=os.getenv("CI_BAZEL_REMOTE_CACHE"),
             action="store",
         )
+        parser.add_argument(
+            "--bazel-lto",
+            default=ui.env_is_truthy("CI_BAZEL_LTO"),
+            action="store",
+        )
 
     @classmethod
     def from_arguments(cls, root: Path, args: argparse.Namespace) -> "Repository":
@@ -1329,7 +1504,11 @@ class Repository:
         elif args.dev:
             profile = Profile.DEV
         else:
-            profile = Profile.RELEASE
+            profile = (
+                Profile.RELEASE
+                if ui.env_is_truthy("CI_BAZEL_LTO")
+                else Profile.OPTIMIZED
+            )
 
         return cls(
             root,
@@ -1341,6 +1520,7 @@ class Repository:
             arch=args.arch,
             bazel=args.bazel,
             bazel_remote_cache=args.bazel_remote_cache,
+            bazel_lto=args.bazel_lto,
         )
 
     @property

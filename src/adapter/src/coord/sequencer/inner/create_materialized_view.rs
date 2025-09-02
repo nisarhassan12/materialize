@@ -73,9 +73,7 @@ impl Staged for CreateMaterializedViewStage {
                 coord.create_materialized_view_optimize(stage).await
             }
             CreateMaterializedViewStage::Finish(stage) => {
-                coord
-                    .create_materialized_view_finish(ctx.session(), stage)
-                    .await
+                coord.create_materialized_view_finish(ctx, stage).await
             }
             CreateMaterializedViewStage::Explain(stage) => {
                 coord
@@ -342,7 +340,8 @@ impl Coordinator {
         // We want to reject queries that depend on log sources, for example,
         // even if we can *technically* optimize that reference away.
         let expr_depends_on = expr.depends_on();
-        self.validate_timeline_context(expr_depends_on.iter().copied())?;
+        self.catalog()
+            .validate_timeline_context(expr_depends_on.iter().copied())?;
         self.validate_system_column_references(*ambiguous_columns, &expr_depends_on)?;
         // Materialized views are not allowed to depend on log sources, as replicas
         // are not producing the same definite collection for these.
@@ -548,8 +547,10 @@ impl Coordinator {
     #[instrument]
     async fn create_materialized_view_finish(
         &mut self,
-        session: &Session,
-        CreateMaterializedViewFinish {
+        ctx: &mut ExecuteContext,
+        stage: CreateMaterializedViewFinish,
+    ) -> Result<StageResult<Box<CreateMaterializedViewStage>>, AdapterError> {
+        let CreateMaterializedViewFinish {
             item_id,
             global_id,
             plan:
@@ -575,13 +576,12 @@ impl Coordinator {
             global_mir_plan,
             global_lir_plan,
             ..
-        }: CreateMaterializedViewFinish,
-    ) -> Result<StageResult<Box<CreateMaterializedViewStage>>, AdapterError> {
+        } = stage;
         // Timestamp selection
         let id_bundle = dataflow_import_id_bundle(global_lir_plan.df_desc(), cluster_id);
 
         let read_holds_owned;
-        let read_holds = if let Some(txn_reads) = self.txn_read_holds.get(session.conn_id()) {
+        let read_holds = if let Some(txn_reads) = self.txn_read_holds.get(ctx.session().conn_id()) {
             // In some cases, for example when REFRESH is used, the preparatory
             // stages will already have acquired ReadHolds, we can re-use those.
 
@@ -650,7 +650,7 @@ impl Coordinator {
                     refresh_schedule: refresh_schedule.clone(),
                     initial_as_of: Some(initial_as_of.clone()),
                 }),
-                owner_id: *session.current_role_id(),
+                owner_id: *ctx.session().current_role_id(),
             },
         ];
 
@@ -661,63 +661,65 @@ impl Coordinator {
             .collect::<Vec<_>>();
 
         let transact_result = self
-            .catalog_transact_with_side_effects(Some(session), ops, |coord| async {
-                let output_desc = global_lir_plan.desc().clone();
-                let (mut df_desc, df_meta) = global_lir_plan.unapply();
+            .catalog_transact_with_side_effects(Some(ctx), ops, move |coord, ctx| {
+                Box::pin(async move {
+                    let output_desc = global_lir_plan.desc().clone();
+                    let (mut df_desc, df_meta) = global_lir_plan.unapply();
 
-                // Save plan structures.
-                coord
-                    .catalog_mut()
-                    .set_optimized_plan(global_id, global_mir_plan.df_desc().clone());
-                coord
-                    .catalog_mut()
-                    .set_physical_plan(global_id, df_desc.clone());
+                    // Save plan structures.
+                    coord
+                        .catalog_mut()
+                        .set_optimized_plan(global_id, global_mir_plan.df_desc().clone());
+                    coord
+                        .catalog_mut()
+                        .set_physical_plan(global_id, df_desc.clone());
 
-                let notice_builtin_updates_fut = coord
-                    .process_dataflow_metainfo(df_meta, global_id, session, notice_ids)
-                    .await;
+                    let notice_builtin_updates_fut = coord
+                        .process_dataflow_metainfo(df_meta, global_id, ctx, notice_ids)
+                        .await;
 
-                df_desc.set_as_of(dataflow_as_of.clone());
-                df_desc.set_initial_as_of(initial_as_of);
-                df_desc.until = until;
+                    df_desc.set_as_of(dataflow_as_of.clone());
+                    df_desc.set_initial_as_of(initial_as_of);
+                    df_desc.until = until;
 
-                let storage_metadata = coord.catalog.state().storage_metadata();
+                    let storage_metadata = coord.catalog.state().storage_metadata();
 
-                // Announce the creation of the materialized view source.
-                coord
-                    .controller
-                    .storage
-                    .create_collections(
-                        storage_metadata,
-                        None,
-                        vec![(
-                            global_id,
-                            CollectionDescription {
-                                desc: output_desc,
-                                data_source: DataSource::Other,
-                                since: Some(storage_as_of),
-                                status_collection_id: None,
-                                timeline: None,
-                            },
-                        )],
-                    )
-                    .await
-                    .unwrap_or_terminate("cannot fail to append");
+                    // Announce the creation of the materialized view source.
+                    coord
+                        .controller
+                        .storage
+                        .create_collections(
+                            storage_metadata,
+                            None,
+                            vec![(
+                                global_id,
+                                CollectionDescription {
+                                    desc: output_desc,
+                                    data_source: DataSource::Other,
+                                    since: Some(storage_as_of),
+                                    status_collection_id: None,
+                                    timeline: None,
+                                },
+                            )],
+                        )
+                        .await
+                        .unwrap_or_terminate("cannot fail to append");
 
-                coord
-                    .initialize_storage_read_policies(
-                        btreeset![item_id],
-                        compaction_window.unwrap_or(CompactionWindow::Default),
-                    )
-                    .await;
+                    coord
+                        .initialize_storage_read_policies(
+                            btreeset![item_id],
+                            compaction_window.unwrap_or(CompactionWindow::Default),
+                        )
+                        .await;
 
-                coord
-                    .ship_dataflow_and_notice_builtin_table_updates(
-                        df_desc,
-                        cluster_id,
-                        notice_builtin_updates_fut,
-                    )
-                    .await;
+                    coord
+                        .ship_dataflow_and_notice_builtin_table_updates(
+                            df_desc,
+                            cluster_id,
+                            notice_builtin_updates_fut,
+                        )
+                        .await;
+                })
             })
             .await;
 
@@ -727,7 +729,7 @@ impl Coordinator {
                 kind:
                     mz_catalog::memory::error::ErrorKind::Sql(CatalogError::ItemAlreadyExists(_, _)),
             })) if if_not_exists => {
-                session
+                ctx.session()
                     .add_notice(AdapterNotice::ObjectAlreadyExists {
                         name: name.item,
                         ty: "materialized view",
@@ -761,7 +763,7 @@ impl Coordinator {
 
         // For non-REFRESH MVs both the `dataflow_as_of` and the `storage_as_of` should be simply
         // `least_valid_read`.
-        let least_valid_read = self.least_valid_read(read_holds);
+        let least_valid_read = read_holds.least_valid_read();
         let mut dataflow_as_of = least_valid_read.clone();
         let mut storage_as_of = least_valid_read.clone();
 

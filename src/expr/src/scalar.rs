@@ -176,7 +176,10 @@ impl RustType<ProtoMirScalarExpr> for MirScalarExpr {
         use proto_mir_scalar_expr::Kind::*;
         ProtoMirScalarExpr {
             kind: Some(match self {
-                MirScalarExpr::Column(i, _) => Column(i.into_proto()),
+                MirScalarExpr::Column(index, name) => Column(ProtoColumn {
+                    index: index.into_proto(),
+                    name: name.0.as_ref().map(ToString::to_string),
+                }),
                 MirScalarExpr::Literal(lit, typ) => Literal(ProtoLiteral {
                     lit: Some(lit.into_proto()),
                     typ: Some(typ.into_proto()),
@@ -214,7 +217,13 @@ impl RustType<ProtoMirScalarExpr> for MirScalarExpr {
             .kind
             .ok_or_else(|| TryFromProtoError::missing_field("ProtoMirScalarExpr::kind"))?;
         Ok(match kind {
-            Column(i) => MirScalarExpr::column(usize::from_proto(i)?),
+            Column(ProtoColumn { index, name }) => {
+                let index = usize::from_proto(index)?;
+                match name {
+                    Some(name) => MirScalarExpr::named_column(index, name.into()),
+                    None => MirScalarExpr::column(index),
+                }
+            }
             Literal(ProtoLiteral { lit, typ }) => MirScalarExpr::Literal(
                 lit.into_rust_if_some("ProtoLiteral::lit")?,
                 typ.into_rust_if_some("ProtoLiteral::typ")?,
@@ -639,12 +648,20 @@ impl MirScalarExpr {
         mem::replace(self, MirScalarExpr::literal_null(ScalarType::String))
     }
 
-    pub fn as_literal(&self) -> Option<Result<Datum, &EvalError>> {
+    /// If the expression is a literal, this returns the literal's Datum or the literal's EvalError.
+    /// Otherwise, it returns None.
+    pub fn as_literal(&self) -> Option<Result<Datum<'_>, &EvalError>> {
         if let MirScalarExpr::Literal(lit, _column_type) = self {
             Some(lit.as_ref().map(|row| row.unpack_first()))
         } else {
             None
         }
+    }
+
+    /// Flattens the two failure modes of `as_literal` into one layer of Option: returns the
+    /// literal's Datum only if the expression is a literal, and it's not a literal error.
+    pub fn as_literal_non_error(&self) -> Option<Datum<'_>> {
+        self.as_literal().map(|eval_err| eval_err.ok()).flatten()
     }
 
     pub fn as_literal_owned(&self) -> Option<Result<Row, EvalError>> {
@@ -716,6 +733,17 @@ impl MirScalarExpr {
         let mut worklist = vec![self];
         while let Some(expr) = worklist.pop() {
             if expr.is_error_if_null() {
+                return true;
+            }
+            worklist.extend(expr.children());
+        }
+        false
+    }
+
+    pub fn contains_err(&self) -> bool {
+        let mut worklist = vec![self];
+        while let Some(expr) = worklist.pop() {
+            if expr.is_literal_err() {
                 return true;
             }
             worklist.extend(expr.children());
@@ -1217,11 +1245,7 @@ impl MirScalarExpr {
                             let mut prior_exprs = BTreeSet::new();
                             exprs.retain(|e| prior_exprs.insert(e.clone()));
 
-                            if let Some(expr) = exprs.iter_mut().find(|e| e.is_literal_err()) {
-                                // One of the remaining arguments is an error, so
-                                // just replace the entire coalesce with that error.
-                                *e = expr.take();
-                            } else if exprs.len() == 1 {
+                            if exprs.len() == 1 {
                                 // Only one argument, so the coalesce is a no-op.
                                 *e = exprs[0].take();
                             }
@@ -3383,25 +3407,11 @@ mod tests {
             TestCase {
                 input: MirScalarExpr::CallVariadic {
                     func: VariadicFunc::Coalesce,
-                    exprs: vec![col(0), err(EvalError::DivisionByZero)],
-                },
-                output: err(EvalError::DivisionByZero),
-            },
-            TestCase {
-                input: MirScalarExpr::CallVariadic {
-                    func: VariadicFunc::Coalesce,
                     exprs: vec![
                         null(),
                         err(EvalError::DivisionByZero),
                         err(EvalError::NumericFieldOverflow),
                     ],
-                },
-                output: err(EvalError::DivisionByZero),
-            },
-            TestCase {
-                input: MirScalarExpr::CallVariadic {
-                    func: VariadicFunc::Coalesce,
-                    exprs: vec![col(0), err(EvalError::DivisionByZero)],
                 },
                 output: err(EvalError::DivisionByZero),
             },

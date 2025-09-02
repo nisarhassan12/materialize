@@ -206,7 +206,7 @@ impl LocalMirPlan<Unresolved> {
         timestamp_ctx: TimestampContext<Timestamp>,
         session: &dyn SessionMetadata,
         stats: Box<dyn StatisticsOracle>,
-    ) -> LocalMirPlan<Resolved> {
+    ) -> LocalMirPlan<Resolved<'_>> {
         LocalMirPlan {
             expr: self.expr,
             df_meta: self.df_meta,
@@ -333,7 +333,7 @@ impl<'s> Optimize<LocalMirPlan<Resolved<'s>>> for Optimizer {
             self.config.persist_fast_path_order,
         ) {
             Ok(maybe_fast_path_plan) => maybe_fast_path_plan.is_some(),
-            Err(OptimizerError::UnsafeMfpPlan) => {
+            Err(OptimizerError::InternalUnsafeMfpPlan(_)) => {
                 // This is expected, in that `create_fast_path_plan` can choke on `mz_now`, which we
                 // haven't removed yet.
                 false

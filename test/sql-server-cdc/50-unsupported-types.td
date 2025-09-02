@@ -18,16 +18,10 @@ $ sql-server-connect name=sql-server
 server=tcp:sql-server,1433;IntegratedSecurity=true;TrustServerCertificate=true;User ID=${arg.default-sql-server-user};Password=${arg.default-sql-server-password}
 
 $ sql-server-execute name=sql-server
-DROP DATABASE IF EXISTS test_50;
-CREATE DATABASE test_50;
-USE test_50;
-
-EXEC sys.sp_cdc_enable_db;
-ALTER DATABASE test_50 SET ALLOW_SNAPSHOT_ISOLATION ON;
-
-CREATE TABLE table_text (good varchar(128), bad text);
-EXEC sys.sp_cdc_enable_table @source_schema = 'dbo', @source_name = 'table_text', @role_name = 'SA', @supports_net_changes = 0;
-INSERT INTO table_text VALUES ('i work', 'i do not'), ('maybe me', 'not so much');
+USE test;
+CREATE TABLE table_xml (good varchar(128), bad xml);
+EXEC sys.sp_cdc_enable_table @source_schema = 'dbo', @source_name = 'table_xml', @role_name = 'SA', @supports_net_changes = 0;
+INSERT INTO table_xml VALUES ('i work', NULL), ('maybe me', NULL);
 
 CREATE TABLE table_image (good int, bad image);
 EXEC sys.sp_cdc_enable_table @source_schema = 'dbo', @source_name = 'table_image', @role_name = 'SA', @supports_net_changes = 0;
@@ -45,38 +39,45 @@ CREATE TABLE table_varchar_max (good int, bad varchar(max));
 EXEC sys.sp_cdc_enable_table @source_schema = 'dbo', @source_name = 'table_varchar_max', @role_name = 'SA', @supports_net_changes = 0;
 INSERT INTO table_varchar_max VALUES (42, NULL);
 
+
 # Exercise Materialize.
 
 > CREATE SECRET IF NOT EXISTS sql_server_pass AS '${arg.default-sql-server-password}'
 
-$ postgres-execute connection=postgres://mz_system:materialize@${testdrive.materialize-internal-sql-addr}
-ALTER SYSTEM SET enable_sql_server_source = true;
-
 > CREATE CONNECTION sql_server_test_50_connection TO SQL SERVER (
     HOST 'sql-server',
     PORT 1433,
-    DATABASE test_50,
+    DATABASE test,
     USER '${arg.default-sql-server-user}',
     PASSWORD = SECRET sql_server_pass
   );
 
-! CREATE SOURCE table_text_source
+! CREATE SOURCE table_xml_source
   FROM SQL SERVER CONNECTION sql_server_test_50_connection
-  FOR TABLES (dbo.table_text);
-contains: SQL SERVER source validation: column dbo.table_text.bad of type text is not supported
+  FOR TABLES (dbo.table_xml);
+contains: SQL SERVER source validation: column dbo.table_xml.bad of type xml is not supported
 
-> CREATE SOURCE table_text_source
+> CREATE SOURCE table_xml_source
   FROM SQL SERVER CONNECTION sql_server_test_50_connection (
-    EXCLUDE COLUMNS (dbo.table_text.bad)
+    EXCLUDE COLUMNS (dbo.table_xml.bad)
   )
-  FOR TABLES (dbo.table_text);
+  FOR TABLES (dbo.table_xml);
 
-> SHOW COLUMNS FROM table_text;
+> SHOW COLUMNS FROM table_xml;
 good true "character varying" ""
 
-> SELECT * FROM table_text;
+# Wait until snapshot has emitted stats and then insert a new row
+# to force LSN in MS SQL to progress.
+> SELECT s.name, ss.snapshot_records_known = ss.snapshot_records_staged
+  FROM mz_internal.mz_source_statistics ss JOIN mz_sources s using (id)
+  WHERE s.name = 'table_xml_source' AND ss.snapshot_records_staged > 0;
+table_xml_source true
+
+> SELECT * FROM table_xml;
 "i work"
 "maybe me"
+
+> DROP SOURCE table_xml_source CASCADE;
 
 ! CREATE SOURCE table_image_source
   FROM SQL SERVER CONNECTION sql_server_test_50_connection
@@ -97,3 +98,52 @@ contains: SQL SERVER source validation: column dbo.table_geometry.bad of type ge
   FROM SQL SERVER CONNECTION sql_server_test_50_connection
   FOR TABLES (dbo.table_varchar_max);
 contains: SQL SERVER source validation: column dbo.table_varchar_max.bad of type varchar is not supported
+
+
+## same tests for source tables
+
+# Creating a source with no subsources should succeed
+> CREATE SOURCE ms_src
+  FROM SQL SERVER CONNECTION sql_server_test_50_connection;
+
+! CREATE TABLE table_xml
+  FROM SOURCE ms_src (REFERENCE dbo.table_xml);
+contains: SQL SERVER source validation: column dbo.table_xml.bad of type xml is not supported
+
+> CREATE TABLE table_xml
+  FROM SOURCE ms_src (REFERENCE dbo.table_xml)
+  WITH (
+    EXCLUDE COLUMNS (bad)
+  );
+
+# Wait until snapshot has emitted stats and then insert a new row
+# to force LSN in MS SQL to progress.
+> SELECT s.name, ss.snapshot_records_known = ss.snapshot_records_staged
+  FROM mz_internal.mz_source_statistics ss JOIN mz_sources s using (id)
+  WHERE s.name = 'ms_src' AND ss.snapshot_records_staged > 0;
+ms_src true
+
+> SHOW COLUMNS FROM table_xml;
+good true "character varying" ""
+
+> SELECT * FROM table_xml;
+"i work"
+"maybe me"
+
+! CREATE TABLE table_image
+  FROM SOURCE ms_src (REFERENCE dbo.table_image);
+contains: SQL SERVER source validation: column dbo.table_image.bad of type image is not supported
+
+! CREATE TABLE table_geography
+  FROM SOURCE ms_src (REFERENCE dbo.table_geography);
+contains: SQL SERVER source validation: column dbo.table_geography.bad of type geography is not supported
+
+! CREATE TABLE table_geometry
+  FROM SOURCE ms_src (REFERENCE dbo.table_geometry);
+contains: SQL SERVER source validation: column dbo.table_geometry.bad of type geometry is not supported
+
+! CREATE TABLE table_varchar_max
+  FROM SOURCE ms_src (REFERENCE dbo.table_varchar_max);
+contains: SQL SERVER source validation: column dbo.table_varchar_max.bad of type varchar is not supported
+
+> DROP SOURCE ms_src CASCADE;

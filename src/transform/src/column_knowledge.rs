@@ -526,7 +526,7 @@ impl From<&MirScalarExpr> for DatumKnowledge {
 
 impl From<(Datum<'_>, &ColumnType)> for DatumKnowledge {
     fn from((d, t): (Datum<'_>, &ColumnType)) -> Self {
-        let value = Ok(Row::pack_slice(&[d.clone()]));
+        let value = Ok(Row::pack_slice(std::slice::from_ref(&d)));
         let typ = t.scalar_type.clone();
         Self::Lit { value, typ }
     }
@@ -783,8 +783,6 @@ fn optimize(
     #[allow(deprecated)]
     expr.visit_mut_pre_post(
         &mut |e| {
-            // We should not eagerly memoize `if` branches that might not be taken.
-            // TODO: Memoize expressions in the intersection of `then` and `els`.
             if let MirScalarExpr::If { then, els, .. } = e {
                 Some(vec![then, els])
             } else {

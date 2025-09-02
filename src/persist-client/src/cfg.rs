@@ -27,6 +27,7 @@ use semver::Version;
 use serde::{Deserialize, Serialize};
 use tokio::sync::watch;
 
+use crate::async_runtime;
 use crate::internal::machine::{
     NEXT_LISTEN_BATCH_RETRYER_CLAMP, NEXT_LISTEN_BATCH_RETRYER_INITIAL_BACKOFF,
     NEXT_LISTEN_BATCH_RETRYER_MULTIPLIER,
@@ -263,6 +264,7 @@ impl PersistConfig {
 
         let mut cfg = Self::new_default_configs(&DUMMY_BUILD_INFO, SYSTEM_TIME.clone());
         cfg.hostname = "tests".into();
+        cfg.isolated_runtime_worker_threads = async_runtime::TEST_THREADS;
         cfg
     }
 }
@@ -315,7 +317,7 @@ pub fn all_dyncfgs(configs: ConfigSet) -> ConfigSet {
         .add(&crate::cli::admin::EXPRESSION_CACHE_FORCE_COMPACTION_WAIT)
         .add(&crate::fetch::FETCH_SEMAPHORE_COST_ADJUSTMENT)
         .add(&crate::fetch::FETCH_SEMAPHORE_PERMIT_ADJUSTMENT)
-        .add(&crate::fetch::FETCH_VALIDATE_PART_BOUNDS_ON_READ)
+        .add(&crate::fetch::VALIDATE_PART_BOUNDS_ON_READ)
         .add(&crate::fetch::OPTIMIZE_IGNORED_DATA_FETCH)
         .add(&crate::internal::cache::BLOB_CACHE_MEM_LIMIT_BYTES)
         .add(&crate::internal::cache::BLOB_CACHE_SCALE_WITH_THREADS)
@@ -334,6 +336,8 @@ pub fn all_dyncfgs(configs: ConfigSet) -> ConfigSet {
         .add(&crate::internal::state::ROLLUP_USE_ACTIVE_ROLLUP)
         .add(&crate::internal::state::GC_FALLBACK_THRESHOLD_MS)
         .add(&crate::internal::state::GC_USE_ACTIVE_GC)
+        .add(&crate::internal::state::GC_MIN_VERSIONS)
+        .add(&crate::internal::state::GC_MAX_VERSIONS)
         .add(&crate::internal::state::ROLLUP_FALLBACK_THRESHOLD_MS)
         .add(&crate::internal::state::ENABLE_INCREMENTAL_COMPACTION)
         .add(&crate::operators::STORAGE_SOURCE_DECODE_FUEL)
@@ -358,6 +362,7 @@ pub fn all_dyncfgs(configs: ConfigSet) -> ConfigSet {
         .add(&crate::stats::STATS_UNTRIMMABLE_COLUMNS_SUFFIX)
         .add(&crate::fetch::PART_DECODE_FORMAT)
         .add(&crate::write::COMBINE_INLINE_WRITES)
+        .add(&crate::write::VALIDATE_PART_BOUNDS_ON_WRITE)
 }
 
 impl PersistConfig {

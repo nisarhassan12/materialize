@@ -18,7 +18,7 @@ $ kafka-ingest topic=thetopic format=bytes
 one
 
 > DROP CLUSTER IF EXISTS sc;
-> CREATE CLUSTER sc REPLICAS (r1 (SIZE '32'))
+> CREATE CLUSTER sc REPLICAS (r1 (SIZE 'scale=1,workers=32'))
 
 
 # Unfortunately, currently we need a source we can add stuff to (so kafka), but one that
@@ -28,6 +28,7 @@ one
 > CREATE CONNECTION kafka_conn_non_ssh
   TO KAFKA (BROKER '${testdrive.kafka-addr}', SECURITY PROTOCOL PLAINTEXT);
 
+> BEGIN
 > CREATE SOURCE non_ssh IN CLUSTER sc
   FROM KAFKA CONNECTION kafka_conn_non_ssh (TOPIC 'testdrive-thetopic-${testdrive.seed}')
 
@@ -35,6 +36,7 @@ one
   FORMAT TEXT
   ENVELOPE NONE
 
+> COMMIT
 
 > CREATE CONNECTION kafka_conn_using
   TO KAFKA (BROKER '${testdrive.kafka-addr}' USING SSH TUNNEL thancred, SECURITY PROTOCOL PLAINTEXT);

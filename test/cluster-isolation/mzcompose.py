@@ -15,7 +15,11 @@ then making sure that cluster2 continues to operate properly
 from collections.abc import Callable
 from dataclasses import dataclass
 
-from materialize.mzcompose.composition import Composition, WorkflowArgumentParser
+from materialize.mzcompose.composition import (
+    Composition,
+    Service,
+    WorkflowArgumentParser,
+)
 from materialize.mzcompose.services.clusterd import Clusterd
 from materialize.mzcompose.services.kafka import Kafka
 from materialize.mzcompose.services.materialized import Materialized
@@ -36,6 +40,7 @@ SERVICES = [
             "unsafe_enable_unsafe_functions": "true",
             "unsafe_enable_unstable_dependencies": "true",
         },
+        support_external_clusterd=True,
     ),
     Clusterd(name="clusterd_1_1"),
     Clusterd(name="clusterd_1_2"),
@@ -218,17 +223,17 @@ A
 > SELECT * FROM source1_tbl
 A
 
-# TODO: This should be made reliable without sleeping, database-issues#7611
-$ sleep-is-probably-flaky-i-have-justified-my-need-with-a-comment duration=5s
-
 # Sinks
 > CREATE SINK sink1 FROM v1mat
   INTO KAFKA CONNECTION kafka_conn (TOPIC 'sink1')
-  FORMAT AVRO USING CONFLUENT SCHEMA REGISTRY CONNECTION csr_conn
-  ENVELOPE DEBEZIUM
+  KEY (c1) NOT ENFORCED
+  FORMAT JSON
+  ENVELOPE UPSERT
 
-$ kafka-verify-data format=avro sink=materialize.public.sink1 sort-messages=true
-{"before": null, "after": {"row":{"c1": 3}}}
+# Note: nothing constrains Materialize to _start_ the sink from the most recent timestamp, but it should
+# eventually reflect the latest count.
+$ kafka-verify-data format=json key=false sink=materialize.public.sink1 partial-search=10
+{"c1": 3}
 """,
     )
 
@@ -259,13 +264,13 @@ def run_test(c: Composition, disruption: Disruption, id: int) -> None:
             process_names=["clusterd_2_1", "clusterd_2_2"],
         ),
     ):
-        c.up("testdrive", persistent=True)
         c.up(
             "materialized",
             "clusterd_1_1",
             "clusterd_1_2",
             "clusterd_2_1",
             "clusterd_2_2",
+            Service("testdrive", idle=True),
         )
 
         c.sql(

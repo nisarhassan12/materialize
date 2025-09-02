@@ -11,14 +11,13 @@ import json
 import random
 from typing import Any
 
-from materialize import buildkite
+from materialize import buildkite, ui
 from materialize.mzcompose import DEFAULT_MZ_VOLUMES, cluster_replica_size_map
 from materialize.mzcompose.service import (
     Service,
     ServiceConfig,
-    ServiceDependency,
 )
-from materialize.mzcompose.services.azure import azure_blob_uri
+from materialize.mzcompose.services.azurite import azure_blob_uri
 from materialize.mzcompose.services.minio import minio_blob_uri
 from materialize.mzcompose.services.postgres import METADATA_STORE
 
@@ -65,9 +64,8 @@ class Testdrive(Service):
         cluster_replica_size: dict[str, dict[str, Any]] | None = None,
         network_mode: str | None = None,
         set_persist_urls: bool = True,
+        backoff_factor: float = 1.0,
     ) -> None:
-        depends_graph: dict[str, ServiceDependency] = {}
-
         if cluster_replica_size is None:
             cluster_replica_size = cluster_replica_size_map()
 
@@ -90,6 +88,7 @@ class Testdrive(Service):
         environment += [
             f"CLUSTER_REPLICA_SIZES={json.dumps(cluster_replica_size)}",
             "MZ_CI_LICENSE_KEY",
+            "LD_PRELOAD=libeatmydata.so",
         ]
 
         volumes = [
@@ -107,7 +106,10 @@ class Testdrive(Service):
                 f"--materialize-url={materialize_url}",
                 f"--materialize-internal-url={materialize_url_internal}",
                 *(["--materialize-use-https"] if materialize_use_https else []),
+                # Faster retries
             ]
+
+        entrypoint.append(f"--backoff-factor={backoff_factor}")
 
         if aws_region:
             entrypoint.append(f"--aws-region={aws_region}")
@@ -134,7 +136,9 @@ class Testdrive(Service):
             entrypoint.append(f"--materialize-param={k}={v}")
 
         if default_timeout is None:
-            default_timeout = "360s"
+            default_timeout = (
+                "120s" if ui.env_is_truthy("CI_COVERAGE_ENABLED") else "20s"
+            )
         entrypoint.append(f"--default-timeout={default_timeout}")
 
         if kafka_default_partitions:
@@ -156,7 +160,6 @@ class Testdrive(Service):
             entrypoint.append("--consistency-checks=disable")
 
         if fivetran_destination:
-            depends_graph["fivetran-destination"] = {"condition": "service_started"}
             entrypoint.append(f"--fivetran-destination-url={fivetran_destination_url}")
             entrypoint.append(
                 f"--fivetran-destination-files-path={fivetran_destination_files_path}"
@@ -178,7 +181,6 @@ class Testdrive(Service):
                 entrypoint.append("--persist-blob-url=file:///mzdata/persist/blob")
 
             if external_metadata_store:
-                depends_graph[metadata_store] = {"condition": "service_healthy"}
                 entrypoint.append(
                     "--persist-consensus-url=postgres://root@cockroach:26257?options=--search_path=consensus"
                 )
@@ -190,7 +192,6 @@ class Testdrive(Service):
         entrypoint.extend(entrypoint_extra)
 
         config: ServiceConfig = {
-            "depends_on": depends_graph,
             "mzbuild": mzbuild,
             "entrypoint": entrypoint,
             "environment": environment,

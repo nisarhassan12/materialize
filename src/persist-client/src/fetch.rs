@@ -91,7 +91,7 @@ pub(crate) const OPTIMIZE_IGNORED_DATA_FETCH: Config<bool> = Config::new(
     "CYA to allow opt-out of a performance optimization to skip fetching ignored data",
 );
 
-pub(crate) const FETCH_VALIDATE_PART_BOUNDS_ON_READ: Config<bool> = Config::new(
+pub(crate) const VALIDATE_PART_BOUNDS_ON_READ: Config<bool> = Config::new(
     "persist_validate_part_bounds_on_read",
     true,
     "Validate the part lower <= the batch lower and the part upper <= batch upper,\
@@ -106,7 +106,7 @@ pub(crate) struct FetchConfig {
 impl FetchConfig {
     pub fn from_persist_config(cfg: &PersistConfig) -> Self {
         Self {
-            validate_bounds_on_read: FETCH_VALIDATE_PART_BOUNDS_ON_READ.get(cfg),
+            validate_bounds_on_read: VALIDATE_PART_BOUNDS_ON_READ.get(cfg),
         }
     }
 }
@@ -1255,8 +1255,11 @@ where
         //   truncated bounds must be ignored. Not every user batch is
         //   truncated.
         // - Batches written by compaction. These always have an inline desc
-        //   that exactly matches the one they are registered with. The since
-        //   can be anything.
+        //   lower and upper that matches the registered desc lower and upper,
+        //   and a since that is less than or equal to the registered desc.
+        //   The inline since may be less than the registered desc since,
+        //   this is because of incremental compaction, where we might rewrite
+        //   certain runs in a batch but not others.
         let inline_desc = &parsed.desc;
         let needs_truncation = inline_desc.lower() != registered_desc.lower()
             || inline_desc.upper() != registered_desc.upper();
@@ -1297,10 +1300,28 @@ where
                 registered_desc
             );
         } else {
-            assert_eq!(
-                inline_desc, &registered_desc,
+            assert!(
+                PartialOrder::less_equal(inline_desc.since(), registered_desc.since()),
                 "key={} inline={:?} registered={:?}",
-                printable_name, inline_desc, registered_desc
+                printable_name,
+                inline_desc,
+                registered_desc
+            );
+            assert_eq!(
+                inline_desc.lower(),
+                registered_desc.lower(),
+                "key={} inline={:?} registered={:?}",
+                printable_name,
+                inline_desc,
+                registered_desc
+            );
+            assert_eq!(
+                inline_desc.upper(),
+                registered_desc.upper(),
+                "key={} inline={:?} registered={:?}",
+                printable_name,
+                inline_desc,
+                registered_desc
             );
         }
 

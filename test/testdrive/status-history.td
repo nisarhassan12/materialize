@@ -7,14 +7,14 @@
 # the Business Source License, use of this software will be governed
 # by the Apache License, Version 2.0.
 
-$ set-arg-default default-storage-size=1
+$ set-arg-default default-storage-size=scale=1,workers=1
 
 # Specify the behaviour of the status history tables
 $ set-regex match="\d\d\d\d-\d\d-\d\d \d\d:\d\d:\d\d(\.\d\d\d)?" replacement="<TIMESTAMP>"
 
 > DROP CLUSTER IF EXISTS c CASCADE
 
-> CREATE CLUSTER c SIZE '1', REPLICATION FACTOR 0
+> CREATE CLUSTER c SIZE 'scale=1,workers=1', REPLICATION FACTOR 0
 
 > CREATE SOURCE counter in cluster c FROM LOAD GENERATOR COUNTER (UP TO 100)
 
@@ -58,12 +58,14 @@ $ kafka-create-topic topic=status-history
 ## entries we expect.
 
 > CREATE CLUSTER kafka_source_cluster SIZE '${arg.default-storage-size}';
+> BEGIN
 > CREATE SOURCE kafka_source
   IN CLUSTER kafka_source_cluster
   FROM KAFKA CONNECTION kafka_conn (TOPIC 'testdrive-status-history-${testdrive.seed}')
 
 > CREATE TABLE kafka_source_tbl FROM SOURCE kafka_source (REFERENCE "testdrive-status-history-${testdrive.seed}")
   FORMAT TEXT
+> COMMIT
 
 > CREATE CLUSTER kafka_sink_cluster SIZE '${arg.default-storage-size}';
 > CREATE SINK kafka_sink
@@ -133,12 +135,14 @@ $ kafka-verify-data format=avro sink=materialize.public.kafka_sink sort-messages
 ## Confirm that the tables report statuses for multiple sources and sinks.
 
 > CREATE CLUSTER kafka_source_2_cluster SIZE '${arg.default-storage-size}';
+> BEGIN
 > CREATE SOURCE kafka_source_2
   IN CLUSTER kafka_source_2_cluster
   FROM KAFKA CONNECTION kafka_conn (TOPIC 'testdrive-status-history-${testdrive.seed}')
 
 > CREATE TABLE kafka_source_2_tbl FROM SOURCE kafka_source_2 (REFERENCE "testdrive-status-history-${testdrive.seed}")
   FORMAT TEXT
+> COMMIT
 
 > CREATE CLUSTER kafka_sink_2_cluster SIZE '${arg.default-storage-size}';
 > CREATE SINK kafka_sink_2

@@ -17,14 +17,14 @@ import base64
 import decimal
 import json
 import logging
-from collections.abc import Sequence
+from importlib.resources import files
 from textwrap import dedent
 from typing import Any
 from uuid import UUID
 
 import aiorwlock
 from mcp import Tool
-from mcp.types import EmbeddedResource, ImageContent, TextContent, ToolAnnotations
+from mcp.types import ToolAnnotations
 from psycopg import sql
 from psycopg.rows import dict_row
 from psycopg_pool import AsyncConnectionPool
@@ -35,90 +35,7 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
 
-TOOL_QUERY = base = dedent(
-    """
-        WITH tools AS (
-            SELECT
-                op.database || '_' || op.schema || '_' || i.name AS name,
-                op.database,
-                op.schema,
-                op.name AS object_name,
-                c.name AS cluster,
-                cts.comment AS description,
-                jsonb_build_object(
-                    'type', 'object',
-                    'required', jsonb_agg(distinct ccol.name) FILTER (WHERE ccol.position = ic.on_position),
-                    'properties', jsonb_strip_nulls(jsonb_object_agg(
-                        ccol.name,
-                        CASE
-                            WHEN ccol.type IN (
-                                'uint2', 'uint4','uint8', 'int', 'integer', 'smallint',
-                                'double', 'double precision', 'bigint', 'float',
-                                'numeric', 'real'
-                            ) THEN jsonb_build_object(
-                                'type', 'number',
-                                'description', cts_col.comment
-                            )
-                            WHEN ccol.type = 'boolean' THEN jsonb_build_object(
-                                'type', 'boolean',
-                                'description', cts_col.comment
-                            )
-                            WHEN ccol.type = 'bytea' THEN jsonb_build_object(
-                                'type', 'string',
-                                'description', cts_col.comment,
-                                'contentEncoding', 'base64',
-                                'contentMediaType', 'application/octet-stream'
-                            )
-                            WHEN ccol.type = 'date' THEN jsonb_build_object(
-                                'type', 'string',
-                                'format', 'date',
-                                'description', cts_col.comment
-                            )
-                            WHEN ccol.type = 'time' THEN jsonb_build_object(
-                                'type', 'string',
-                                'format', 'time',
-                                'description', cts_col.comment
-                            )
-                            WHEN ccol.type ilike 'timestamp%%' THEN jsonb_build_object(
-                                'type', 'string',
-                                'format', 'date-time',
-                                'description', cts_col.comment
-                            )
-                            WHEN ccol.type = 'jsonb' THEN jsonb_build_object(
-                                'type', 'object',
-                                'description', cts_col.comment
-                            )
-                            WHEN ccol.type = 'uuid' THEN jsonb_build_object(
-                                'type', 'string',
-                                'format', 'uuid',
-                                'description', cts_col.comment
-                            )
-                            ELSE jsonb_build_object(
-                                'type', 'string',
-                                'description', cts_col.comment
-                            )
-                        END
-                    ) FILTER (WHERE ccol.position = ic.on_position))
-                ) AS input_schema,
-                array_agg(distinct ccol.name) FILTER (WHERE ccol.position <> ic.on_position) AS output_columns
-            FROM mz_internal.mz_show_my_object_privileges op
-            JOIN mz_objects o ON op.name = o.name AND op.object_type = o.type
-            JOIN mz_schemas s ON s.name = op.schema AND s.id = o.schema_id
-            JOIN mz_databases d ON d.name = op.database AND d.id = s.database_id
-            JOIN mz_indexes i ON i.on_id = o.id
-            JOIN mz_index_columns ic ON i.id = ic.index_id
-            JOIN mz_columns ccol ON ccol.id = o.id
-            JOIN mz_clusters c ON c.id = i.cluster_id
-            JOIN mz_internal.mz_show_my_cluster_privileges cp ON cp.name = c.name
-            JOIN mz_internal.mz_comments cts ON cts.id = o.id AND cts.object_sub_id IS NULL
-            LEFT JOIN mz_internal.mz_comments cts_col ON cts_col.id = o.id AND cts_col.object_sub_id = ccol.position
-            WHERE op.privilege_type = 'SELECT'
-              AND cp.privilege_type = 'USAGE'
-            GROUP BY 1,2,3,4,5,6
-        )
-        SELECT * FROM tools
-        """  # noqa: E501
-)
+TOOL_QUERY = (files("mcp_materialize.sql") / "tools.sql").read_text()
 
 
 class MzTool:
@@ -129,8 +46,10 @@ class MzTool:
         schema,
         object_name,
         cluster,
+        title,
         description,
         input_schema,
+        output_schema,
         output_columns,
     ):
         self.name = name
@@ -138,8 +57,10 @@ class MzTool:
         self.schema = schema
         self.object_name = object_name
         self.cluster = cluster
+        self.title = title
         self.description = description
         self.input_schema = input_schema
+        self.output_schema = output_schema
         self.output_columns = output_columns
 
     def as_tool(self) -> Tool:
@@ -147,7 +68,8 @@ class MzTool:
             name=self.name,
             description=self.description,
             inputSchema=self.input_schema,
-            annotations=ToolAnnotations(readOnlyHint=True),
+            outputSchema=self.output_schema,
+            annotations=ToolAnnotations(title=self.title, readOnlyHint=True),
         )
 
 
@@ -233,8 +155,10 @@ class MzClient:
                         schema=row["schema"],
                         object_name=row["object_name"],
                         cluster=row["cluster"],
+                        title=row["title"],
                         description=row["description"],
                         input_schema=row["input_schema"],
+                        output_schema=row["output_schema"],
                         output_columns=row["output_columns"],
                     )
                     new_tools[tool.name] = tool
@@ -250,9 +174,7 @@ class MzClient:
         async with self._lock.reader_lock:
             return [tool.as_tool() for tool in self.tools.values()]
 
-    async def call_tool(
-        self, name: str, arguments: dict[str, Any]
-    ) -> Sequence[TextContent | ImageContent | EmbeddedResource]:
+    async def call_tool(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
         pool = self.pool
 
         async with self._lock.reader_lock:
@@ -292,19 +214,21 @@ class MzClient:
                 rows = await cur.fetchall()
                 columns = [desc.name for desc in cur.description]
 
-                result = [
+                raw = [
                     {k: v for k, v in dict(zip(columns, row)).items()} for row in rows
                 ]
 
-                match len(result):
-                    case 0:
-                        return []
-                    case 1:
-                        text = json.dumps(result[0], default=json_serial)
-                    case _:
-                        text = json.dumps(result, default=json_serial)
+                return serialize({"rows": raw})
 
-                return [TextContent(text=text, type="text")]
+
+def serialize(obj):
+    """Serialize any Decimal/date/bytes/UUID into JSON-safe primitives."""
+    # json.dumps will call json_serial for any non-standard type,
+    # then json.loads turns it back into a Python dict/list of primitives.
+    # Structured output types require the tool returns dict[str, Any]
+    # but the json encoder used by the mcp library does not support all
+    # standard postgres types
+    return json.loads(json.dumps(obj, default=json_serial))
 
 
 def json_serial(obj):
@@ -318,7 +242,7 @@ def json_serial(obj):
     elif isinstance(obj, bytes):
         return base64.b64encode(obj).decode("ascii")
     elif isinstance(obj, decimal.Decimal):
-        return str(obj)
+        return float(obj)
     elif isinstance(obj, UUID):
         return str(obj)
     else:

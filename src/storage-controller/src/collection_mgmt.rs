@@ -80,7 +80,7 @@ use mz_ore::now::{EpochMillis, NowFn};
 use mz_ore::retry::Retry;
 use mz_ore::soft_panic_or_log;
 use mz_ore::task::AbortOnDropHandle;
-use mz_ore::vec::VecExt;
+use mz_persist_client::batch::Added;
 use mz_persist_client::read::ReadHandle;
 use mz_persist_client::write::WriteHandle;
 use mz_persist_types::Codec64;
@@ -395,10 +395,17 @@ where
             panic!("attempting blind write to {} while in read-only mode", id);
         }
 
-        if !updates.is_empty() {
-            let update_tx = self.append_only_write_sender(id);
-            let (tx, _rx) = oneshot::channel();
-            update_tx.send((updates, tx)).expect("rx hung up");
+        if updates.is_empty() {
+            return;
+        }
+
+        let collections = self.append_only_collections.lock().expect("poisoned");
+        match collections.get(&id) {
+            Some((update_tx, _, _)) => {
+                let (tx, _rx) = oneshot::channel();
+                update_tx.send((updates, tx)).expect("rx hung up");
+            }
+            None => panic!("missing append-only collection: {id}"),
         }
     }
 
@@ -410,10 +417,17 @@ where
     /// - If `id` does not belong to a differential collection.
     /// - If the collection closed.
     pub(super) fn differential_write(&self, id: GlobalId, op: StorageWriteOp) {
-        if !op.is_empty_append() {
-            let update_tx = self.differential_write_sender(id);
-            let (tx, _rx) = oneshot::channel();
-            update_tx.send((op, tx)).expect("rx hung up");
+        if op.is_empty_append() {
+            return;
+        }
+
+        let collections = self.differential_collections.lock().expect("poisoned");
+        match collections.get(&id) {
+            Some((update_tx, _, _)) => {
+                let (tx, _rx) = oneshot::channel();
+                update_tx.send((op, tx)).expect("rx hung up");
+            }
+            None => panic!("missing differential collection: {id}"),
         }
     }
 
@@ -864,7 +878,7 @@ where
                 self.to_write.extend(updates);
             }
             StorageWriteOp::Delete { filter } => {
-                let to_delete = self.desired.drain_filter_swapping(|(row, _)| filter(row));
+                let to_delete = self.desired.extract_if(.., |(row, _)| filter(row));
                 let retractions = to_delete.map(|(row, diff)| (row, -diff));
                 self.to_write.extend(retractions);
             }
@@ -1515,45 +1529,52 @@ where
     };
 
     let mut rows = storage_collections
-        .snapshot(id, as_of_ts)
+        .snapshot_cursor(id, as_of_ts)
         .await
         .map_err(|e| anyhow!("reading snapshot: {e:?}"))?;
 
     let now = mz_ore::now::to_datetime(now());
     let keep_since = now - keep_duration;
 
-    // Produce retractions by inverting diffs of rows we want to delete and setting the diffs
-    // of all other rows to 0.
-    for (row, diff) in &mut rows {
-        let datums = row.unpack();
-        let occurred_at = datums[occurred_at_col].unwrap_timestamptz();
-        *diff = if *occurred_at < keep_since { -*diff } else { 0 };
-    }
-
-    // Consolidate to avoid superfluous writes.
-    consolidation::consolidate(&mut rows);
-
-    if rows.is_empty() {
-        return Ok(());
-    }
-
     // It is very important that we append our retractions at the timestamp
     // right after the timestamp at which we got our snapshot. Otherwise,
     // it's possible for someone else to sneak in retractions or other
     // unexpected changes.
     let old_upper_ts = upper_ts.clone();
-    let write_ts = old_upper_ts.clone();
     let new_upper_ts = TimestampManipulation::step_forward(&old_upper_ts);
 
-    let updates = rows
-        .into_iter()
-        .map(|(row, diff)| ((SourceData(Ok(row)), ()), write_ts.clone(), diff));
+    // Produce retractions by inverting diffs of rows we want to delete.
+    let mut builder = write_handle.builder(Antichain::from_elem(old_upper_ts.clone()));
+    while let Some(chunk) = rows.next().await {
+        for ((key, _v), _t, diff) in chunk {
+            let data = key.map_err(|e| anyhow!("decoding error in metrics snapshot: {e}"))?;
+            let Ok(row) = &data.0 else { continue };
+            let datums = row.unpack();
+            let occurred_at = datums[occurred_at_col].unwrap_timestamptz();
+            if *occurred_at >= keep_since {
+                continue;
+            }
+            let diff = -diff;
+            match builder.add(&data, &(), &old_upper_ts, &diff).await? {
+                Added::Record => {}
+                Added::RecordAndParts => {
+                    debug!(?id, "added part to builder");
+                }
+            }
+        }
+    }
+
+    let mut updates = builder
+        .finish(Antichain::from_elem(new_upper_ts.clone()))
+        .await?;
+    let mut batches = vec![&mut updates];
 
     write_handle
-        .compare_and_append(
-            updates,
+        .compare_and_append_batch(
+            batches.as_mut_slice(),
             Antichain::from_elem(old_upper_ts),
             Antichain::from_elem(new_upper_ts),
+            true,
         )
         .await
         .expect("valid usage")

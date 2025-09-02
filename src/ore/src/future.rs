@@ -367,7 +367,7 @@ pub trait OreSinkExt<T>: Sink<T> {
 
     /// Like [`futures::sink::SinkExt::send`], but does not flush the sink after enqueuing
     /// `item`.
-    fn enqueue(&mut self, item: T) -> Enqueue<Self, T> {
+    fn enqueue(&mut self, item: T) -> Enqueue<'_, Self, T> {
         Enqueue {
             sink: self,
             item: Some(item),
@@ -488,4 +488,30 @@ where
 
         Some(buffer)
     }
+}
+
+/// Yield execution back to the runtime.
+///
+/// A snapshot of the old `tokio::task::yield_now` implementation, from before it
+/// had sneaky TLS shenangans.
+pub async fn yield_now() {
+    struct YieldNow {
+        yielded: bool,
+    }
+
+    impl Future for YieldNow {
+        type Output = ();
+
+        fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+            if self.yielded {
+                return Poll::Ready(());
+            }
+
+            self.yielded = true;
+            cx.waker().wake_by_ref();
+            Poll::Pending
+        }
+    }
+
+    YieldNow { yielded: false }.await
 }

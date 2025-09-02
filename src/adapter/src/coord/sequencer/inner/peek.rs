@@ -14,6 +14,8 @@ use std::sync::Arc;
 use http::Uri;
 use itertools::Either;
 use maplit::btreemap;
+use mz_adapter_types::dyncfgs::PLAN_INSIGHTS_NOTICE_FAST_PATH_CLUSTERS_OPTIMIZE_DURATION;
+use mz_catalog::memory::objects::CatalogItem;
 use mz_compute_types::sinks::ComputeSinkConnection;
 use mz_controller_types::ClusterId;
 use mz_expr::{CollectionPlan, ResultSpec};
@@ -25,7 +27,6 @@ use mz_repr::{Datum, GlobalId, RowArena, Timestamp};
 use mz_sql::ast::{ExplainStage, Statement};
 use mz_sql::catalog::CatalogCluster;
 // Import `plan` module, but only import select elements to avoid merge conflicts on use statements.
-use mz_catalog::memory::objects::CatalogItem;
 use mz_sql::plan::QueryWhen;
 use mz_sql::plan::{self, HirScalarExpr};
 use mz_sql::session::metadata::SessionMetadata;
@@ -296,9 +297,6 @@ impl Coordinator {
         let optimizer = match copy_to_ctx {
             None => {
                 // Collect optimizer parameters specific to the peek::Optimizer.
-                let compute_instance = self
-                    .instance_snapshot(cluster.id())
-                    .expect("compute instance does not exist");
                 let (_, view_id) = self.allocate_transient_id();
                 let (_, index_id) = self.allocate_transient_id();
 
@@ -317,11 +315,11 @@ impl Coordinator {
                 // Getting the max worker count across replicas
                 // and using that value for the number of batches to
                 // divide the copy output into.
-                let max_worker_count = match cluster
-                    .replicas()
-                    .map(|r| r.config.location.workers())
-                    .max()
-                {
+                let worker_counts = cluster.replicas().map(|r| {
+                    let loc = &r.config.location;
+                    loc.workers().unwrap_or_else(|| loc.num_processes())
+                });
+                let max_worker_count = match worker_counts.max() {
                     Some(count) => u64::cast_from(count),
                     None => {
                         return Err(AdapterError::NoClusterReplicasAvailable {
@@ -356,7 +354,9 @@ impl Coordinator {
             .transpose()?;
 
         let source_ids = plan.source.depends_on();
-        let mut timeline_context = self.validate_timeline_context(source_ids.iter().copied())?;
+        let mut timeline_context = self
+            .catalog()
+            .validate_timeline_context(source_ids.iter().copied())?;
         if matches!(timeline_context, TimelineContext::TimestampIndependent)
             && plan.source.contains_temporal()?
         {
@@ -596,35 +596,36 @@ impl Coordinator {
                     let stage = match pipeline_result {
                         Ok(Either::Left(global_lir_plan)) => {
                             let optimizer = optimizer.unwrap_left();
-                        // Enable fast path cluster calculation for slow path plans.
-                        let needs_plan_insights = explain_ctx.needs_plan_insights();
-                        // Disable anything that uses the optimizer if we only want the notice and
-                        // plan optimization took longer than the threshold. This is to prevent a
-                        // situation where optimizing takes a while and there a lots of clusters,
-                        // which would delay peek execution by the product of those.
-                        let opt_limit = mz_adapter_types::dyncfgs::PLAN_INSIGHTS_NOTICE_FAST_PATH_CLUSTERS_OPTIMIZE_DURATION.get(catalog.system_config().dyncfgs());
-                        let target_instance = catalog
-                            .get_cluster(optimizer.cluster_id())
-                            .name
-                            .clone();
-                        let enable_re_optimize =
-                            !(matches!(explain_ctx, ExplainContext::PlanInsightsNotice(_))
-                                && optimizer.duration() > opt_limit);
-                        let insights_ctx = needs_plan_insights.then(|| PlanInsightsContext {
-                            stmt: plan.select.as_deref().map(Clone::clone).map(Statement::Select),
-                            raw_expr: plan.source.clone(),
-                            catalog,
-                            compute_instances,
-                            target_instance,
-                            metrics: optimizer.metrics().clone(),
-                            finishing: optimizer.finishing().clone(),
-                            optimizer_config: optimizer.config().clone(),
-                            session,
-                            timestamp_context,
-                            view_id: optimizer.select_id(),
-                            index_id: optimizer.index_id(),
-                            enable_re_optimize,
-                        }).map(Box::new);
+                            // Enable fast path cluster calculation for slow path plans.
+                            let needs_plan_insights = explain_ctx.needs_plan_insights();
+                            // Disable anything that uses the optimizer if we only want the notice and
+                            // plan optimization took longer than the threshold. This is to prevent a
+                            // situation where optimizing takes a while and there a lots of clusters,
+                            // which would delay peek execution by the product of those.
+                            let opt_limit = PLAN_INSIGHTS_NOTICE_FAST_PATH_CLUSTERS_OPTIMIZE_DURATION
+                                .get(catalog.system_config().dyncfgs());
+                            let target_instance = catalog
+                                .get_cluster(optimizer.cluster_id())
+                                .name
+                                .clone();
+                            let enable_re_optimize =
+                                !(matches!(explain_ctx, ExplainContext::PlanInsightsNotice(_))
+                                    && optimizer.duration() > opt_limit);
+                            let insights_ctx = needs_plan_insights.then(|| PlanInsightsContext {
+                                stmt: plan.select.as_deref().map(Clone::clone).map(Statement::Select),
+                                raw_expr: plan.source.clone(),
+                                catalog,
+                                compute_instances,
+                                target_instance,
+                                metrics: optimizer.metrics().clone(),
+                                finishing: optimizer.finishing().clone(),
+                                optimizer_config: optimizer.config().clone(),
+                                session,
+                                timestamp_context,
+                                view_id: optimizer.select_id(),
+                                index_id: optimizer.index_id(),
+                                enable_re_optimize,
+                            }).map(Box::new);
                             match explain_ctx {
                                 ExplainContext::Plan(explain_ctx) => {
                                     let (_, df_meta, _) = global_lir_plan.unapply();
@@ -724,7 +725,7 @@ impl Coordinator {
                                     df_meta: Default::default(),
                                     explain_ctx,
                                     insights_ctx: None,
-                            })
+                                })
                             } else {
                                 // In regular `EXPLAIN` contexts, immediately retire
                                 // the execution with the error.

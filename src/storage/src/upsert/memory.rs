@@ -15,9 +15,9 @@
 #![allow(clippy::disallowed_types)]
 
 use std::collections::HashMap;
-use std::collections::hash_map::Drain;
 
 use itertools::Itertools;
+use mz_ore::cast::CastFrom;
 
 use super::UpsertKey;
 use super::types::{
@@ -29,21 +29,6 @@ use super::types::{
 pub struct InMemoryHashMap<T, O> {
     state: HashMap<UpsertKey, StateValue<T, O>>,
     total_size: i64,
-}
-
-impl<T, O> InMemoryHashMap<T, O> {
-    /// Drain the map, returning the last total size as well.
-    pub fn drain(&mut self) -> (i64, Drain<'_, UpsertKey, StateValue<T, O>>) {
-        let last_size = self.total_size;
-        self.total_size = 0;
-
-        (last_size, self.state.drain())
-    }
-
-    /// Get the current size of the map. Note that after `drain`-ing, this is 0.
-    pub fn current_size(&self) -> i64 {
-        self.total_size
-    }
 }
 
 impl<T, O> Default for InMemoryHashMap<T, O> {
@@ -109,7 +94,7 @@ where
             stats.processed_gets += 1;
             let value = self.state.get(&key).cloned();
             let metadata = value.as_ref().map(|v| ValueMetadata {
-                size: v.memory_size(),
+                size: u64::cast_from(v.memory_size()),
                 is_tombstone: v.is_tombstone(),
             });
             stats.processed_gets_size += metadata.map_or(0, |m| m.size);

@@ -28,12 +28,14 @@ $ kafka-ingest topic=data format=avro schema=${writer-schema}
 > CREATE CONNECTION kafka_conn
   TO KAFKA (BROKER '${testdrive.kafka-addr}', SECURITY PROTOCOL PLAINTEXT);
 
+> BEGIN
 > CREATE SOURCE data
   IN CLUSTER ${arg.single-replica-cluster}
   FROM KAFKA CONNECTION kafka_conn (TOPIC 'testdrive-data-${testdrive.seed}')
 
 > CREATE TABLE data_tbl FROM SOURCE data (REFERENCE "testdrive-data-${testdrive.seed}")
   FORMAT AVRO USING SCHEMA '${writer-schema}'
+> COMMIT
 
 > SET CLUSTER TO mz_catalog_server
 > SHOW INDEXES ON data_tbl
@@ -250,7 +252,7 @@ contains:cannot show indexes on materialize.public.foo_primary_idx because it is
 
 > SET CLUSTER TO quickstart
 
-> CREATE CLUSTER clstr REPLICAS (r1 (SIZE '1'))
+> CREATE CLUSTER clstr REPLICAS (r1 (SIZE 'scale=1,workers=1'))
 > CREATE DEFAULT INDEX IN CLUSTER clstr ON foo;
 > SET CLUSTER TO mz_catalog_server
 > SHOW INDEXES IN CLUSTER clstr WHERE on = 'foo'
@@ -296,7 +298,7 @@ bar_ind bar <VARIABLE_OUTPUT> {a}  ""
 $ postgres-execute connection=postgres://mz_system@${testdrive.materialize-internal-sql-addr}/materialize
 ALTER SYSTEM SET enable_rbac_checks TO true
 
->[version<14800] SHOW INDEXES IN CLUSTER mz_catalog_server
+>[version<14900] SHOW INDEXES IN CLUSTER mz_catalog_server
 mz_active_peeks_per_worker_s2_primary_idx                   mz_active_peeks_per_worker                   mz_catalog_server    {id,worker_id}                              ""
 mz_arrangement_batches_raw_s2_primary_idx                   mz_arrangement_batches_raw                   mz_catalog_server    {operator_id,worker_id}                     ""
 mz_arrangement_records_raw_s2_primary_idx                   mz_arrangement_records_raw                   mz_catalog_server    {operator_id,worker_id}                     ""
@@ -400,7 +402,7 @@ pg_description_all_databases_ind                            pg_description_all_d
 pg_namespace_all_databases_ind                              pg_namespace_all_databases                   mz_catalog_server    {nspname}                                   ""
 pg_type_all_databases_ind                                   pg_type_all_databases                        mz_catalog_server    {oid}                                       ""
 
->[version>=14800] SHOW INDEXES IN CLUSTER mz_catalog_server
+>[version>=14900] SHOW INDEXES IN CLUSTER mz_catalog_server
 mz_active_peeks_per_worker_s2_primary_idx                   mz_active_peeks_per_worker                   mz_catalog_server    {id,worker_id}                              ""
 mz_arrangement_batches_raw_s2_primary_idx                   mz_arrangement_batches_raw                   mz_catalog_server    {operator_id,worker_id}                     ""
 mz_arrangement_records_raw_s2_primary_idx                   mz_arrangement_records_raw                   mz_catalog_server    {operator_id,worker_id}                     ""

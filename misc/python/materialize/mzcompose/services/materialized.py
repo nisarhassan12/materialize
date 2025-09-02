@@ -30,7 +30,7 @@ from materialize.mzcompose.service import (
     ServiceConfig,
     ServiceDependency,
 )
-from materialize.mzcompose.services.azure import azure_blob_uri
+from materialize.mzcompose.services.azurite import azure_blob_uri
 from materialize.mzcompose.services.minio import minio_blob_uri
 from materialize.mzcompose.services.postgres import METADATA_STORE
 
@@ -96,6 +96,7 @@ class Materialized(Service):
         bootstrap_replica_size: str | None = None,
         default_replication_factor: int = 1,
         listeners_config_path: str = f"{MZ_ROOT}/src/materialized/ci/listener_configs/no_auth.json",
+        support_external_clusterd: bool = False,
     ) -> None:
         if name is None:
             name = "materialized"
@@ -114,6 +115,8 @@ class Materialized(Service):
 
         environment = [
             "MZ_NO_TELEMETRY=1",
+            "MZ_NO_BUILTIN_CONSOLE=1",
+            "MZ_EAT_MY_DATA=1",
             "MZ_TEST_ONLY_DUMMY_SEGMENT_CLIENT=true",
             f"MZ_SOFT_ASSERTIONS={int(soft_assertions)}",
             # The following settings can not be baked in the default image, as they
@@ -123,6 +126,7 @@ class Materialized(Service):
             "MZ_BOOTSTRAP_ROLE=materialize",
             # TODO move this to the listener config?
             "MZ_INTERNAL_PERSIST_PUBSUB_LISTEN_ADDR=0.0.0.0:6879",
+            "MZ_PERSIST_PUBSUB_URL=http://127.0.0.1:6879",
             "MZ_AWS_CONNECTION_ROLE_ARN=arn:aws:iam::123456789000:role/MaterializeConnection",
             "MZ_AWS_EXTERNAL_ID_PREFIX=eb5cb59b-e2fe-41f3-87ca-d2176a495345",
             # Always use the persist catalog if the version has multiple implementations.
@@ -178,6 +182,9 @@ class Materialized(Service):
                 )
             ]
 
+        if not support_external_clusterd:
+            environment.append("MZ_NO_EXTERNAL_CLUSTERD=1")
+
         command = []
 
         if unsafe_mode:
@@ -213,13 +220,17 @@ class Materialized(Service):
             if not unsafe_mode:
                 command += ["--unsafe-mode"]
 
-        self.default_storage_size = "1" if default_size == 1 else f"{default_size}-1"
+        self.default_storage_size = (
+            "scale=1,workers=1"
+            if default_size == 1
+            else f"scale={default_size},workers=1"
+        )
 
         self.default_replica_size = (
-            "1"
+            "scale=1,workers=1"
             if default_size == 1
             else (
-                f"{default_size}-{default_size}"
+                f"scale={default_size},workers={default_size}"
                 if isinstance(default_size, int)
                 else default_size
             )
@@ -292,7 +303,11 @@ class Materialized(Service):
                 limits["cpus"] = cpu
             config["deploy"] = {"resources": {"limits": limits}}
 
-        if sanity_restart:
+        # Sanity restarts are rather slow and rarely find a bug, running them
+        # on main and releases is enough to prevent regressions.
+        if sanity_restart and (
+            os.getenv("BUILDKITE_BRANCH") == "main" or os.getenv("BUILDKITE_TAG")
+        ):
             # Workaround for https://github.com/docker/compose/issues/11133
             config["labels"] = {"sanity_restart": True}
 

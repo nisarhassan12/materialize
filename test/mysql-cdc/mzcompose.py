@@ -20,7 +20,11 @@ from materialize.mysql_util import (
     retrieve_invalid_ssl_context_for_mysql,
     retrieve_ssl_context_for_mysql,
 )
-from materialize.mzcompose.composition import Composition, WorkflowArgumentParser
+from materialize.mzcompose.composition import (
+    Composition,
+    Service,
+    WorkflowArgumentParser,
+)
 from materialize.mzcompose.services.materialized import Materialized
 from materialize.mzcompose.services.mysql import MySql
 from materialize.mzcompose.services.mz import Mz
@@ -108,8 +112,8 @@ def workflow_cdc(c: Composition, parser: WorkflowArgumentParser) -> None:
         matching_files.extend(
             glob.glob(filter, root_dir=MZ_ROOT / "test" / "mysql-cdc")
         )
-    sharded_files: list[str] = sorted(
-        buildkite.shard_list(matching_files, lambda file: file)
+    sharded_files: list[str] = buildkite.shard_list(
+        sorted(matching_files), lambda file: file
     )
     print(f"Files: {sharded_files}")
 
@@ -132,8 +136,8 @@ def workflow_cdc(c: Composition, parser: WorkflowArgumentParser) -> None:
                 f"--var=ssl-wrong-client-key={wrong_ssl_context.client_key}",
                 f"--var=mysql-root-password={MySql.DEFAULT_ROOT_PASSWORD}",
                 "--var=mysql-user-password=us3rp4ssw0rd",
-                f"--var=default-replica-size={Materialized.Size.DEFAULT_SIZE}-{Materialized.Size.DEFAULT_SIZE}",
-                f"--var=default-storage-size={Materialized.Size.DEFAULT_SIZE}-1",
+                f"--var=default-replica-size=scale={Materialized.Size.DEFAULT_SIZE},workers={Materialized.Size.DEFAULT_SIZE}",
+                f"--var=default-storage-size=scale={Materialized.Size.DEFAULT_SIZE},workers=1",
                 file,
             ),
         )
@@ -203,8 +207,7 @@ def workflow_many_inserts(c: Composition, parser: WorkflowArgumentParser) -> Non
     """
     mysql_version = get_targeted_mysql_version(parser)
     with c.override(create_mysql(mysql_version)):
-        c.up("materialized", "mysql")
-        c.up("testdrive", persistent=True)
+        c.up("materialized", "mysql", Service("testdrive", idle=True))
 
         # Records to before creating the source.
         (initial_sql, initial_records) = _make_inserts(txns=1, txn_size=1_000_000)
@@ -292,8 +295,7 @@ def workflow_large_scale(c: Composition, parser: WorkflowArgumentParser) -> None
     """
     mysql_version = get_targeted_mysql_version(parser)
     with c.override(create_mysql(mysql_version)):
-        c.up("materialized", "mysql")
-        c.up("testdrive", persistent=True)
+        c.up("materialized", "mysql", Service("testdrive", idle=True))
 
         # Set up the MySQL server with the initial records, set up the connection to
         # the MySQL server in Materialize.
@@ -336,7 +338,7 @@ def workflow_large_scale(c: Composition, parser: WorkflowArgumentParser) -> None
             ),
         )
 
-    num_rows = 200_000  # out of disk with 300_000 rows
+    num_rows = 100_000  # out of disk with 200_000 rows
     batch_size = 100
     for i in range(0, num_rows, batch_size):
         batch_num = min(batch_size, num_rows - i)

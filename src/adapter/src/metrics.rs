@@ -47,6 +47,8 @@ pub struct Metrics {
     pub pgwire_message_processing_seconds: HistogramVec,
     pub result_rows_first_to_last_byte_seconds: HistogramVec,
     pub pgwire_ensure_transaction_seconds: HistogramVec,
+    pub catalog_snapshot_seconds: HistogramVec,
+    pub pgwire_recv_scheduling_delay_ms: HistogramVec,
 }
 
 impl Metrics {
@@ -206,6 +208,18 @@ impl Metrics {
                 help: "The time it takes to run `ensure_transactions` when processing pgwire messages.",
                 var_labels: ["message_type"],
                 buckets: histogram_seconds_buckets(0.001, 512.0),
+            )),
+            catalog_snapshot_seconds: registry.register(metric!(
+                name: "mz_catalog_snapshot_seconds",
+                help: "The time it takes to run `catalog_snapshot` when fetching the catalog.",
+                var_labels: ["context"],
+                buckets: histogram_seconds_buckets(0.001, 512.0),
+            )),
+            pgwire_recv_scheduling_delay_ms: registry.register(metric!(
+                name: "mz_pgwire_recv_scheduling_delay_ms",
+                help: "The time between a pgwire connection's receiver task being woken up by incoming data and getting polled.",
+                var_labels: ["message_type"],
+                buckets: histogram_milliseconds_buckets(0.128, 512000.),
             ))
         }
     }

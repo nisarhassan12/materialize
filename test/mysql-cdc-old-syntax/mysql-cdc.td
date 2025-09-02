@@ -8,7 +8,6 @@
 # by the Apache License, Version 2.0.
 
 $ set-sql-timeout duration=1s
-$ set-max-tries max-tries=20
 
 
 > CREATE SECRET mysqlpass AS '${arg.mysql-root-password}'
@@ -552,7 +551,7 @@ true
 # Ensure we can start a source with more workers
 #
 
-> CREATE CLUSTER large_cluster SIZE '16';
+> CREATE CLUSTER large_cluster SIZE 'scale=1,workers=16';
 
 > CREATE SOURCE large_cluster_source
   IN CLUSTER large_cluster

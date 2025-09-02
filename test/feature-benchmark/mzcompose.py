@@ -36,6 +36,10 @@ from materialize.feature_benchmark.report import (
 from materialize.mz_version import MzVersion
 from materialize.mzcompose import ADDITIONAL_BENCHMARKING_SYSTEM_PARAMETERS
 from materialize.mzcompose.services.mysql import MySql
+from materialize.mzcompose.services.sql_server import (
+    SqlServer,
+    setup_sql_server_testing,
+)
 from materialize.mzcompose.test_result import (
     FailedTestExecutionError,
     TestFailureDetails,
@@ -83,8 +87,12 @@ from materialize.feature_benchmark.termination import (
     RunAtMost,
     TerminationCondition,
 )
-from materialize.mzcompose.composition import Composition, WorkflowArgumentParser
-from materialize.mzcompose.services.azure import Azurite
+from materialize.mzcompose.composition import (
+    Composition,
+    Service,
+    WorkflowArgumentParser,
+)
+from materialize.mzcompose.services.azurite import Azurite
 from materialize.mzcompose.services.balancerd import Balancerd
 from materialize.mzcompose.services.clusterd import Clusterd
 from materialize.mzcompose.services.cockroach import Cockroach
@@ -135,12 +143,13 @@ SERVICES = [
     KafkaService(),
     SchemaRegistry(),
     Redpanda(),
-    Cockroach(setup_materialize=True),
+    Cockroach(setup_materialize=True, in_memory=True),
     Minio(setup_materialize=True),
     Azurite(),
     KgenService(),
     Postgres(),
     MySql(),
+    SqlServer(),
     Balancerd(),
     # Overridden below
     Materialized(),
@@ -151,7 +160,10 @@ SERVICES = [
 
 
 def run_one_scenario(
-    c: Composition, scenario_class: type[Scenario], args: argparse.Namespace
+    c: Composition,
+    scenario_class: type[Scenario],
+    args: argparse.Namespace,
+    first_run: bool,
 ) -> BenchmarkScenarioResult:
     scenario_name = scenario_class.__name__
     print(f"--- Now benchmarking {scenario_name} ...")
@@ -183,7 +195,7 @@ def run_one_scenario(
 
         entrypoint_host = "balancerd" if balancerd else "materialized"
 
-        c.up("testdrive", persistent=True)
+        c.up(Service("testdrive", idle=True))
 
         additional_system_parameter_defaults = (
             ADDITIONAL_BENCHMARKING_SYSTEM_PARAMETERS
@@ -229,9 +241,10 @@ def run_one_scenario(
                 clusterd_image, size, additional_system_parameter_defaults
             )
 
-        start_overridden_mz_clusterd_and_cockroach(c, mz, clusterd, instance)
-        if balancerd:
-            c.up("balancerd")
+        start_overridden_mz_clusterd_and_cockroach(
+            c, mz, clusterd, instance, balancerd, first_run
+        )
+        first_run = False
 
         with c.override(
             Testdrive(
@@ -340,6 +353,7 @@ def create_mz_service(
         external_blob_store=True,
         blob_store_is_azure=azurite,
         sanity_restart=False,
+        support_external_clusterd=True,
     )
 
 
@@ -352,9 +366,23 @@ def create_clusterd_service(
 
 
 def start_overridden_mz_clusterd_and_cockroach(
-    c: Composition, mz: Materialized, clusterd: Clusterd, instance: str
+    c: Composition,
+    mz: Materialized,
+    clusterd: Clusterd,
+    instance: str,
+    balancerd: bool,
+    first_run: bool,
 ) -> None:
     with c.override(mz, clusterd):
+        c.up(
+            "cockroach",
+            "materialized",
+            "clusterd",
+            *(["balancerd"] if balancerd else []),
+        )
+        if first_run:
+            setup_sql_server_testing(c)
+
         version_request_command = c.run(
             "materialized",
             "-c",
@@ -365,8 +393,7 @@ def start_overridden_mz_clusterd_and_cockroach(
         )
         version = version_request_command.stdout.strip()
         print(f"The version of the '{instance.upper()}' Mz instance is: {version}")
-
-        c.up("cockroach", "materialized", "clusterd")
+        c.verify_build_profile()
 
 
 def workflow_default(c: Composition, parser: WorkflowArgumentParser) -> None:
@@ -519,7 +546,7 @@ def workflow_default(c: Composition, parser: WorkflowArgumentParser) -> None:
         # specified root scenario is a leaf
         selected_scenarios = [specified_root_scenario]
 
-    dependencies = ["postgres", "mysql"]
+    dependencies = ["postgres", "mysql", "sql-server"]
 
     if args.redpanda:
         dependencies += ["redpanda"]
@@ -542,6 +569,7 @@ def workflow_default(c: Composition, parser: WorkflowArgumentParser) -> None:
         )
 
     reports = []
+    first_run = True
 
     for run_index in range(0, args.runs_per_scenario):
         run_number = run_index + 1
@@ -554,7 +582,7 @@ def workflow_default(c: Composition, parser: WorkflowArgumentParser) -> None:
 
         for scenario_class in scenario_classes_scheduled_to_run:
             try:
-                scenario_result = run_one_scenario(c, scenario_class, args)
+                scenario_result = run_one_scenario(c, scenario_class, args, first_run)
             except RuntimeError as e:
                 if (
                     "No image found for commit hash" in str(e)
@@ -565,6 +593,8 @@ def workflow_default(c: Composition, parser: WorkflowArgumentParser) -> None:
                     )
                     return
                 raise e
+            finally:
+                first_run = False
 
             if scenario_result.is_empty():
                 continue

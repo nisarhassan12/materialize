@@ -40,7 +40,9 @@ use crate::batch::{
     BatchParts, ProtoBatch, validate_truncate_batch,
 };
 use crate::error::{InvalidUsage, UpperMismatch};
-use crate::fetch::{EncodedPart, FetchBatchFilter, FetchedPart, PartDecodeFormat};
+use crate::fetch::{
+    EncodedPart, FetchBatchFilter, FetchedPart, PartDecodeFormat, VALIDATE_PART_BOUNDS_ON_READ,
+};
 use crate::internal::compact::{CompactConfig, Compactor};
 use crate::internal::encoding::{Schemas, check_data_version};
 use crate::internal::machine::{CompareAndAppendRes, ExpireFn, Machine};
@@ -54,6 +56,13 @@ pub(crate) const COMBINE_INLINE_WRITES: Config<bool> = Config::new(
     "persist_write_combine_inline_writes",
     true,
     "If set, re-encode inline writes if they don't fit into the batch metadata limits.",
+);
+
+pub(crate) const VALIDATE_PART_BOUNDS_ON_WRITE: Config<bool> = Config::new(
+    "persist_validate_part_bounds_on_write",
+    true,
+    "Validate the part lower <= the batch lower and the part upper <= batch upper,\
+    for the batch being appended.",
 );
 
 /// An opaque identifier for a writer of a persist durable TVC (aka shard).
@@ -77,7 +86,7 @@ impl std::str::FromStr for WriterId {
     type Err = String;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        parse_id('w', "WriterId", s).map(WriterId)
+        parse_id("w", "WriterId", s).map(WriterId)
     }
 }
 
@@ -194,6 +203,12 @@ where
             purpose,
             read.read_schemas.clone(),
         )
+    }
+
+    /// Whether or not this WriteHandle supports writing without enforcing batch
+    /// bounds checks.
+    pub fn validate_part_bounds_on_write(&self) -> bool {
+        VALIDATE_PART_BOUNDS_ON_WRITE.get(&self.cfg) && VALIDATE_PART_BOUNDS_ON_READ.get(&self.cfg)
     }
 
     /// This handle's shard id.
@@ -468,7 +483,7 @@ where
         batches: &mut [&mut Batch<K, V, T, D>],
         expected_upper: Antichain<T>,
         new_upper: Antichain<T>,
-        enforce_matching_batch_boundaries: bool,
+        validate_part_bounds_on_write: bool,
     ) -> Result<Result<(), UpperMismatch<T>>, InvalidUsage<T>>
     where
         D: Send + Sync,
@@ -518,7 +533,7 @@ where
                     &batch.batch,
                     &desc,
                     any_batch_rewrite,
-                    enforce_matching_batch_boundaries,
+                    validate_part_bounds_on_write,
                 )?;
                 for (run_meta, run) in batch.batch.runs() {
                     let start_index = parts.len();

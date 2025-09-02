@@ -22,7 +22,7 @@ ALTER TABLE t1 REPLICA IDENTITY FULL;
 
 CREATE PUBLICATION mz_source FOR ALL TABLES;
 
-> CREATE CLUSTER storage REPLICAS (r1 (SIZE '1'))
+> CREATE CLUSTER storage REPLICAS (r1 (SIZE 'scale=1,workers=1'))
 
 > CREATE SECRET pgpass AS 'postgres'
 
@@ -32,11 +32,13 @@ CREATE PUBLICATION mz_source FOR ALL TABLES;
     USER postgres,
     PASSWORD SECRET pgpass
   )
+> BEGIN
 > CREATE SOURCE mz_source
   IN CLUSTER storage
   FROM POSTGRES CONNECTION pg (PUBLICATION 'mz_source');
 
 > CREATE TABLE t1 FROM SOURCE mz_source (REFERENCE t1);
+> COMMIT
 
 # Wait for the initial snapshot to be ingested
 > SELECT * FROM t1
@@ -52,7 +54,7 @@ UPDATE t1 SET f2 = CONCAT(f2, pk);
 UPDATE t1 SET f2 = CONCAT(f2, pk);
 
 # Resume the ingestion by adding a replica to the cluster.
-> CREATE CLUSTER REPLICA storage.r1 SIZE = '1';
+> CREATE CLUSTER REPLICA storage.r1 SIZE = 'scale=1,workers=1';
 
 ! SELECT * FROM t1;
 contains:replication slot has been invalidated because it exceeded the maximum reserved size

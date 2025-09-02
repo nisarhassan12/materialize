@@ -32,11 +32,15 @@ class Clusterd(Service):
         volumes: list[str] = [],
         workers: int = 1,
         process_names: list[str] = [],
+        mz_service: str = "materialized",
     ) -> None:
         environment = [
             "CLUSTERD_LOG_FILTER",
             f"CLUSTERD_GRPC_HOST={name}",
+            "CLUSTERD_USE_CTP=true",
             "MZ_SOFT_ASSERTIONS=1",
+            "MZ_EAT_MY_DATA=1",
+            f"CLUSTERD_PERSIST_PUBSUB_URL=http://{mz_service}:6879",
             *environment_extra,
         ]
 

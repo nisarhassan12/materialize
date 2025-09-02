@@ -14,12 +14,14 @@ Runs the Rust-based unit tests in Debug mode.
 import json
 import multiprocessing
 import os
+import shutil
 import subprocess
 
 from materialize import MZ_ROOT, buildkite, rustc_flags, spawn, ui
 from materialize.cli.run import SANITIZER_TARGET
 from materialize.mzcompose.composition import Composition, WorkflowArgumentParser
-from materialize.mzcompose.services.azure import Azurite
+from materialize.mzcompose.services.azurite import Azurite
+from materialize.mzcompose.services.clusterd import Clusterd
 from materialize.mzcompose.services.kafka import Kafka
 from materialize.mzcompose.services.minio import Minio
 from materialize.mzcompose.services.postgres import (
@@ -29,6 +31,7 @@ from materialize.mzcompose.services.postgres import (
 from materialize.mzcompose.services.schema_registry import SchemaRegistry
 from materialize.mzcompose.services.zookeeper import Zookeeper
 from materialize.rustc_flags import Sanitizer
+from materialize.util import PropagatingThread
 from materialize.xcompile import Arch, target
 
 SERVICES = [
@@ -44,7 +47,7 @@ SERVICES = [
         ],
     ),
     SchemaRegistry(),
-    Postgres(image="postgres:14.2"),
+    Postgres(),
     CockroachOrPostgresMetadata(),
     Minio(
         # We need a stable port exposed to the host since we can't pass any arguments
@@ -57,6 +60,7 @@ SERVICES = [
         ports=["40111:10000"],
         allow_host_ports=True,
     ),
+    Clusterd(),  # Only to attempt to download the binary
 ]
 
 
@@ -83,7 +87,9 @@ def workflow_default(c: Composition, parser: WorkflowArgumentParser) -> None:
     postgres_url = (
         f"postgres://postgres:postgres@localhost:{c.default_port('postgres')}"
     )
-    cockroach_url = f"postgres://root@localhost:{c.default_port(c.metadata_store())}"
+    metadata_backend_url = (
+        f"postgres://root@localhost:{c.default_port(c.metadata_store())}"
+    )
 
     env = dict(
         os.environ,
@@ -91,17 +97,18 @@ def workflow_default(c: Composition, parser: WorkflowArgumentParser) -> None:
         KAFKA_ADDRS="localhost:30123",
         SCHEMA_REGISTRY_URL=f"http://localhost:{c.default_port('schema-registry')}",
         POSTGRES_URL=postgres_url,
-        COCKROACH_URL=cockroach_url,
+        METADATA_BACKEND_URL=metadata_backend_url,
         MZ_SOFT_ASSERTIONS="1",
         MZ_PERSIST_EXTERNAL_STORAGE_TEST_S3_BUCKET="mz-test-persist-1d-lifecycle-delete",
         MZ_S3_UPLOADER_TEST_S3_BUCKET="mz-test-1d-lifecycle-delete",
         MZ_PERSIST_EXTERNAL_STORAGE_TEST_AZURE_CONTAINER="mz-test-azure",
-        MZ_PERSIST_EXTERNAL_STORAGE_TEST_POSTGRES_URL=cockroach_url,
+        MZ_PERSIST_EXTERNAL_STORAGE_TEST_POSTGRES_URL=metadata_backend_url,
     )
 
     coverage = ui.env_is_truthy("CI_COVERAGE_ENABLED")
     sanitizer = Sanitizer[os.getenv("CI_SANITIZER", "none")]
     extra_env = {}
+    clusterd_thread: PropagatingThread | None = None
 
     if coverage:
         # TODO(def-): For coverage inside of clusterd called from unit tests need
@@ -219,28 +226,85 @@ def workflow_default(c: Composition, parser: WorkflowArgumentParser) -> None:
                     ],
                 )
             else:
-                spawn.runv(
-                    [
-                        "cargo",
-                        "build",
-                        "--workspace",
-                        "--bin",
-                        "clusterd",
-                        "--profile=ci",
-                    ],
-                    env=env,
+                assert (
+                    buildkite.get_parallelism_count() <= 2
+                ), "Special handling of parallelism, only 1 and 2 supported"
+                if (
+                    buildkite.get_parallelism_count() == 1
+                    or buildkite.get_parallelism_index() == 0
+                ):
+
+                    def worker() -> None:
+                        clusterd = c.compose["services"]["clusterd"]
+                        try:
+                            subprocess.run(
+                                ["docker", "pull", clusterd["image"]],
+                                check=True,
+                                capture_output=True,
+                                stdin=subprocess.DEVNULL,
+                            )
+                            container_id = subprocess.check_output(
+                                ["docker", "create", clusterd["image"]], text=True
+                            ).strip()
+                            target_dir = os.getenv("CARGO_TARGET_DIR", "target") + "/ci"
+                            os.makedirs(target_dir, exist_ok=True)
+                            subprocess.run(
+                                [
+                                    "docker",
+                                    "cp",
+                                    f"{container_id}:/usr/local/bin/clusterd",
+                                    target_dir,
+                                ],
+                                check=True,
+                            )
+                        except subprocess.CalledProcessError as e:
+                            print(f"Failed to get clusterd image: {e}")
+                            target_dir = os.getenv("CARGO_TARGET_DIR", "target")
+                            clusterd_target_dir = target_dir + "/ci-clusterd"
+                            spawn.runv(
+                                [
+                                    "cargo",
+                                    "build",
+                                    "--workspace",
+                                    "--bin",
+                                    "clusterd",
+                                    "--profile=ci",
+                                ],
+                                env={**env, "CARGO_TARGET_DIR": clusterd_target_dir},
+                            )
+                            shutil.copy(
+                                clusterd_target_dir + "/ci/clusterd",
+                                target_dir + "/ci/",
+                            )
+
+                    clusterd_thread = PropagatingThread(target=worker)
+                    clusterd_thread.start()
+                    spawn.runv(
+                        [
+                            "cargo",
+                            "nextest",
+                            "run",
+                            "--no-run",
+                            "--all-features",
+                            "--cargo-profile=ci",
+                            "--profile=ci",
+                            *(
+                                ["--package=mz-environmentd", "--package=mz-balancerd"]
+                                if buildkite.get_parallelism_count() == 2
+                                else ["--workspace"]
+                            ),
+                        ],
+                        env=env,
+                    )
+                    clusterd_thread.join()
+
+            metadata = json.loads(
+                subprocess.check_output(
+                    ["cargo", "metadata", "--no-deps", "--format-version=1"]
                 )
-
-            partition = buildkite.get_parallelism_index() + 1
-            total = buildkite.get_parallelism_count()
-
+            )
             if sanitizer != Sanitizer.none:
                 # Can't just use --workspace because of https://github.com/rust-lang/cargo/issues/7160
-                metadata = json.loads(
-                    subprocess.check_output(
-                        ["cargo", "metadata", "--no-deps", "--format-version=1"]
-                    )
-                )
                 for pkg in metadata["packages"]:
                     try:
                         spawn.runv(
@@ -262,7 +326,6 @@ def workflow_default(c: Composition, parser: WorkflowArgumentParser) -> None:
                                 "--no-default-features",
                                 "--profile=sanitizer",
                                 "--cargo-profile=ci",
-                                f"--partition=count:{partition}/{total}",
                                 # We want all tests to run
                                 "--no-fail-fast",
                                 "-Zbuild-std",
@@ -276,17 +339,34 @@ def workflow_default(c: Composition, parser: WorkflowArgumentParser) -> None:
                         print(f"Test against package {pkg['name']} failed, continuing")
 
             else:
+                pkgs = [
+                    f"--package={p['name']}"
+                    for p in metadata["packages"]
+                    if p["name"] not in ("mz-environmentd", "mz-balancerd")
+                ]
                 spawn.runv(
                     [
                         "cargo",
                         "nextest",
                         "run",
-                        "--workspace",
+                        # We want all tests to run
+                        "--no-fail-fast",
                         "--all-features",
                         "--profile=ci",
                         "--cargo-profile=ci",
                         f"--test-threads={multiprocessing.cpu_count() * 2}",
-                        f"--partition=count:{partition}/{total}",
+                        *(
+                            (
+                                pkgs
+                                if buildkite.get_parallelism_index() == 1
+                                else [
+                                    "--package=mz-environmentd",
+                                    "--package=mz-balancerd",
+                                ]
+                            )
+                            if buildkite.get_parallelism_count() == 2
+                            else ["--workspace"]
+                        ),
                         *args.args,
                     ],
                     env=env,

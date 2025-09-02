@@ -68,10 +68,16 @@ pub const ARRANGEMENT_EXERT_PROPORTIONALITY: Config<u32> = Config::new(
     "Value that controls how much merge effort to exert on arrangements.",
 );
 
-pub const ENABLE_TIMELY_INIT_AT_PROCESS_STARTUP: Config<bool> = Config::new(
-    "enable_timely_init_at_process_startup",
+pub const ENABLE_CTP_CLUSTER_PROTOCOLS: Config<bool> = Config::new(
+    "enable_ctp_cluster_protocols",
     true,
-    "Whether to initialize the Timely runtime at clusterd process startup.",
+    "Enable CTP (instead of gRPC) for the compute and storage cluster protocols.",
+);
+
+pub const ENABLE_PAUSED_CLUSTER_READHOLD_DOWNGRADE: Config<bool> = Config::new(
+    "enable_paused_cluster_readhold_downgrade",
+    true,
+    "Aggressively downgrade input read holds for indexes on zero-replica clusters.",
 );
 
 /// Adds the full set of all controller `Config`s.
@@ -86,5 +92,6 @@ pub fn all_dyncfgs(configs: ConfigSet) -> ConfigSet {
         .add(&ENABLE_TIMELY_ZERO_COPY_LGALLOC)
         .add(&TIMELY_ZERO_COPY_LIMIT)
         .add(&ARRANGEMENT_EXERT_PROPORTIONALITY)
-        .add(&ENABLE_TIMELY_INIT_AT_PROCESS_STARTUP)
+        .add(&ENABLE_CTP_CLUSTER_PROTOCOLS)
+        .add(&ENABLE_PAUSED_CLUSTER_READHOLD_DOWNGRADE)
 }

@@ -14,16 +14,9 @@
 $ sql-server-connect name=sql-server
 server=tcp:sql-server,1433;IntegratedSecurity=true;TrustServerCertificate=true;User ID=${arg.default-sql-server-user};Password=${arg.default-sql-server-password}
 
-$ sql-server-execute name=sql-server
-DROP DATABASE IF EXISTS test_40;
-CREATE DATABASE test_40;
-USE test_40;
-
-EXEC sys.sp_cdc_enable_db;
-ALTER DATABASE test_40 SET ALLOW_SNAPSHOT_ISOLATION ON;
-
 # Integer types.
-
+$ sql-server-execute name=sql-server
+USE test;
 CREATE TABLE table_tinyint (val tinyint);
 INSERT INTO table_tinyint VALUES (0), (1), (2), (100), (254), (255), (NULL);
 EXEC sys.sp_cdc_enable_table @source_schema = 'dbo', @source_name = 'table_tinyint', @role_name = 'SA', @supports_net_changes = 0;
@@ -102,22 +95,31 @@ EXEC sys.sp_cdc_enable_table @source_schema = 'dbo', @source_name = 'table_nvarc
 > CREATE SECRET IF NOT EXISTS sql_server_pass AS '${arg.default-sql-server-password}'
 
 $ postgres-execute connection=postgres://mz_system:materialize@${testdrive.materialize-internal-sql-addr}
-ALTER SYSTEM SET enable_sql_server_source = true;
-
-$ postgres-execute connection=postgres://mz_system:materialize@${testdrive.materialize-internal-sql-addr}
 ALTER SYSTEM SET log_filter = 'mz_storage::source::sql_server=debug,mz_sql_server_util=debug,info';
 
 > CREATE CONNECTION sql_server_test_40_connection TO SQL SERVER (
     HOST 'sql-server',
     PORT 1433,
-    DATABASE test_40,
+    DATABASE test,
     USER '${arg.default-sql-server-user}',
     PASSWORD = SECRET sql_server_pass
   );
 
+# TODO - SQL server delay because it's terrible for testing and the initial_lsn selection
+# may happen faster than CDC manages to process the above updates
+$ sleep-is-probably-flaky-i-have-justified-my-need-with-a-comment duration=5s
+
 > CREATE SOURCE test_40_data_types
   FROM SQL SERVER CONNECTION sql_server_test_40_connection
   FOR ALL TABLES;
+
+
+# Wait until snapshot has emitted stats and then insert a new row
+# to force LSN in MS SQL to progress.
+> SELECT s.name, ss.snapshot_records_known = ss.snapshot_records_staged
+  FROM mz_internal.mz_source_statistics ss JOIN mz_sources s using (id)
+  WHERE s.name = 'test_40_data_types' AND ss.snapshot_records_staged > 0;
+test_40_data_types true
 
 > SELECT * FROM table_tinyint ORDER BY val ASC;
 0
@@ -274,3 +276,5 @@ true
 "🦀🚀🦀🚀🦀🚀🦀🚀🦀🚀🦀🚀🦀🚀"
 "💯💯💯💯💯💯💯💯💯"
 <null>
+
+> DROP SOURCE test_40_data_types CASCADE;

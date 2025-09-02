@@ -130,7 +130,7 @@ pub enum ControllerResponse<T = mz_repr::Timestamp> {
 /// Whether one of the underlying controllers is ready for their `process`
 /// method to be called.
 #[derive(Debug, Default)]
-enum Readiness<T> {
+pub enum Readiness<T> {
     /// No underlying controllers are ready.
     #[default]
     NotReady,
@@ -183,7 +183,7 @@ pub struct Controller<T: ComputeControllerTimestamp = mz_repr::Timestamp> {
     /// A map associating a global ID to the set of all the unfulfilled watch
     /// set ids that include it.
     ///
-    /// See [`self.install_watch_set`] for a description of watch sets.
+    /// See [`Controller::install_compute_watch_set`]/[`Controller::install_storage_watch_set`] for a description of watch sets.
     // When a watch set is fulfilled for a given object (that is, when
     // the object's frontier advances to at least the watch set's
     // timestamp), the corresponding entry will be removed from the set.
@@ -195,9 +195,9 @@ pub struct Controller<T: ComputeControllerTimestamp = mz_repr::Timestamp> {
 
     /// A list of watch sets that were already fulfilled as soon as
     /// they were installed, and thus that must be returned to the
-    /// client on the next call to [`self.process`].
+    /// client on the next call to [`Controller::process_compute_response`]/[`Controller::process_storage_response`].
     ///
-    /// See [`self.install_watch_set`] for a description of watch sets.
+    /// See [`Controller::install_compute_watch_set`]/[`Controller::install_storage_watch_set`] for a description of watch sets.
     immediate_watch_sets: Vec<WatchSetId>,
 
     /// Dynamic system configuration.
@@ -364,6 +364,11 @@ where
                 }
             }
         }
+    }
+
+    /// Returns the [Readiness] status of this controller.
+    pub fn get_readiness(&self) -> &Readiness<T> {
+        &self.readiness
     }
 
     /// Install a _watch set_ in the controller.

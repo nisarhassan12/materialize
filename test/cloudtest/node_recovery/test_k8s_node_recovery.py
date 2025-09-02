@@ -14,7 +14,7 @@ import pytest
 
 from materialize.cloudtest.app.materialize_application import MaterializeApplication
 
-TD_TIMEOUT_SHORT = 80
+TD_TIMEOUT_SHORT = 10
 TD_TIMEOUT_FULL_RECOVERY = 660
 
 
@@ -37,7 +37,7 @@ class ClusterDefinition:
         replica_definitions = []
         for replica in self.replica_definitions:
             replica_definitions.append(
-                f"{replica.get_name()} (SIZE = '1', AVAILABILITY ZONE '{replica.availability_zone}')"
+                f"{replica.get_name()} (SIZE = 'scale=1,workers=1', AVAILABILITY ZONE '{replica.availability_zone}')"
             )
 
         return ", ".join(replica_definitions)
@@ -69,6 +69,15 @@ def populate(
     compute_cluster: ClusterDefinition,
     storage_cluster: ClusterDefinition,
 ) -> None:
+    # Make sure the `quickstart` cluster replica gets is scheduled on its own
+    # node, so queries still work when a node running a compute/storage replica
+    # is suspended.
+    mz.environmentd.sql(
+        "ALTER CLUSTER quickstart SET (AVAILABILITY ZONES ('quickstart'))",
+        port="internal",
+        user="mz_system",
+    )
+
     all_clusters = [compute_cluster, storage_cluster]
 
     drop_cluster_statements = [
@@ -131,7 +140,7 @@ def validate_state(
     comparison_operator = ">" if must_exceed_reached_index else ">="
     print(f"Expect '{expected_state}' within timeout of {timeout_in_sec}s")
 
-    testdrive_run_timeout_in_sec = 10
+    testdrive_run_timeout_in_sec = 20
 
     validation_succeeded = False
     last_error_message = None

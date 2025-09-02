@@ -7,7 +7,7 @@
 # the Business Source License, use of this software will be governed
 # by the Apache License, Version 2.0.
 
-from materialize.mzcompose.composition import Composition
+from materialize.mzcompose.composition import Composition, Service
 from materialize.mzcompose.services.materialized import Materialized
 from materialize.mzcompose.services.mysql import MySql
 from materialize.mzcompose.services.postgres import Postgres
@@ -19,7 +19,7 @@ SERVICES = [
     Postgres(),
     MySql(),
     Testdrive(),
-    Materialized(),
+    Materialized(system_parameter_defaults={"enable_rbac_checks": "false"}),
 ]
 
 
@@ -29,5 +29,5 @@ def workflow_default(c: Composition) -> None:
         "postgres",
         "mysql",
         "materialized",
+        Service("testdrive", idle=True),
     )
-    c.up("testdrive", persistent=True)

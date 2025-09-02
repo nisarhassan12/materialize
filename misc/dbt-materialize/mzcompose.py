@@ -11,11 +11,16 @@
 Basic test for the Data build tool (dbt) integration of Materialize
 """
 
+import os
 from dataclasses import dataclass
 from textwrap import dedent
 from typing import Dict, List, Optional
 
-from materialize.mzcompose.composition import Composition, WorkflowArgumentParser
+from materialize.mzcompose.composition import (
+    Composition,
+    Service,
+    WorkflowArgumentParser,
+)
 from materialize.mzcompose.services.dbt import Dbt
 from materialize.mzcompose.services.materialized import Materialized
 from materialize.mzcompose.services.redpanda import Redpanda
@@ -56,6 +61,8 @@ def workflow_default(c: Composition, parser: WorkflowArgumentParser) -> None:
     parser.add_argument("-s", action="store_true", help="don't suppress output")
     args = parser.parse_args()
 
+    c.up(Service("dbt", idle=True))
+
     for test_case in test_cases:
         if args.filter in test_case.name:
             print(f"> Running test case {test_case.name}")
@@ -77,9 +84,11 @@ def workflow_default(c: Composition, parser: WorkflowArgumentParser) -> None:
             with c.test_case(test_case.name):
                 with c.override(materialized):
                     c.down()
-                    c.up("redpanda")
-                    c.up("materialized")
-                    c.up("testdrive", persistent=True)
+                    c.up(
+                        "redpanda",
+                        "materialized",
+                        Service("testdrive", idle=True),
+                    )
 
                     # Create a topic that some tests rely on
                     c.testdrive(
@@ -132,6 +141,8 @@ def workflow_default(c: Composition, parser: WorkflowArgumentParser) -> None:
                     c.run(
                         "dbt",
                         "pytest",
+                        f"--splits={os.getenv('BUILDKITE_PARALLEL_JOB_COUNT', 1)}",
+                        f"--group={int(os.getenv('BUILDKITE_PARALLEL_JOB', 0)) + 1}",
                         *test_args,
                         env_extra={
                             "DBT_HOST": "materialized",

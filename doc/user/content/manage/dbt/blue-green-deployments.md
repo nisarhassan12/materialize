@@ -52,7 +52,7 @@ These environments are later swapped transparently.
 <br>
 
 1. In `dbt_project.yml`, use the `deployment` variable to specify the cluster(s)
-   and schema(s) that contain the changes you want to deploy.
+   and schema(s) that contain the changes you want to deploy. The dedicated schemas and clusters for sinks shouldn't be included in your deployment configuration.
 
     ```yaml
     vars:
@@ -89,6 +89,8 @@ These environments are later swapped transparently.
     the original schema or cluster specified for each model scoped for
     deployment, which transparently handles running that subset of models
     against the deployment environment.
+
+    You must [exclude sources and sinks](/manage/dbt/development-workflows/#exclude-sources-and-sinks) when running the dbt project.
 
     {{< callout >}}
   If you encounter an error like `String 'deploy:' is not valid YAML`, you

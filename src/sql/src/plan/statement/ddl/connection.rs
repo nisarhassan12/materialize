@@ -34,14 +34,15 @@ use mz_storage_types::connections::inline::ReferencedConnection;
 use mz_storage_types::connections::string_or_secret::StringOrSecret;
 use mz_storage_types::connections::{
     AwsPrivatelink, AwsPrivatelinkConnection, CsrConnection, CsrConnectionHttpAuth,
-    KafkaConnection, KafkaSaslConfig, KafkaTlsConfig, KafkaTopicOptions, MySqlConnection,
-    MySqlSslMode, PostgresConnection, SqlServerConnectionDetails, SshConnection, SshTunnel,
-    TlsIdentity, Tunnel,
+    IcebergCatalogConnection, IcebergCatalogImpl, IcebergCatalogType, KafkaConnection,
+    KafkaSaslConfig, KafkaTlsConfig, KafkaTopicOptions, MySqlConnection, MySqlSslMode,
+    PostgresConnection, RestIcebergCatalog, S3TablesRestIcebergCatalog, SqlServerConnectionDetails,
+    SshConnection, SshTunnel, TlsIdentity, Tunnel,
 };
 
 use crate::names::Aug;
 use crate::plan::statement::{Connection, ResolvedItemName};
-use crate::plan::with_options;
+use crate::plan::with_options::{self};
 use crate::plan::{ConnectionDetails, PlanError, SshKey, StatementContext};
 use crate::session::vars::{self, ENABLE_AWS_MSK_IAM_AUTH};
 
@@ -56,6 +57,7 @@ generate_extracted_config!(
     // (AwsPrivatelink, with_options::Object),
     (Broker, Vec<KafkaBroker<Aug>>),
     (Brokers, Vec<KafkaBroker<Aug>>),
+    (Credential, StringOrSecret),
     (Database, String),
     (Endpoint, String),
     (Host, String),
@@ -69,6 +71,7 @@ generate_extracted_config!(
     (SaslMechanisms, String),
     (SaslPassword, with_options::Secret),
     (SaslUsername, StringOrSecret),
+    (Scope, String),
     (SecretAccessKey, with_options::Secret),
     (SecurityProtocol, String),
     (ServiceName, String),
@@ -78,8 +81,10 @@ generate_extracted_config!(
     (SslKey, with_options::Secret),
     (SslMode, String),
     (SessionToken, StringOrSecret),
+    (CatalogType, IcebergCatalogType),
     (Url, String),
-    (User, StringOrSecret)
+    (User, StringOrSecret),
+    (Warehouse, String)
 );
 
 generate_extracted_config!(
@@ -178,6 +183,14 @@ pub(super) fn validate_options_per_connection_type(
             SslKey,
             SslMode,
             User,
+        ],
+        CreateConnectionType::IcebergCatalog => &[
+            AwsConnection,
+            CatalogType,
+            Credential,
+            Scope,
+            Url,
+            Warehouse,
         ],
     };
 
@@ -360,7 +373,7 @@ impl ConnectionOptionExtracted {
                 if let Some(privatelink) = self.aws_privatelink.as_ref() {
                     if privatelink.port.is_some() {
                         sql_bail!(
-                            "invalid CONNECTION: PORT in AWS PRIVATELINK is only supported for kafka"
+                            "invalid CONNECTION: CONFLUENT SCHEMA REGISTRY does not support PORT for AWS PRIVATELINK"
                         )
                     }
                 }
@@ -406,7 +419,7 @@ impl ConnectionOptionExtracted {
                 if let Some(privatelink) = self.aws_privatelink.as_ref() {
                     if privatelink.port.is_some() {
                         sql_bail!(
-                            "invalid CONNECTION: PORT in AWS PRIVATELINK is only supported for kafka"
+                            "invalid CONNECTION: POSTGRES does not support PORT for AWS PRIVATELINK"
                         )
                     }
                 }
@@ -512,7 +525,7 @@ impl ConnectionOptionExtracted {
                 if let Some(privatelink) = self.aws_privatelink.as_ref() {
                     if privatelink.port.is_some() {
                         sql_bail!(
-                            "invalid CONNECTION: PORT in AWS PRIVATELINK is only supported for kafka"
+                            "invalid CONNECTION: MYSQL does not support PORT for AWS PRIVATELINK"
                         )
                     }
                 }
@@ -538,17 +551,53 @@ impl ConnectionOptionExtracted {
                 scx.require_feature_flag(&vars::ENABLE_SQL_SERVER_SOURCE)?;
 
                 let aws_connection = get_aws_connection_reference(scx, &self)?;
-                // TODO(sql_server2): Support AWS connections for SQL Server. Nothing fundamental
-                // prevents this, just need to wire it up.
-                if aws_connection.is_some() {
-                    return Err(PlanError::Unsupported {
-                        feature: "AWS CONNECTION with SQL Server".to_string(),
-                        discussion_no: None,
-                    });
+                if aws_connection.is_some() && self.password.is_some() {
+                    sql_bail!(
+                        "invalid CONNECTION: AWS IAM authentication is not supported with password"
+                    );
                 }
 
-                // TODO(sql_server2): Parse the encryption level from the create SQL.
-                let encryption = mz_sql_server_util::config::EncryptionLevel::Preferred;
+                let (encryption, certificate_validation_policy) = match self
+                    .ssl_mode
+                    .map(|mode| mode.to_uppercase())
+                    .as_ref()
+                    .map(|mode| mode.as_str())
+                {
+                    None | Some("DISABLED") => (
+                        mz_sql_server_util::config::EncryptionLevel::None,
+                        mz_sql_server_util::config::CertificateValidationPolicy::TrustAll,
+                    ),
+                    Some("REQUIRED") => (
+                        mz_sql_server_util::config::EncryptionLevel::Required,
+                        mz_sql_server_util::config::CertificateValidationPolicy::TrustAll,
+                    ),
+                    Some("VERIFY") => (
+                        mz_sql_server_util::config::EncryptionLevel::Required,
+                        mz_sql_server_util::config::CertificateValidationPolicy::VerifySystem,
+                    ),
+                    Some("VERIFY_CA") => {
+                        if self.ssl_certificate_authority.is_none() {
+                            sql_bail!(
+                                "invalid CONNECTION: SSL MODE 'verify_ca' requires SSL CERTIFICATE AUTHORITY"
+                            );
+                        }
+                        (
+                            mz_sql_server_util::config::EncryptionLevel::Required,
+                            mz_sql_server_util::config::CertificateValidationPolicy::VerifyCA,
+                        )
+                    }
+                    Some(mode) => {
+                        sql_bail!("invalid CONNECTION: unknown SSL MODE {}", mode.quoted())
+                    }
+                };
+
+                if let Some(privatelink) = self.aws_privatelink.as_ref() {
+                    if privatelink.port.is_some() {
+                        sql_bail!(
+                            "invalid CONNECTION: SQL SERVER does not support PORT for AWS PRIVATELINK"
+                        )
+                    }
+                }
 
                 // 1433 is the default port for SQL Server instances running over TCP.
                 //
@@ -573,7 +622,60 @@ impl ConnectionOptionExtracted {
                         .map(|pass| pass.into())?,
                     tunnel,
                     encryption,
+                    certificate_validation_policy,
+                    tls_root_cert: self.ssl_certificate_authority,
                 })
+            }
+            CreateConnectionType::IcebergCatalog => {
+                let catalog_type = self.catalog_type.clone().ok_or_else(|| {
+                    sql_err!("invalid CONNECTION: ICEBERG connections must specify CATALOG TYPE")
+                })?;
+
+                let uri: reqwest::Url = match &self.url {
+                    Some(url) => url
+                        .parse()
+                        .map_err(|e| sql_err!("parsing Iceberg catalog url: {e}"))?,
+                    None => sql_bail!("invalid CONNECTION: must specify URL"),
+                };
+
+                let warehouse = self.warehouse.clone();
+                let credential = self.credential.clone();
+                let aws_connection = get_aws_connection_reference(scx, &self)?;
+
+                let catalog = match catalog_type {
+                    IcebergCatalogType::S3TablesRest => {
+                        let Some(warehouse) = warehouse else {
+                            sql_bail!(
+                                "invalid CONNECTION: ICEBERG s3tablesrest connections must specify WAREHOUSE"
+                            );
+                        };
+                        let Some(aws_connection) = aws_connection else {
+                            sql_bail!(
+                                "invalid CONNECTION: ICEBERG s3tablesrest connections require an AWS connection"
+                            );
+                        };
+
+                        IcebergCatalogImpl::S3TablesRest(S3TablesRestIcebergCatalog {
+                            aws_connection,
+                            warehouse,
+                        })
+                    }
+                    IcebergCatalogType::Rest => {
+                        let Some(credential) = credential else {
+                            sql_bail!(
+                                "invalid CONNECTION: ICEBERG rest connections require a CREDENTIAL"
+                            );
+                        };
+
+                        IcebergCatalogImpl::Rest(RestIcebergCatalog {
+                            credential,
+                            scope: self.scope.clone(),
+                            warehouse,
+                        })
+                    }
+                };
+
+                ConnectionDetails::IcebergCatalog(IcebergCatalogConnection { catalog, uri })
             }
         };
 

@@ -14,7 +14,7 @@ use std::time::Duration;
 
 use mz_dyncfg::Config;
 use mz_ore::future::InTask;
-use mz_proto::{IntoRustIfSome, RustType};
+use mz_proto::{IntoRustIfSome, RustType, TryFromProtoError};
 use mz_repr::{CatalogItemId, Datum, GlobalId, RelationDesc, Row, ScalarType};
 use mz_sql_server_util::cdc::Lsn;
 use proptest_derive::Arbitrary;
@@ -34,11 +34,11 @@ include!(concat!(
     "/mz_storage_types.sources.sql_server.rs"
 ));
 
-pub const SNAPSHOT_MAX_LSN_WAIT: Config<Duration> = Config::new(
-    "sql_server_snapshot_max_lsn_wait",
+pub const MAX_LSN_WAIT: Config<Duration> = Config::new(
+    "sql_server_max_lsn_wait",
     Duration::from_secs(30),
     "Maximum amount of time we'll wait for SQL Server to report an LSN (in other words for \
-    CDC to be fully enabled) before taking an initial snapshot.",
+    CDC to be fully enabled)",
 );
 
 pub const SNAPSHOT_PROGRESS_REPORT_INTERVAL: Config<Duration> = Config::new(
@@ -55,7 +55,7 @@ pub const CDC_POLL_INTERVAL: Config<Duration> = Config::new(
 
 pub const CDC_CLEANUP_CHANGE_TABLE: Config<bool> = Config::new(
     "sql_server_cdc_cleanup_change_table",
-    true,
+    false,
     "When enabled we'll notify SQL Server that it can cleanup the change tables \
     as the source makes progress and commits data.",
 );
@@ -75,7 +75,7 @@ pub const CDC_CLEANUP_CHANGE_TABLE_MAX_DELETES: Config<u32> = Config::new(
 
 pub const OFFSET_KNOWN_INTERVAL: Config<Duration> = Config::new(
     "sql_server_offset_known_interval",
-    Duration::from_secs(10),
+    Duration::from_secs(1),
     "Interval to fetch `offset_known`, from `sys.fn_cdc_get_max_lsn()`",
 );
 
@@ -245,21 +245,34 @@ impl RustType<ProtoSqlServerSource> for SqlServerSource {
 /// It's currently unused but we keep the struct around to maintain conformity
 /// with other sources.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, Arbitrary)]
-pub struct SqlServerSourceExtras {}
+pub struct SqlServerSourceExtras {
+    /// The most recent `restore_history_id` field from msdb.dbo.restorehistory. A change in this
+    /// value indicates the upstream SQL server has been restored.
+    /// See: <https://learn.microsoft.com/en-us/sql/relational-databases/system-tables/restorehistory-transact-sql?view=sql-server-ver17>
+    pub restore_history_id: Option<i32>,
+}
 
 impl AlterCompatible for SqlServerSourceExtras {
-    fn alter_compatible(&self, _id: GlobalId, _other: &Self) -> Result<(), AlterError> {
+    fn alter_compatible(&self, id: GlobalId, other: &Self) -> Result<(), AlterError> {
+        if self.restore_history_id != other.restore_history_id {
+            tracing::warn!(?self, ?other, "SqlServerSourceExtras incompatible");
+            return Err(AlterError { id });
+        }
         Ok(())
     }
 }
 
 impl RustType<ProtoSqlServerSourceExtras> for SqlServerSourceExtras {
     fn into_proto(&self) -> ProtoSqlServerSourceExtras {
-        ProtoSqlServerSourceExtras {}
+        ProtoSqlServerSourceExtras {
+            restore_history_id: self.restore_history_id.clone(),
+        }
     }
 
-    fn from_proto(_proto: ProtoSqlServerSourceExtras) -> Result<Self, mz_proto::TryFromProtoError> {
-        Ok(SqlServerSourceExtras {})
+    fn from_proto(proto: ProtoSqlServerSourceExtras) -> Result<Self, mz_proto::TryFromProtoError> {
+        Ok(SqlServerSourceExtras {
+            restore_history_id: proto.restore_history_id,
+        })
     }
 }
 
@@ -274,6 +287,10 @@ pub struct SqlServerSourceExportDetails {
     pub text_columns: Vec<String>,
     /// Columns from the upstream source that should be excluded.
     pub exclude_columns: Vec<String>,
+    /// The initial 'LSN' for this export.
+    /// This is used as a consistent snapshot point for this export to ensure
+    /// correctness in the case of multiple replicas.
+    pub initial_lsn: mz_sql_server_util::cdc::Lsn,
 }
 
 impl RustType<ProtoSqlServerSourceExportDetails> for SqlServerSourceExportDetails {
@@ -283,6 +300,7 @@ impl RustType<ProtoSqlServerSourceExportDetails> for SqlServerSourceExportDetail
             table: Some(self.table.into_proto()),
             text_columns: self.text_columns.clone(),
             exclude_columns: self.exclude_columns.clone(),
+            initial_lsn: self.initial_lsn.as_bytes().to_vec(),
         }
     }
 
@@ -296,6 +314,8 @@ impl RustType<ProtoSqlServerSourceExportDetails> for SqlServerSourceExportDetail
                 .into_rust_if_some("ProtoSqlServerSourceExportDetails::table")?,
             text_columns: proto.text_columns,
             exclude_columns: proto.exclude_columns,
+            initial_lsn: mz_sql_server_util::cdc::Lsn::try_from(proto.initial_lsn.as_ref())
+                .map_err(|e| TryFromProtoError::InvalidFieldError(e.to_string()))?,
         })
     }
 }

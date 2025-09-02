@@ -37,6 +37,7 @@ $ kafka-ingest format=avro topic=non-dbz-data schema=${non-dbz-schema} timestamp
 > CREATE CONNECTION kafka_conn
   TO KAFKA (BROKER '${testdrive.kafka-addr}', SECURITY PROTOCOL PLAINTEXT);
 
+> BEGIN
 > CREATE SOURCE non_dbz_data
   IN CLUSTER ${arg.single-replica-cluster}
   FROM KAFKA CONNECTION kafka_conn (TOPIC 'testdrive-non-dbz-data-${testdrive.seed}')
@@ -44,6 +45,7 @@ $ kafka-ingest format=avro topic=non-dbz-data schema=${non-dbz-schema} timestamp
 > CREATE TABLE non_dbz_data_tbl FROM SOURCE non_dbz_data (REFERENCE "testdrive-non-dbz-data-${testdrive.seed}")
   FORMAT AVRO USING SCHEMA '${non-dbz-schema}'
   ENVELOPE NONE
+> COMMIT
 
 > CREATE MATERIALIZED VIEW monotonic_min AS SELECT a, min(b) FROM non_dbz_data_tbl group by a
 
@@ -90,13 +92,13 @@ Explained Query:
       Get::PassArrangements materialize.public.i1
         raw=false
         arrangements[0]={ key=[#0{b}], permutation=id, thinning=() }
-        types=[bigint]
 
 Used Indexes:
   - materialize.public.i1_primary_idx (*** full scan ***)
 
 Target cluster: quickstart
 
+> BEGIN
 > CREATE SOURCE non_dbz_data_indexed
   IN CLUSTER ${arg.single-replica-cluster}
   FROM KAFKA CONNECTION kafka_conn (TOPIC 'testdrive-non-dbz-data-${testdrive.seed}')
@@ -104,6 +106,7 @@ Target cluster: quickstart
 > CREATE TABLE non_dbz_data_indexed_tbl FROM SOURCE non_dbz_data_indexed (REFERENCE "testdrive-non-dbz-data-${testdrive.seed}")
   FORMAT AVRO USING SCHEMA '${non-dbz-schema}'
   ENVELOPE NONE
+> COMMIT
 
 > CREATE DEFAULT INDEX ON non_dbz_data_indexed
 
@@ -137,7 +140,6 @@ Explained Query:
       Get::PassArrangements materialize.public.i4
         raw=false
         arrangements[0]={ key=[#0{c}], permutation=id, thinning=() }
-        types=[bigint]
 
 Used Indexes:
   - materialize.public.i4_primary_idx (*** full scan ***)
@@ -160,7 +162,6 @@ Explained Query:
       Get::PassArrangements materialize.public.i6
         raw=false
         arrangements[0]={ key=[#0{c}], permutation=id, thinning=() }
-        types=[bigint]
 
 Used Indexes:
   - materialize.public.i6_primary_idx (*** full scan ***)
@@ -186,7 +187,6 @@ Explained Query:
       Get::PassArrangements materialize.public.i9
         raw=false
         arrangements[0]={ key=[#0{b}], permutation=id, thinning=() }
-        types=[bigint]
 
 Used Indexes:
   - materialize.public.i9_primary_idx (*** full scan ***)
@@ -280,17 +280,17 @@ Target cluster: quickstart
 "Dataflow: materialize.public.monotonic_min" "Reduced Fallibly MinsMaxesHierarchical"
 "Dataflow: materialize.public.monotonic_min" "Reduced Fallibly MinsMaxesHierarchical"
 "Dataflow: materialize.public.monotonic_min" "Reduced Fallibly MinsMaxesHierarchical"
-"Dataflow: materialize.public.non_dbz_data_indexed_primary_idx" "ArrangeBy[[Column(0)]]"
-"Dataflow: materialize.public.non_dbz_data_indexed_primary_idx" "ArrangeBy[[Column(0)]]-errors"
-"Dataflow: materialize.public.i1_primary_idx" "ArrangeBy[[Column(0)]]"
-"Dataflow: materialize.public.i1_primary_idx" "ArrangeBy[[Column(0)]]-errors"
-"Dataflow: materialize.public.i4_primary_idx" "ArrangeBy[[Column(0)]]"
-"Dataflow: materialize.public.i4_primary_idx" "ArrangeBy[[Column(0)]]-errors"
-"Dataflow: materialize.public.i6_primary_idx" "ArrangeBy[[Column(0)]]"
-"Dataflow: materialize.public.i6_primary_idx" "ArrangeBy[[Column(0)]]-errors"
+"Dataflow: materialize.public.non_dbz_data_indexed_primary_idx" "ArrangeBy[[Column(0, \"value\")]]"
+"Dataflow: materialize.public.non_dbz_data_indexed_primary_idx" "ArrangeBy[[Column(0, \"value\")]]-errors"
+"Dataflow: materialize.public.i1_primary_idx" "ArrangeBy[[Column(0, \"b\")]]"
+"Dataflow: materialize.public.i1_primary_idx" "ArrangeBy[[Column(0, \"b\")]]-errors"
+"Dataflow: materialize.public.i4_primary_idx" "ArrangeBy[[Column(0, \"c\")]]"
+"Dataflow: materialize.public.i4_primary_idx" "ArrangeBy[[Column(0, \"c\")]]-errors"
+"Dataflow: materialize.public.i6_primary_idx" "ArrangeBy[[Column(0, \"c\")]]"
+"Dataflow: materialize.public.i6_primary_idx" "ArrangeBy[[Column(0, \"c\")]]-errors"
 "Dataflow: materialize.public.i6_primary_idx" "Arranged TopK input"
 "Dataflow: materialize.public.i6_primary_idx" "Reduced TopK input"
-"Dataflow: materialize.public.i8_primary_idx" "ArrangeBy[[Column(0)]]"
-"Dataflow: materialize.public.i8_primary_idx" "ArrangeBy[[Column(0)]]-errors"
-"Dataflow: materialize.public.i9_primary_idx" "ArrangeBy[[Column(0)]]"
-"Dataflow: materialize.public.i9_primary_idx" "ArrangeBy[[Column(0)]]-errors"
+"Dataflow: materialize.public.i8_primary_idx" "ArrangeBy[[Column(0, \"b\")]]"
+"Dataflow: materialize.public.i8_primary_idx" "ArrangeBy[[Column(0, \"b\")]]-errors"
+"Dataflow: materialize.public.i9_primary_idx" "ArrangeBy[[Column(0, \"b\")]]"
+"Dataflow: materialize.public.i9_primary_idx" "ArrangeBy[[Column(0, \"b\")]]-errors"

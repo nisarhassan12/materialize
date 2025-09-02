@@ -110,7 +110,6 @@ use std::rc::{Rc, Weak};
 use std::sync::Arc;
 use std::task::Poll;
 
-use differential_dataflow::IntoOwned;
 use differential_dataflow::dynamic::pointstamp::PointStamp;
 use differential_dataflow::lattice::Lattice;
 use differential_dataflow::operators::arrange::{Arranged, ShutdownButton};
@@ -122,6 +121,7 @@ use mz_compute_types::dataflows::{DataflowDescription, IndexDesc};
 use mz_compute_types::dyncfgs::{
     COMPUTE_APPLY_COLUMN_DEMANDS, COMPUTE_LOGICAL_BACKPRESSURE_INFLIGHT_SLACK,
     COMPUTE_LOGICAL_BACKPRESSURE_MAX_RETAINED_CAPABILITIES, ENABLE_COMPUTE_LOGICAL_BACKPRESSURE,
+    ENABLE_TEMPORAL_BUCKETING, TEMPORAL_BUCKETING_SUMMARY,
 };
 use mz_compute_types::plan::LirId;
 use mz_compute_types::plan::render_plan::{
@@ -138,6 +138,7 @@ use mz_timely_util::operator::{CollectionExt, StreamExt};
 use mz_timely_util::probe::{Handle as MzProbeHandle, ProbeNotify};
 use timely::PartialOrder;
 use timely::communication::Allocate;
+use timely::container::CapacityContainerBuilder;
 use timely::dataflow::channels::pact::Pipeline;
 use timely::dataflow::operators::to_stream::ToStream;
 use timely::dataflow::operators::{BranchWhen, Capability, Operator, Probe, probe};
@@ -153,6 +154,7 @@ use crate::arrangement::manager::TraceBundle;
 use crate::compute_state::ComputeState;
 use crate::extensions::arrange::{KeyCollection, MzArrange};
 use crate::extensions::reduce::MzReduce;
+use crate::extensions::temporal_bucket::TemporalBucketing;
 use crate::logging::compute::{
     ComputeEvent, DataflowGlobal, LirMapping, LirMetadata, LogDataflowErrors,
 };
@@ -210,8 +212,6 @@ pub fn build_compute_dataflow<A: Allocate>(
     let worker_logging = timely_worker.logger_for("timely").map(Into::into);
     let apply_demands = COMPUTE_APPLY_COLUMN_DEMANDS.get(&compute_state.worker_config);
 
-    // If you change the format here to something other than "Dataflow: {name}",
-    // you should also update MZ_MAPPABLE_OBJECTS in `src/catalog/src/builtin.rs`
     let name = format!("Dataflow: {}", &dataflow.debug_name);
     let input_name = format!("InputRegion: {}", &dataflow.debug_name);
     let build_name = format!("BuildRegion: {}", &dataflow.debug_name);
@@ -457,6 +457,18 @@ pub fn build_compute_dataflow<A: Allocate>(
                 );
 
                 for (id, (oks, errs)) in imported_sources.into_iter() {
+                    let oks = if ENABLE_TEMPORAL_BUCKETING.get(&compute_state.worker_config) {
+                        let as_of = context.as_of_frontier.clone();
+                        let summary = TEMPORAL_BUCKETING_SUMMARY
+                            .get(&compute_state.worker_config)
+                            .try_into()
+                            .expect("must fit");
+                        oks.inner
+                            .bucket::<CapacityContainerBuilder<_>>(as_of, summary)
+                            .as_collection()
+                    } else {
+                        oks
+                    };
                     let bundle = crate::render::CollectionBundle::from_collections(
                         oks.enter_region(region),
                         errs.enter_region(region),
@@ -718,12 +730,15 @@ where
 
         match bundle.arrangement(&idx.key) {
             Some(ArrangementFlavor::Local(oks, errs)) => {
+                // TODO: The following as_collection/leave/arrange sequence could be optimized.
+                //   * Combine as_collection and leave into a single function.
+                //   * Use columnar to extract columns from the batches to implement leave.
                 let mut oks = oks
-                    .as_collection(|k, v| (k.into_owned(), v.into_owned()))
+                    .as_collection(|k, v| (k.to_row(), v.to_row()))
                     .leave()
                     .mz_arrange::<RowRowBatcher<_, _>, RowRowBuilder<_, _>, _>(
-                        "Arrange export iterative",
-                    );
+                    "Arrange export iterative",
+                );
 
                 let mut errs = errs
                     .as_collection(|k, v| (k.clone(), v.clone()))
@@ -903,7 +918,7 @@ where
                     .mz_arrange::<ErrBatcher<_, _>, ErrBuilder<_, _>, ErrSpine<_, _>>(
                         "Arrange recursive err",
                     )
-                    .mz_reduce_abelian::<_, _, _, ErrBuilder<_, _>, ErrSpine<_, _>>(
+                    .mz_reduce_abelian::<_, ErrBuilder<_, _>, ErrSpine<_, _>>(
                         "Distinct recursive err",
                         move |_k, _s, t| t.push(((), Diff::ONE)),
                     )
@@ -1197,14 +1212,14 @@ where
                 }
             }
             FlatMap {
-                input,
-                func,
-                exprs,
-                mfp_after: mfp,
                 input_key,
+                input,
+                exprs,
+                func,
+                mfp_after: mfp,
             } => {
                 let input = expect_input(input);
-                self.render_flat_map(input, func, exprs, mfp, input_key)
+                self.render_flat_map(input_key, input, exprs, func, mfp)
             }
             Join { inputs, plan } => {
                 let inputs = inputs.into_iter().map(expect_input).collect();
@@ -1218,15 +1233,15 @@ where
                 }
             }
             Reduce {
+                input_key,
                 input,
                 key_val_plan,
                 plan,
-                input_key,
                 mfp_after,
             } => {
                 let input = expect_input(input);
                 let mfp_option = (!mfp_after.is_identity()).then_some(mfp_after);
-                self.render_reduce(input, key_val_plan, plan, input_key, mfp_option)
+                self.render_reduce(input_key, input, key_val_plan, plan, mfp_option)
             }
             TopK { input, top_k_plan } => {
                 let input = expect_input(input);
@@ -1264,10 +1279,10 @@ where
                 CollectionBundle::from_collections(oks, errs)
             }
             ArrangeBy {
-                input,
-                forms: keys,
                 input_key,
+                input,
                 input_mfp,
+                forms: keys,
             } => {
                 let input = expect_input(input);
                 input.ensure_collections(

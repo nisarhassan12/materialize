@@ -12,7 +12,7 @@ mode cockroach
 # Run all tests on a multi-process cluster, because there were some serialization issues in the past that happened
 # only on multi-process clusters.
 statement ok
-CREATE CLUSTER multiprocess REPLICAS (a (SIZE '2-2'));
+CREATE CLUSTER multiprocess REPLICAS (a (SIZE 'scale=2,workers=2'));
 
 statement ok
 SET cluster = 'multiprocess';
@@ -434,7 +434,6 @@ INSERT INTO T VALUES ('this is gonna be an invalid regex', '', '\');
 query error db error: ERROR: Evaluation error: invalid regular expression: regex parse error:
 SELECT replace(s, E'\n', '<newline>') FROM t WHERE s ~* regex_pat;
 
-# TODO: multiline literal errors should be printed somehow differently in EXPLAIN
 query T multiline
 EXPLAIN OPTIMIZED PLAN WITH (humanized expressions) AS VERBOSE TEXT FOR
 SELECT *, s~'\' FROM t;
@@ -494,7 +493,7 @@ ORDER BY 1
 {hello,world}
 {hello,world}
 
-# TODO: Correct ordering when database-issues#4764 is fixed.
+# TODO: Add WITH ORDINALITY when database-issues#9598 is fixed.
 query T
 SELECT foo FROM regexp_split_to_table('the quick brown fox jumps over the lazy dog', '\s+') AS foo ORDER BY 1
 ----
@@ -508,7 +507,7 @@ quick
 the
 the
 
-# TODO: Correct ordering when database-issues#4764 is fixed.
+# TODO: Add WITH ORDINALITY when database-issues#9598 is fixed.
 query T
 SELECT foo FROM regexp_split_to_table('the quick brown fox', '\s*') AS foo ORDER BY 1
 ----
@@ -817,7 +816,7 @@ simple
 SELECT regexp_matches(bar, '(b[^b]+)(b[^b]+)(b[^b]+)', 'ig') FROM foo2;
 ----
 db error: ERROR: function regexp_matches(smallint, unknown, unknown) does not exist
-HINT: No function matches the given name and argument types. You might need to add explicit type casts.
+HINT: No function matches the given name and argument types.  You might need to add explicit type casts.
 
 statement ok
 DROP CLUSTER multiprocess;

@@ -28,6 +28,7 @@ from materialize.feature_benchmark.scenario import (
     ScenarioDisabled,
 )
 from materialize.feature_benchmark.scenario_version import ScenarioVersion
+from materialize.mzcompose.services.sql_server import SqlServer
 
 # for pdoc ignores
 __pdoc__ = {}
@@ -692,7 +693,7 @@ class AccumulateReductions(Dataflow):
 > INSERT INTO t (a, b) VALUES (0, 0);
 
 > DROP CLUSTER IF EXISTS idx_cluster CASCADE;
-> CREATE CLUSTER idx_cluster SIZE '1-8G', REPLICATION FACTOR 1;
+> CREATE CLUSTER idx_cluster SIZE 'scale=1,workers=1,mem=8GiB', REPLICATION FACTOR 1;
 
 > CREATE VIEW accumulable AS
   SELECT
@@ -1026,7 +1027,7 @@ $ kafka-ingest format=bytes topic=kafka-envelope-none-bytes repeat={self.n()}
 
 > CREATE CONNECTION s1_kafka_conn TO KAFKA (BROKER '${{testdrive.kafka-addr}}', SECURITY PROTOCOL PLAINTEXT);
 
-> CREATE CLUSTER source_cluster SIZE '{self._default_size}', REPLICATION FACTOR 1;
+> CREATE CLUSTER source_cluster SIZE 'scale={self._default_size},workers=1', REPLICATION FACTOR 1;
 
 > CREATE SOURCE s1
   IN CLUSTER source_cluster
@@ -1072,7 +1073,7 @@ $ kafka-ingest format=avro topic=kafka-upsert key-format=avro key-schema=${{keys
     URL '${{testdrive.schema-registry-url}}'
   );
 
-> CREATE CLUSTER source_cluster SIZE '{self._default_size}', REPLICATION FACTOR 1;
+> CREATE CLUSTER source_cluster SIZE 'scale={self._default_size},workers=1', REPLICATION FACTOR 1;
 
 > CREATE SOURCE s1
   IN CLUSTER source_cluster
@@ -1117,7 +1118,7 @@ $ kafka-ingest format=avro topic=upsert-unique key-format=avro key-schema=${{key
   TO CONFLUENT SCHEMA REGISTRY (URL '${{testdrive.schema-registry-url}}');
   /* A */
 
-> CREATE CLUSTER source_cluster SIZE '{self._default_size}', REPLICATION FACTOR 1;
+> CREATE CLUSTER source_cluster SIZE 'scale={self._default_size},workers=1', REPLICATION FACTOR 1;
 
 > CREATE SOURCE s1
   IN CLUSTER source_cluster
@@ -1165,7 +1166,7 @@ $ kafka-ingest format=avro topic=kafka-recovery key-format=avro key-schema=${{ke
 > CREATE CONNECTION IF NOT EXISTS s1_csr_conn
   TO CONFLUENT SCHEMA REGISTRY (URL '${{testdrive.schema-registry-url}}');
 
-> CREATE CLUSTER source_cluster SIZE '{self._default_size}', REPLICATION FACTOR 1;
+> CREATE CLUSTER source_cluster SIZE 'scale={self._default_size},workers=1', REPLICATION FACTOR 1;
 
 > CREATE SOURCE s1
   IN CLUSTER source_cluster
@@ -1244,7 +1245,7 @@ class KafkaRestartBig(ScenarioBig):
 > CREATE CONNECTION s1_kafka_conn TO KAFKA (BROKER '${{testdrive.kafka-addr}}', SECURITY PROTOCOL PLAINTEXT);
 
 > DROP CLUSTER IF EXISTS source_cluster CASCADE
-> CREATE CLUSTER source_cluster SIZE '{self._default_size}', REPLICATION FACTOR 1;
+> CREATE CLUSTER source_cluster SIZE 'scale={self._default_size},workers=1', REPLICATION FACTOR 1;
 
 > CREATE SOURCE s1
   IN CLUSTER source_cluster
@@ -1315,7 +1316,7 @@ $ kafka-create-topic topic=kafka-scalability partitions=8
 
 > CREATE CONNECTION s1_kafka_conn TO KAFKA (BROKER '${{testdrive.kafka-addr}}', SECURITY PROTOCOL PLAINTEXT);
 
-> CREATE CLUSTER source_cluster SIZE '{self._default_size}', REPLICATION FACTOR 1;
+> CREATE CLUSTER source_cluster SIZE 'scale={self._default_size},workers=1', REPLICATION FACTOR 1;
 
 > CREATE SOURCE s1
   IN CLUSTER source_cluster
@@ -1374,7 +1375,7 @@ $ kafka-ingest format=avro topic=sink-input key-format=avro key-schema=${{keysch
   FOR CONFLUENT SCHEMA REGISTRY
   URL '${{testdrive.schema-registry-url}}';
 
-> CREATE CLUSTER source_cluster SIZE '{self._default_size}', REPLICATION FACTOR 1;
+> CREATE CLUSTER source_cluster SIZE 'scale={self._default_size},workers=1', REPLICATION FACTOR 1;
 
 > CREATE SOURCE source1
   IN CLUSTER source_cluster
@@ -1397,7 +1398,7 @@ $ kafka-ingest format=avro topic=sink-input key-format=avro key-schema=${{keysch
   /* A */
 
 > DROP CLUSTER IF EXISTS sink_cluster CASCADE
-> CREATE CLUSTER sink_cluster SIZE '{self._default_size}', REPLICATION FACTOR 1;
+> CREATE CLUSTER sink_cluster SIZE 'scale={self._default_size},workers=1', REPLICATION FACTOR 1;
 
 > CREATE SINK sink1
   IN CLUSTER sink_cluster
@@ -1471,7 +1472,7 @@ ALTER SYSTEM SET max_tables = {self.n() * 4};
   URL '${{testdrive.schema-registry-url}}';
 
 > DROP CLUSTER IF EXISTS kafka_source_cluster CASCADE;
-> CREATE CLUSTER kafka_source_cluster SIZE '{self._default_size}', REPLICATION FACTOR 1;
+> CREATE CLUSTER kafka_source_cluster SIZE 'scale={self._default_size},workers=1', REPLICATION FACTOR 1;
 """
         )
 
@@ -1567,7 +1568,7 @@ ALTER TABLE pk_table REPLICA IDENTITY FULL;
     PASSWORD SECRET pgpass
   )
 
-> CREATE CLUSTER source_cluster SIZE '{self._default_size}', REPLICATION FACTOR 1;
+> CREATE CLUSTER source_cluster SIZE 'scale={self._default_size},workers=1', REPLICATION FACTOR 1;
 
 > CREATE SOURCE mz_source_pgcdc
   IN CLUSTER source_cluster
@@ -1621,7 +1622,7 @@ ALTER TABLE t1 REPLICA IDENTITY FULL;
     PASSWORD SECRET pgpass
   )
 
-> CREATE CLUSTER source_cluster SIZE '{self._default_size}', REPLICATION FACTOR 1;
+> CREATE CLUSTER source_cluster SIZE 'scale={self._default_size},workers=1', REPLICATION FACTOR 1;
 
 > CREATE SOURCE s1
   IN CLUSTER source_cluster
@@ -1699,7 +1700,7 @@ INSERT INTO pk_table SELECT @i:=@i+1, @i*@i FROM mysql.time_zone t1, mysql.time_
     PASSWORD SECRET mysqlpass
   )
 
-> CREATE CLUSTER source_cluster SIZE '{self._default_size}', REPLICATION FACTOR 1;
+> CREATE CLUSTER source_cluster SIZE 'scale={self._default_size},workers=1', REPLICATION FACTOR 1;
 
 > CREATE SOURCE mz_source_mysqlcdc
   IN CLUSTER source_cluster
@@ -1753,7 +1754,7 @@ CREATE TABLE t1 (pk SERIAL PRIMARY KEY, f2 BIGINT);
     PASSWORD SECRET mysqlpass
   )
 
-> CREATE CLUSTER source_cluster SIZE '{self._default_size}', REPLICATION FACTOR 1;
+> CREATE CLUSTER source_cluster SIZE 'scale={self._default_size},workers=1', REPLICATION FACTOR 1;
 
 > CREATE SOURCE s1
   IN CLUSTER source_cluster
@@ -1787,6 +1788,145 @@ $ mysql-connect name=mysql url=mysql://root@mysql password=${{arg.mysql-root-pas
 
 $ mysql-execute name=mysql
 USE public;
+{insertions}
+
+> SELECT count(*) FROM t1
+  /* B */
+{self.n()}
+            """
+        )
+
+
+class SqlServerCdc(Scenario):
+    pass
+
+
+class SqlServerInitialLoad(SqlServerCdc):
+    """Measure the time it takes to read 1M existing records from SQL Server
+    when creating a materialized source"""
+
+    FIXED_SCALE = True  # TODO: Remove when database-issues#7556 is fixed
+
+    def shared(self) -> Action:
+        return TdAction(
+            f"""
+$ sql-server-connect name=sql-server
+server=tcp:sql-server,1433;IntegratedSecurity=true;TrustServerCertificate=true;User ID={SqlServer.DEFAULT_USER};Password={SqlServer.DEFAULT_SA_PASSWORD}
+
+$ sql-server-execute name=sql-server
+USE test;
+IF EXISTS (SELECT 1 FROM cdc.change_tables WHERE capture_instance = 'dbo_pk_table') BEGIN EXEC sys.sp_cdc_disable_table @source_schema = 'dbo', @source_name = 'pk_table', @capture_instance = 'dbo_pk_table'; END
+DROP TABLE IF EXISTS pk_table;
+CREATE TABLE pk_table (pk BIGINT PRIMARY KEY, f2 BIGINT);
+EXEC sys.sp_cdc_enable_table @source_schema = 'dbo', @source_name = 'pk_table', @role_name = 'SA', @supports_net_changes = 0;
+
+WITH Numbers AS (SELECT TOP (1000000) ROW_NUMBER() OVER (ORDER BY (SELECT NULL)) AS n FROM master.dbo.spt_values t1 CROSS JOIN master.dbo.spt_values t2) INSERT INTO pk_table (pk, f2) SELECT n, CAST(n AS bigint) * n FROM Numbers;
+"""
+        )
+
+    def before(self) -> Action:
+        return TdAction(
+            """
+> DROP SOURCE IF EXISTS mz_source_sqlservercdc CASCADE;
+> DROP CLUSTER IF EXISTS source_cluster CASCADE
+            """
+        )
+
+    def benchmark(self) -> MeasurementSource:
+        return Td(
+            f"""
+> CREATE SECRET IF NOT EXISTS sqlserverpass AS '${{arg.sql-server-sa-password}}'
+> CREATE CONNECTION IF NOT EXISTS sql_server_conn TO SQL SERVER (
+    HOST 'sql-server',
+    DATABASE test,
+    USER {SqlServer.DEFAULT_USER},
+    PASSWORD SECRET sqlserverpass
+  )
+
+> CREATE CLUSTER source_cluster SIZE 'scale={self._default_size},workers=1', REPLICATION FACTOR 1;
+
+> CREATE SOURCE mz_source_sqlservercdc
+  IN CLUSTER source_cluster
+  FROM SQL SERVER CONNECTION sql_server_conn;
+> CREATE TABLE pk_table FROM SOURCE mz_source_sqlservercdc (REFERENCE pk_table);
+  /* A */
+
+> SELECT count(*) FROM pk_table
+  /* B */
+{self.n()}
+            """
+        )
+
+
+class SqlServerStreaming(SqlServerCdc):
+    """Measure the time it takes to ingest records from SQL Server post-snapshot"""
+
+    SCALE = 5
+
+    def shared(self) -> Action:
+        return TdAction(
+            f"""
+$ sql-server-connect name=sql-server
+server=tcp:sql-server,1433;IntegratedSecurity=true;TrustServerCertificate=true;User ID={SqlServer.DEFAULT_USER};Password={SqlServer.DEFAULT_SA_PASSWORD}
+
+$ sql-server-execute name=sql-server
+USE test;
+"""
+        )
+
+    def before(self) -> Action:
+        return TdAction(
+            f"""
+> DROP SOURCE IF EXISTS s1 CASCADE;
+> DROP CLUSTER IF EXISTS source_cluster CASCADE;
+
+$ sql-server-connect name=sql-server
+server=tcp:sql-server,1433;IntegratedSecurity=true;TrustServerCertificate=true;User ID={SqlServer.DEFAULT_USER};Password={SqlServer.DEFAULT_SA_PASSWORD}
+
+$ sql-server-execute name=sql-server
+USE test;
+IF EXISTS (SELECT 1 FROM cdc.change_tables WHERE capture_instance = 'dbo_t1') BEGIN EXEC sys.sp_cdc_disable_table @source_schema = 'dbo', @source_name = 't1', @capture_instance = 'dbo_t1'; END
+DROP TABLE IF EXISTS t1;
+CREATE TABLE t1 (pk BIGINT IDENTITY(1,1) PRIMARY KEY, f2 BIGINT);
+EXEC sys.sp_cdc_enable_table @source_schema = 'dbo', @source_name = 't1', @role_name = 'SA', @supports_net_changes = 0;
+
+> CREATE SECRET IF NOT EXISTS sqlserverpass AS '${{arg.sql-server-sa-password}}'
+> CREATE CONNECTION IF NOT EXISTS sql_server_conn TO SQL SERVER (
+    HOST 'sql-server',
+    DATABASE test,
+    USER {SqlServer.DEFAULT_USER},
+    PASSWORD SECRET sqlserverpass
+  )
+
+> CREATE CLUSTER source_cluster SIZE 'scale={self._default_size},workers=1', REPLICATION FACTOR 1;
+
+> CREATE SOURCE s1
+  IN CLUSTER source_cluster
+  FROM SQL SERVER CONNECTION sql_server_conn;
+
+> CREATE TABLE t1 FROM SOURCE s1 (REFERENCE t1);
+            """
+        )
+
+    def benchmark(self) -> MeasurementSource:
+        insertions = "\n".join(
+            [
+                f"INSERT INTO t1 (f2) SELECT TOP ({round(self.n()/1000)}) n FROM (SELECT ROW_NUMBER() OVER (ORDER BY (SELECT NULL)) AS n FROM sys.objects AS o1 CROSS JOIN sys.objects AS o2) AS numbers;"
+                for i in range(0, 1000)
+            ]
+        )
+
+        return Td(
+            f"""
+> SELECT 1;
+  /* A */
+1
+
+$ sql-server-connect name=sql-server
+server=tcp:sql-server,1433;IntegratedSecurity=true;TrustServerCertificate=true;User ID={SqlServer.DEFAULT_USER};Password={SqlServer.DEFAULT_SA_PASSWORD}
+
+$ sql-server-execute name=sql-server
+USE test;
 {insertions}
 
 > SELECT count(*) FROM t1
@@ -1906,7 +2046,7 @@ $ kafka-ingest format=avro topic=startup-time schema=${schema} repeat=1
         create_sources = "\n".join(
             f"""
 > DROP CLUSTER IF EXISTS source{i}_cluster CASCADE;
-> CREATE CLUSTER source{i}_cluster SIZE '{self._default_size}', REPLICATION FACTOR 1;
+> CREATE CLUSTER source{i}_cluster SIZE 'scale={self._default_size},workers=1', REPLICATION FACTOR 1;
 
 > CREATE SOURCE source{i}
   IN CLUSTER source{i}_cluster
@@ -1931,7 +2071,7 @@ $ kafka-ingest format=avro topic=startup-time schema=${schema} repeat=1
         create_sinks = "\n".join(
             f"""
 > DROP CLUSTER IF EXISTS sink{i}_cluster;
-> CREATE CLUSTER sink{i}_cluster SIZE '{self._default_size}', REPLICATION FACTOR 1;
+> CREATE CLUSTER sink{i}_cluster SIZE 'scale={self._default_size},workers=1', REPLICATION FACTOR 1;
 > CREATE SINK sink{i}
   IN CLUSTER sink{i}_cluster
   FROM source{i}_tbl
@@ -2105,7 +2245,7 @@ class HydrateIndex(Scenario):
             self.table_ten(),
             TdAction(
                 """
-> CREATE CLUSTER idx_cluster SIZE '16', REPLICATION FACTOR 1
+> CREATE CLUSTER idx_cluster SIZE 'scale=1,workers=16', REPLICATION FACTOR 1
 """
             ),
         ]

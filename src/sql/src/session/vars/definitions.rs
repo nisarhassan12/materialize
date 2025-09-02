@@ -674,14 +674,6 @@ pub static PG_TIMESTAMP_ORACLE_CONNECTION_POOL_TTL_STAGGER: VarDefinition = VarD
     false,
 );
 
-/// The default for the `DISK` option when creating managed clusters and cluster replicas.
-pub static DISK_CLUSTER_REPLICAS_DEFAULT: VarDefinition = VarDefinition::new(
-    "disk_cluster_replicas_default",
-    value!(bool; false),
-    "Whether the disk option for managed clusters and cluster replicas should be enabled by default.",
-    false,
-);
-
 pub static UNSAFE_NEW_TRANSACTION_WALL_TIME: VarDefinition = VarDefinition::new(
     "unsafe_new_transaction_wall_time",
     value!(Option<CheckedTimestamp<DateTime<Utc>>>; None),
@@ -779,23 +771,6 @@ pub mod upsert_rocksdb {
         "Tuning parameter for RocksDB as used in `UPSERT/DEBEZIUM` \
         sources. Described in the `mz_rocksdb_types::config` module. \
         Only takes effect on source restart (Materialize).",
-        false,
-    );
-
-    /// Controls whether automatic spill to disk should be turned on when using `DISK`.
-    pub static UPSERT_ROCKSDB_AUTO_SPILL_TO_DISK: VarDefinition = VarDefinition::new(
-        "upsert_rocksdb_auto_spill_to_disk",
-        value!(bool; true),
-        "Controls whether automatic spill to disk should be turned on when using `DISK`",
-        false,
-    );
-
-    /// The upsert in memory state size threshold after which it will spill to disk.
-    /// The default is 85 MiB = 89128960 bytes
-    pub static UPSERT_ROCKSDB_AUTO_SPILL_THRESHOLD_BYTES: VarDefinition = VarDefinition::new(
-        "upsert_rocksdb_auto_spill_threshold_bytes",
-        value!(usize; mz_rocksdb_types::defaults::DEFAULT_AUTO_SPILL_MEMORY_THRESHOLD),
-        "The upsert in-memory state size threshold in bytes after which it will spill to disk",
         false,
     );
 
@@ -1459,7 +1434,7 @@ pub static ENABLE_CONSOLIDATE_AFTER_UNION_NEGATE: VarDefinition = VarDefinition:
 
 pub static ENABLE_REDUCE_REDUCTION: VarDefinition = VarDefinition::new(
     "enable_reduce_reduction",
-    value!(bool; true),
+    value!(bool; false),
     "split complex reductions in to simpler ones and a join (Materialize).",
     true,
 );
@@ -1627,13 +1602,6 @@ pub mod cluster_scheduling {
         false,
     );
 
-    pub static CLUSTER_ALWAYS_USE_DISK: VarDefinition = VarDefinition::new(
-        "cluster_always_use_disk",
-        value!(bool; DEFAULT_ALWAYS_USE_DISK),
-        "Always provisions a replica with disk, regardless of `DISK` DDL option.",
-        false,
-    );
-
     const DEFAULT_CLUSTER_ALTER_CHECK_READY_INTERVAL: Duration = Duration::from_secs(3);
 
     pub static CLUSTER_ALTER_CHECK_READY_INTERVAL: VarDefinition = VarDefinition::new(
@@ -1794,6 +1762,12 @@ feature_flags!(
     },
     // Actual feature flags
     {
+        name: enable_guard_subquery_tablefunc,
+        desc: "Whether HIR -> MIR lowering should use a new tablefunc to guard subquery sizes",
+        default: true,
+        enable_for_item_parsing: true,
+    },
+    {
         name: enable_binary_date_bin,
         desc: "the binary version of date_bin function",
         default: false,
@@ -1924,12 +1898,6 @@ feature_flags!(
         name: unsafe_enable_unstable_dependencies,
         desc: "depending on unstable objects",
         default: false,
-        enable_for_item_parsing: true,
-    },
-    {
-        name: enable_disk_cluster_replicas,
-        desc: "`WITH (DISK)` for cluster replicas",
-        default: true,
         enable_for_item_parsing: true,
     },
     {
@@ -2209,11 +2177,30 @@ feature_flags!(
         default: true,
         enable_for_item_parsing: false,
     },
+    {
+        name: enable_eq_classes_withholding_errors,
+        desc: "Use `EquivalenceClassesWithholdingErrors` instead of raw `EquivalenceClasses` during eq prop for joins.",
+        default: true,
+        enable_for_item_parsing: false,
+    },
+    {
+        name: enable_fast_path_plan_insights,
+        desc: "Enables those plan insight notices that help with getting fast path queries. Don't turn on before #9492 is fixed!",
+        default: false,
+        enable_for_item_parsing: false,
+    },
+    {
+        name: enable_with_ordinality_legacy_fallback,
+        desc: "When the new WITH ORDINALITY implementation can't be used with a table func, whether to fall back to the legacy implementation or error out.",
+        default: false,
+        enable_for_item_parsing: true,
+    },
 );
 
 impl From<&super::SystemVars> for OptimizerFeatures {
     fn from(vars: &super::SystemVars) -> Self {
         Self {
+            enable_guard_subquery_tablefunc: vars.enable_guard_subquery_tablefunc(),
             enable_consolidate_after_union_negate: vars.enable_consolidate_after_union_negate(),
             enable_eager_delta_joins: vars.enable_eager_delta_joins(),
             enable_new_outer_join_lowering: vars.enable_new_outer_join_lowering(),
@@ -2229,6 +2216,8 @@ impl From<&super::SystemVars> for OptimizerFeatures {
                 .enable_projection_pushdown_after_relation_cse(),
             enable_less_reduce_in_eqprop: vars.enable_less_reduce_in_eqprop(),
             enable_dequadratic_eqprop_map: vars.enable_dequadratic_eqprop_map(),
+            enable_eq_classes_withholding_errors: vars.enable_eq_classes_withholding_errors(),
+            enable_fast_path_plan_insights: vars.enable_fast_path_plan_insights(),
         }
     }
 }

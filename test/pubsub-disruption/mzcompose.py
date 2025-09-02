@@ -15,7 +15,11 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from textwrap import dedent
 
-from materialize.mzcompose.composition import Composition, WorkflowArgumentParser
+from materialize.mzcompose.composition import (
+    Composition,
+    Service,
+    WorkflowArgumentParser,
+)
 from materialize.mzcompose.services.materialized import Materialized
 from materialize.mzcompose.services.redpanda import Redpanda
 from materialize.mzcompose.services.testdrive import Testdrive
@@ -26,7 +30,7 @@ SERVICES = [
     Materialized(options=["--persist-pubsub-url=http://toxiproxy:6879"]),
     Redpanda(),
     Toxiproxy(),
-    Testdrive(no_reset=True, seed=1),
+    Testdrive(no_reset=True, seed=1, default_timeout="60s"),
 ]
 
 SCHEMA = dedent(
@@ -80,8 +84,7 @@ def workflow_default(c: Composition, parser: WorkflowArgumentParser) -> None:
 
     for disruption in selected_by_name(args.disruptions, disruptions):
         c.down(destroy_volumes=True)
-        c.up("redpanda", "materialized")
-        c.up("testdrive", persistent=True)
+        c.up("redpanda", "materialized", Service("testdrive", idle=True))
 
         toxiproxy_start(c)
 
@@ -133,6 +136,8 @@ def workflow_default(c: Composition, parser: WorkflowArgumentParser) -> None:
             input=SCHEMA
             + dedent(
                 """
+                $ set-sql-timeout duration=120s
+
                 > UPDATE t1 SET f2 = 3;
                 $ kafka-ingest format=avro key-format=avro topic=pubsub-disruption schema=${schema} key-schema=${keyschema} start-iteration=1 repeat=1000000
                 {"f1": ${kafka-ingest.iteration}} {"f2": 3}
@@ -164,6 +169,7 @@ def workflow_default(c: Composition, parser: WorkflowArgumentParser) -> None:
             input=SCHEMA
             + dedent(
                 """
+                $ set-sql-timeout duration=120s
                 > UPDATE t1 SET f2 = 4;
                 $ kafka-ingest format=avro key-format=avro topic=pubsub-disruption schema=${schema} key-schema=${keyschema} start-iteration=1 repeat=1000000
                 {"f1": ${kafka-ingest.iteration}} {"f2": 4}

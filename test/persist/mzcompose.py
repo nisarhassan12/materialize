@@ -15,14 +15,14 @@ import argparse
 
 from materialize.mzcompose.composition import (
     Composition,
-    Service,
     WorkflowArgumentParser,
 )
+from materialize.mzcompose.service import Service
 from materialize.mzcompose.services.cockroach import Cockroach
 from materialize.mzcompose.services.postgres import PostgresMetadata
 
 SERVICES = [
-    Cockroach(setup_materialize=True),
+    Cockroach(setup_materialize=True, in_memory=True),
     PostgresMetadata(),
     Service(
         "maelstrom-persist",
@@ -61,6 +61,8 @@ def workflow_default(c: Composition, parser: WorkflowArgumentParser) -> None:
     )
 
     args = parser.parse_args()
+
+    (c.path / "maelstrom").mkdir(mode=0o777, exist_ok=True)
 
     if args.consensus == "mem":
         consensus_uri = "mem://consensus"

@@ -7,7 +7,8 @@
 # the Business Source License, use of this software will be governed
 # by the Apache License, Version 2.0.
 
-$ set-arg-default default-replica-size=1
+$ set-sql-timeout duration=120s
+$ set-arg-default default-replica-size=scale=1,workers=1
 
 $ postgres-execute connection=postgres://mz_system:materialize@${testdrive.materialize-internal-sql-addr}
 ALTER SYSTEM SET storage_statistics_collection_interval = 1000
@@ -57,6 +58,7 @@ goofus,gallant
 
 > CREATE CLUSTER stats_cluster SIZE '${arg.default-replica-size}'
 
+> BEGIN
 > CREATE SOURCE upsert
   IN CLUSTER stats_cluster
   FROM KAFKA CONNECTION kafka_conn (TOPIC
@@ -67,6 +69,7 @@ goofus,gallant
   FORMAT AVRO USING CONFLUENT SCHEMA REGISTRY CONNECTION csr_conn
   INCLUDE OFFSET
   ENVELOPE UPSERT
+> COMMIT
 
 # Adding a select here so that the ingests after this
 # triggers lookup from the upsert state

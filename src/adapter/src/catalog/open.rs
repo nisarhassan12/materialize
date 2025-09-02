@@ -18,14 +18,16 @@ use std::time::{Duration, Instant};
 use futures::future::{BoxFuture, FutureExt};
 use itertools::{Either, Itertools};
 use mz_adapter_types::bootstrap_builtin_cluster_config::BootstrapBuiltinClusterConfig;
-use mz_adapter_types::dyncfgs::{ENABLE_CONTINUAL_TASK_BUILTINS, ENABLE_EXPRESSION_CACHE};
+use mz_adapter_types::dyncfgs::{
+    ENABLE_CONTINUAL_TASK_BUILTINS, ENABLE_EXPRESSION_CACHE, FORCE_SWAP_FOR_CC_SIZES,
+};
 use mz_auth::hash::scram256_hash;
 use mz_catalog::SYSTEM_CONN_ID;
 use mz_catalog::builtin::{
     BUILTIN_CLUSTER_REPLICAS, BUILTIN_CLUSTERS, BUILTIN_PREFIXES, BUILTIN_ROLES, BUILTINS, Builtin,
     Fingerprint, MZ_STORAGE_USAGE_BY_SHARD_DESCRIPTION, RUNTIME_ALTERABLE_FINGERPRINT_SENTINEL,
 };
-use mz_catalog::config::{ClusterReplicaSizeMap, StateConfig};
+use mz_catalog::config::StateConfig;
 use mz_catalog::durable::objects::{
     SystemObjectDescription, SystemObjectMapping, SystemObjectUniqueIdentifier,
 };
@@ -37,7 +39,7 @@ use mz_catalog::memory::error::{Error, ErrorKind};
 use mz_catalog::memory::objects::{
     BootstrapStateUpdateKind, CommentsMap, DefaultPrivileges, RoleAuth, StateUpdate,
 };
-use mz_controller::clusters::{ReplicaAllocation, ReplicaLogging};
+use mz_controller::clusters::{ReplicaLocation, ReplicaLogging};
 use mz_controller_types::ClusterId;
 use mz_ore::cast::usize_to_u64;
 use mz_ore::collections::HashSet;
@@ -180,6 +182,7 @@ impl Catalog {
             aws_principal_context: config.aws_principal_context,
             aws_privatelink_availability_zones: config.aws_privatelink_availability_zones,
             http_host_name: config.http_host_name,
+            license_key: config.license_key,
         };
 
         let mut updates: Vec<_> = storage.sync_to_current_updates().await?;
@@ -214,13 +217,11 @@ impl Catalog {
             add_new_remove_old_builtin_clusters_migration(
                 &mut txn,
                 &builtin_bootstrap_cluster_config_map,
-                &state.cluster_replica_sizes,
             )?;
             add_new_remove_old_builtin_introspection_source_migration(&mut txn)?;
             add_new_remove_old_builtin_cluster_replicas_migration(
                 &mut txn,
                 &builtin_bootstrap_cluster_config_map,
-                &state.cluster_replica_sizes,
             )?;
             add_new_remove_old_builtin_roles_migration(&mut txn)?;
             remove_invalid_config_param_role_defaults_migration(&mut txn)?;
@@ -486,6 +487,41 @@ impl Catalog {
 
         cleanup_action.await;
 
+        // Force cc sizes to use swap, if requested.
+        if FORCE_SWAP_FOR_CC_SIZES.get(state.system_configuration.dyncfgs()) {
+            info!("force-enabling swap for cc replica sizes");
+
+            for size in state.cluster_replica_sizes.0.values_mut() {
+                if size.is_cc {
+                    size.swap_enabled = true;
+                    size.cpu_exclusive = false;
+                    size.selectors.remove("materialize.cloud/scratch-fs");
+                    size.selectors
+                        .insert("materialize.cloud/swap".into(), "true".into());
+                }
+            }
+
+            // The size definitions were copied into the in-memory replica configs during
+            // `CatalogState` initialization above. We can't move this code before that because we
+            // need to wait for the `system_configuration` to be fully initialized. Instead we also
+            // patch the replica configs here.
+            for cluster in state.clusters_by_id.values_mut() {
+                for replica in cluster.replicas_by_id_.values_mut() {
+                    if let ReplicaLocation::Managed(loc) = &mut replica.config.location {
+                        let alloc = &mut loc.allocation;
+                        if alloc.is_cc {
+                            alloc.swap_enabled = true;
+                            alloc.cpu_exclusive = false;
+                            alloc.selectors.remove("materialize.cloud/scratch-fs");
+                            alloc
+                                .selectors
+                                .insert("materialize.cloud/swap".into(), "true".into());
+                        }
+                    }
+                }
+            }
+        }
+
         Ok(InitializeStateResult {
             state,
             migrated_storage_collections_0dt,
@@ -559,6 +595,16 @@ impl Catalog {
                     catalog
                         .state
                         .resolve_builtin_table_update(catalog.state.pack_egress_ip_update(ip)?),
+                );
+            }
+
+            if !catalog.state.license_key.id.is_empty() {
+                builtin_table_updates.push(
+                    catalog.state.resolve_builtin_table_update(
+                        catalog
+                            .state
+                            .pack_license_key_update(&catalog.state.license_key)?,
+                    ),
                 );
             }
 
@@ -932,7 +978,6 @@ fn add_new_remove_old_builtin_items_migration(
 fn add_new_remove_old_builtin_clusters_migration(
     txn: &mut mz_catalog::durable::Transaction<'_>,
     builtin_cluster_config_map: &BuiltinBootstrapClusterConfigMap,
-    cluster_sizes: &ClusterReplicaSizeMap,
 ) -> Result<(), mz_catalog::durable::CatalogError> {
     let mut durable_clusters: BTreeMap<_, _> = txn
         .get_clusters()
@@ -944,7 +989,6 @@ fn add_new_remove_old_builtin_clusters_migration(
     for builtin_cluster in BUILTIN_CLUSTERS {
         if durable_clusters.remove(builtin_cluster.name).is_none() {
             let cluster_config = builtin_cluster_config_map.get_config(builtin_cluster.name)?;
-            let cluster_allocation = cluster_sizes.get_allocation_by_name(&cluster_config.size)?;
 
             txn.insert_system_cluster(
                 builtin_cluster.name,
@@ -956,7 +1000,6 @@ fn add_new_remove_old_builtin_clusters_migration(
                         size: cluster_config.size,
                         availability_zones: vec![],
                         replication_factor: cluster_config.replication_factor,
-                        disk: cluster_allocation.is_cc,
                         logging: default_logging_config(),
                         optimizer_feature_overrides: Default::default(),
                         schedule: Default::default(),
@@ -1046,7 +1089,6 @@ fn add_new_remove_old_builtin_roles_migration(
 fn add_new_remove_old_builtin_cluster_replicas_migration(
     txn: &mut Transaction<'_>,
     builtin_cluster_config_map: &BuiltinBootstrapClusterConfigMap,
-    cluster_sizes: &ClusterReplicaSizeMap,
 ) -> Result<(), AdapterError> {
     let cluster_lookup: BTreeMap<_, _> = txn
         .get_clusters()
@@ -1086,9 +1128,8 @@ fn add_new_remove_old_builtin_cluster_replicas_migration(
                 ClusterVariant::Managed(ClusterVariantManaged { ref size, .. }) => size.clone(),
                 ClusterVariant::Unmanaged => builtin_cluster_boostrap_config.size,
             };
-            let replica_allocation = cluster_sizes.get_allocation_by_name(&replica_size)?;
 
-            let config = builtin_cluster_replica_config(replica_size, replica_allocation);
+            let config = builtin_cluster_replica_config(replica_size);
             txn.insert_cluster_replica(
                 cluster.id,
                 builtin_replica.name,
@@ -1177,13 +1218,11 @@ fn remove_pending_cluster_replicas_migration(tx: &mut Transaction) -> Result<(),
 
 pub(crate) fn builtin_cluster_replica_config(
     replica_size: String,
-    replica_allocation: &ReplicaAllocation,
 ) -> mz_catalog::durable::ReplicaConfig {
     mz_catalog::durable::ReplicaConfig {
         location: mz_catalog::durable::ReplicaLocation::Managed {
             availability_zone: None,
             billed_as: None,
-            disk: replica_allocation.is_cc,
             pending: false,
             internal: false,
             size: replica_size,

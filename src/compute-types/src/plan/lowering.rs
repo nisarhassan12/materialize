@@ -11,6 +11,7 @@
 
 use std::collections::BTreeMap;
 
+use columnar::Len;
 use mz_expr::JoinImplementation::{DeltaQuery, Differential, IndexedFilter, Unimplemented};
 use mz_expr::{
     AggregateExpr, Id, JoinInputMapper, MapFilterProject, MirRelationExpr, MirScalarExpr,
@@ -19,6 +20,7 @@ use mz_expr::{
 use mz_ore::{assert_none, soft_assert_eq_or_log, soft_panic_or_log};
 use mz_repr::GlobalId;
 use mz_repr::optimize::OptimizerFeatures;
+use timely::Container;
 use timely::progress::Timestamp;
 
 use crate::dataflows::{BuildDesc, DataflowDescription, IndexImport};
@@ -90,7 +92,6 @@ impl Context {
                 .entry(Id::Global(index_desc.on_id))
                 .or_insert_with(AvailableCollections::default);
             index_keys.arranged.push((key, permutation, thinning));
-            index_keys.types = Some(typ.column_types.clone());
         }
         for id in desc.source_imports.keys() {
             self.arrangements
@@ -345,10 +346,10 @@ impl Context {
                                     limits,
                                     body: Box::new(
                                         PlanNode::ArrangeBy {
-                                            input: body,
-                                            forms,
                                             input_key,
+                                            input: body,
                                             input_mfp,
+                                            forms,
                                         }
                                         .as_plan(inner_lir_id),
                                     ),
@@ -358,10 +359,10 @@ impl Context {
                             lir_value => {
                                 let lir_id = self.allocate_lir_id();
                                 PlanNode::ArrangeBy {
-                                    input: Box::new(lir_value),
-                                    forms,
                                     input_key,
+                                    input: Box::new(lir_value),
                                     input_mfp,
+                                    forms,
                                 }
                                 .as_plan(lir_id)
                             }
@@ -532,11 +533,11 @@ impl Context {
                     // Return the plan, and no arrangements.
                     (
                         PlanNode::FlatMap {
-                            input: Box::new(input),
-                            func: func.clone(),
-                            exprs: exprs.clone(),
-                            mfp_after: mfp,
                             input_key,
+                            input: Box::new(input),
+                            exprs: exprs.clone(),
+                            func: func.clone(),
+                            mfp_after: mfp,
                         }
                         .as_plan(lir_id),
                         AvailableCollections::new_raw(),
@@ -771,25 +772,16 @@ This is not expected to cause incorrect results, but could indicate a performanc
             }
             MirRelationExpr::Threshold { input } => {
                 let (plan, keys) = self.lower_mir_expr(input)?;
-                let arity = keys
-                    .types
-                    .as_ref()
-                    .map(|types| types.len())
-                    .unwrap_or_else(|| input.arity());
+                let arity = input.arity();
                 let (threshold_plan, required_arrangement) = ThresholdPlan::create_from(arity);
-                let mut types = keys.types.clone();
                 let plan = if !keys
                     .arranged
                     .iter()
                     .any(|(key, _, _)| key == &required_arrangement.0)
                 {
-                    types = Some(types.unwrap_or_else(|| input.typ().column_types));
                     self.arrange_by(
                         plan,
-                        AvailableCollections::new_arranged(
-                            vec![required_arrangement],
-                            types.clone(),
-                        ),
+                        AvailableCollections::new_arranged(vec![required_arrangement]),
                         &keys,
                         arity,
                     )
@@ -797,7 +789,7 @@ This is not expected to cause incorrect results, but could indicate a performanc
                     plan
                 };
 
-                let output_keys = threshold_plan.keys(types);
+                let output_keys = threshold_plan.keys();
                 // Return the plan, and any produced keys.
                 let lir_id = self.allocate_lir_id();
                 (
@@ -845,10 +837,7 @@ This is not expected to cause incorrect results, but could indicate a performanc
                 let input_mir = input;
                 let (input, mut input_keys) = self.lower_mir_expr(input)?;
                 // Fill the `types` in `input_keys` if not already present.
-                let input_types = input_keys
-                    .types
-                    .get_or_insert_with(|| input_mir.typ().column_types);
-                let arity = input_types.len();
+                let arity = input_mir.arity();
 
                 // Determine keys that are not present in `input_keys`.
                 let new_keys = keys
@@ -859,10 +848,18 @@ This is not expected to cause incorrect results, but could indicate a performanc
                 if new_keys.is_empty() {
                     (input, input_keys)
                 } else {
-                    let new_keys = new_keys.iter().cloned().map(|k| {
-                        let (permutation, thinning) = permutation_for_arrangement(&k, arity);
-                        (k, permutation, thinning)
-                    });
+                    let mut new_keys = new_keys
+                        .iter()
+                        .cloned()
+                        .map(|k| {
+                            let (permutation, thinning) = permutation_for_arrangement(&k, arity);
+                            (k, permutation, thinning)
+                        })
+                        .collect::<Vec<_>>();
+                    let forms = AvailableCollections {
+                        raw: input_keys.raw,
+                        arranged: new_keys.clone(),
+                    };
                     let (input_key, input_mfp) = if let Some((input_key, permutation, thinning)) =
                         input_keys.arbitrary_arrangement()
                     {
@@ -872,17 +869,17 @@ This is not expected to cause incorrect results, but could indicate a performanc
                     } else {
                         (None, MapFilterProject::new(arity))
                     };
-                    input_keys.arranged.extend(new_keys);
+                    input_keys.arranged.append(&mut new_keys);
                     input_keys.arranged.sort_by(|k1, k2| k1.0.cmp(&k2.0));
 
                     // Return the plan and extended keys.
                     let lir_id = self.allocate_lir_id();
                     (
                         PlanNode::ArrangeBy {
-                            input: Box::new(input),
-                            forms: input_keys.clone(),
                             input_key,
+                            input: Box::new(input),
                             input_mfp,
+                            forms,
                         }
                         .as_plan(lir_id),
                         input_keys,
@@ -1038,10 +1035,10 @@ This is not expected to cause incorrect results, but could indicate a performanc
         let lir_id = self.allocate_lir_id();
         Ok((
             PlanNode::Reduce {
+                input_key,
                 input: Box::new(input),
                 key_val_plan,
                 plan: reduce_plan,
-                input_key,
                 mfp_after,
             }
             .as_plan(lir_id),
@@ -1061,10 +1058,10 @@ This is not expected to cause incorrect results, but could indicate a performanc
         if let Plan {
             node:
                 PlanNode::ArrangeBy {
-                    input,
-                    mut forms,
                     input_key,
+                    input,
                     input_mfp,
+                    mut forms,
                 },
             lir_id,
         } = plan
@@ -1073,16 +1070,11 @@ This is not expected to cause incorrect results, but could indicate a performanc
             forms.arranged.extend(collections.arranged);
             forms.arranged.sort_by(|k1, k2| k1.0.cmp(&k2.0));
             forms.arranged.dedup_by(|k1, k2| k1.0 == k2.0);
-            if forms.types.is_none() {
-                forms.types = collections.types;
-            } else {
-                assert!(collections.types.is_none() || collections.types == forms.types);
-            }
             PlanNode::ArrangeBy {
-                input,
-                forms,
                 input_key,
+                input,
                 input_mfp,
+                forms,
             }
             .as_plan(lir_id)
         } else {
@@ -1096,11 +1088,12 @@ This is not expected to cause incorrect results, but could indicate a performanc
                 (None, MapFilterProject::new(arity))
             };
             let lir_id = self.allocate_lir_id();
+
             PlanNode::ArrangeBy {
-                input: Box::new(plan),
-                forms: collections,
                 input_key,
+                input: Box::new(plan),
                 input_mfp,
+                forms: collections,
             }
             .as_plan(lir_id)
         }

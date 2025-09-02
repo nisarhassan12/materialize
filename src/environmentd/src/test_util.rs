@@ -193,26 +193,26 @@ impl Default for TestHarness {
             seed: rand::random(),
             storage_usage_collection_interval: Duration::from_secs(3600),
             storage_usage_retention_period: None,
-            default_cluster_replica_size: "1".to_string(),
+            default_cluster_replica_size: "scale=1,workers=1".to_string(),
             default_cluster_replication_factor: 1,
             builtin_system_cluster_config: BootstrapBuiltinClusterConfig {
-                size: "1".to_string(),
+                size: "scale=1,workers=1".to_string(),
                 replication_factor: SYSTEM_CLUSTER_DEFAULT_REPLICATION_FACTOR,
             },
             builtin_catalog_server_cluster_config: BootstrapBuiltinClusterConfig {
-                size: "1".to_string(),
+                size: "scale=1,workers=1".to_string(),
                 replication_factor: CATALOG_SERVER_CLUSTER_DEFAULT_REPLICATION_FACTOR,
             },
             builtin_probe_cluster_config: BootstrapBuiltinClusterConfig {
-                size: "1".to_string(),
+                size: "scale=1,workers=1".to_string(),
                 replication_factor: PROBE_CLUSTER_DEFAULT_REPLICATION_FACTOR,
             },
             builtin_support_cluster_config: BootstrapBuiltinClusterConfig {
-                size: "1".to_string(),
+                size: "scale=1,workers=1".to_string(),
                 replication_factor: SUPPORT_CLUSTER_DEFAULT_REPLICATION_FACTOR,
             },
             builtin_analytics_cluster_config: BootstrapBuiltinClusterConfig {
-                size: "1".to_string(),
+                size: "scale=1,workers=1".to_string(),
                 replication_factor: ANALYTICS_CLUSTER_DEFAULT_REPLICATION_FACTOR,
             },
             propagate_crashes: false,
@@ -547,8 +547,8 @@ impl Listeners {
         let scratch_dir = tempfile::tempdir()?;
         let (consensus_uri, timestamp_oracle_url) = {
             let seed = config.seed;
-            let cockroach_url = env::var("COCKROACH_URL")
-                .map_err(|_| anyhow!("COCKROACH_URL environment variable is not set"))?;
+            let cockroach_url = env::var("METADATA_BACKEND_URL")
+                .map_err(|_| anyhow!("METADATA_BACKEND_URL environment variable is not set"))?;
             let (client, conn) = tokio_postgres::connect(&cockroach_url, NoTls).await?;
             mz_ore::task::spawn(|| "startup-postgres-conn", async move {
                 if let Err(err) = conn.await {
@@ -751,6 +751,7 @@ impl Listeners {
             inner,
             metrics_registry,
             _temp_dir: temp_dir,
+            _scratch_dir: scratch_dir,
             _tracing_guard: tracing_guard,
         })
     }
@@ -760,7 +761,9 @@ impl Listeners {
 pub struct TestServer {
     pub inner: crate::Server,
     pub metrics_registry: MetricsRegistry,
+    /// The `TempDir`s are saved to prevent them from being dropped, and thus cleaned up too early.
     _temp_dir: Option<TempDir>,
+    _scratch_dir: TempDir,
     _tracing_guard: Option<TracingGuard>,
 }
 

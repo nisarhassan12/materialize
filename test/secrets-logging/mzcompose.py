@@ -15,7 +15,7 @@ import glob
 
 from materialize import MZ_ROOT, buildkite
 from materialize.mzcompose.composition import Composition, WorkflowArgumentParser
-from materialize.mzcompose.services.azure import Azurite
+from materialize.mzcompose.services.azurite import Azurite
 from materialize.mzcompose.services.fivetran_destination import FivetranDestination
 from materialize.mzcompose.services.kafka import Kafka
 from materialize.mzcompose.services.materialized import Materialized
@@ -75,13 +75,15 @@ def workflow_default(c: Composition, parser: WorkflowArgumentParser) -> None:
         )
 
     files = buildkite.shard_list(
-        [
-            file
-            for pattern in args.files
-            for file in glob.glob(
-                pattern, root_dir=MZ_ROOT / "test" / "secrets-logging"
-            )
-        ],
+        sorted(
+            [
+                file
+                for pattern in args.files
+                for file in glob.glob(
+                    pattern, root_dir=MZ_ROOT / "test" / "secrets-logging"
+                )
+            ]
+        ),
         lambda file: file,
     )
     c.test_parts(files, process)

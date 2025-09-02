@@ -20,7 +20,7 @@ from textwrap import dedent
 from psycopg import Cursor
 
 from materialize import buildkite
-from materialize.mzcompose.composition import Composition
+from materialize.mzcompose.composition import Composition, Service
 from materialize.mzcompose.services.kafka import Kafka
 from materialize.mzcompose.services.materialized import Materialized
 from materialize.mzcompose.services.mz import Mz
@@ -153,8 +153,13 @@ def workflow_resumption(c: Composition) -> None:
 
 def workflow_multithreaded(c: Composition) -> None:
     c.down(destroy_volumes=True)
-    c.up("zookeeper", "kafka", "schema-registry", "materialized")
-    c.up("testdrive", persistent=True)
+    c.up(
+        "zookeeper",
+        "kafka",
+        "schema-registry",
+        "materialized",
+        Service("testdrive", idle=True),
+    )
 
     value = [201]
     lock = threading.Lock()

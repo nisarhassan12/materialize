@@ -12,6 +12,7 @@ use std::cmp::Reverse;
 use std::convert::AsRef;
 use std::fmt::Debug;
 use std::hash::{Hash, Hasher};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use differential_dataflow::hashable::Hashable;
@@ -46,23 +47,31 @@ use crate::healthcheck::HealthStatusUpdate;
 use crate::metrics::upsert::UpsertMetrics;
 use crate::storage_state::StorageInstanceContext;
 use crate::upsert_continual_feedback;
-use autospill::AutoSpillBackend;
-use memory::InMemoryHashMap;
 use types::{
-    BincodeOpts, StateValue, UpsertState, UpsertStateBackend, Value, consolidating_merge_function,
+    BincodeOpts, StateValue, UpsertState, UpsertStateBackend, consolidating_merge_function,
     upsert_bincode_opts,
 };
 
-mod autospill;
+#[cfg(test)]
 pub mod memory;
-mod rocksdb;
+pub(crate) mod rocksdb;
 // TODO(aljoscha): Move next to upsert module, rename to upsert_types.
 pub(crate) mod types;
 
-pub type UpsertValue = Result<Row, UpsertError>;
+pub type UpsertValue = Result<Row, Box<UpsertError>>;
 
-#[derive(Copy, Clone, Debug, Hash, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Copy, Clone, Hash, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct UpsertKey([u8; 32]);
+
+impl Debug for UpsertKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "0x")?;
+        for byte in self.0 {
+            write!(f, "{:02x}", byte)?;
+        }
+        Ok(())
+    }
+}
 
 impl AsRef<[u8]> for UpsertKey {
     #[inline(always)]
@@ -254,134 +263,80 @@ where
 
     let thin_input = upsert_thinning(input);
 
-    if let Some(scratch_directory) = instance_context.scratch_directory.as_ref() {
-        let tuning = dataflow_paramters.upsert_rocksdb_tuning_config.clone();
+    let tuning = dataflow_paramters.upsert_rocksdb_tuning_config.clone();
 
-        let allow_auto_spill = storage_configuration
-            .parameters
-            .upsert_auto_spill_config
-            .allow_spilling_to_disk;
-        let spill_threshold = storage_configuration
-            .parameters
-            .upsert_auto_spill_config
-            .spill_to_disk_threshold_bytes;
+    // When running RocksDB in memory, the file system is emulated. However, we still need to
+    // pick a path that exists because RocksDB will attempt to create the working directory
+    // (see https://github.com/rust-rocksdb/rust-rocksdb/issues/1015) and write a lock file,
+    // so we need to ensure the directory is unique per worker.
+    let rocksdb_dir = instance_context
+        .scratch_directory
+        .clone()
+        .unwrap_or_else(|| PathBuf::from("/tmp"))
+        .join("storage")
+        .join("upsert")
+        .join(source_config.id.to_string())
+        .join(source_config.worker_id.to_string());
 
-        tracing::info!(
-            worker_id = %source_config.worker_id,
-            source_id = %source_config.id,
-            ?tuning,
-            ?storage_configuration.parameters.upsert_auto_spill_config,
-            ?rocksdb_use_native_merge_operator,
-            "rendering upsert source with rocksdb-backed upsert state"
-        );
-        let rocksdb_shared_metrics = Arc::clone(&upsert_metrics.rocksdb_shared);
-        let rocksdb_instance_metrics = Arc::clone(&upsert_metrics.rocksdb_instance_metrics);
-        let rocksdb_dir = scratch_directory
-            .join("storage")
-            .join("upsert")
-            .join(source_config.id.to_string())
-            .join(source_config.worker_id.to_string());
+    tracing::info!(
+        worker_id = %source_config.worker_id,
+        source_id = %source_config.id,
+        ?rocksdb_dir,
+        ?tuning,
+        ?rocksdb_use_native_merge_operator,
+        "rendering upsert source"
+    );
 
-        let env = instance_context.rocksdb_env.clone();
+    let rocksdb_shared_metrics = Arc::clone(&upsert_metrics.rocksdb_shared);
+    let rocksdb_instance_metrics = Arc::clone(&upsert_metrics.rocksdb_instance_metrics);
 
-        let rocksdb_in_use_metric = Arc::clone(&upsert_metrics.rocksdb_autospill_in_use);
+    let env = instance_context.rocksdb_env.clone();
 
-        // A closure that will initialize and return a configured RocksDB instance
-        let rocksdb_init_fn = move || async move {
-            let merge_operator =
-                if rocksdb_use_native_merge_operator {
-                    Some((
-                        "upsert_state_snapshot_merge_v1".to_string(),
-                        |a: &[u8],
-                         b: ValueIterator<
-                            BincodeOpts,
-                            StateValue<G::Timestamp, Option<FromTime>>,
-                        >| {
-                            consolidating_merge_function::<G::Timestamp, Option<FromTime>>(
-                                a.into(),
-                                b,
-                            )
-                        },
-                    ))
-                } else {
-                    None
-                };
-            rocksdb::RocksDB::new(
-                mz_rocksdb::RocksDBInstance::new(
-                    &rocksdb_dir,
-                    mz_rocksdb::InstanceOptions::new(
-                        env,
-                        rocksdb_cleanup_tries,
-                        merge_operator,
-                        // For now, just use the same config as the one used for
-                        // merging snapshots.
-                        upsert_bincode_opts(),
-                    ),
-                    tuning,
-                    rocksdb_shared_metrics,
-                    rocksdb_instance_metrics,
-                )
-                .unwrap(),
-            )
-        };
-
-        // TODO(aljoscha): I don't like how we have basically the same call
-        // three times here, but it's hard working around those impl Futures
-        // that return an impl Trait. Oh well...
-        if allow_auto_spill {
-            upsert_operator(
-                &thin_input,
-                upsert_envelope.key_indices,
-                resume_upper,
-                previous,
-                previous_token,
-                upsert_metrics,
-                source_config,
-                move || async move {
-                    AutoSpillBackend::new(rocksdb_init_fn, spill_threshold, rocksdb_in_use_metric)
+    // A closure that will initialize and return a configured RocksDB instance
+    let rocksdb_init_fn = move || async move {
+        let merge_operator = if rocksdb_use_native_merge_operator {
+            Some((
+                "upsert_state_snapshot_merge_v1".to_string(),
+                |a: &[u8], b: ValueIterator<BincodeOpts, StateValue<G::Timestamp, FromTime>>| {
+                    consolidating_merge_function::<G::Timestamp, FromTime>(a.into(), b)
                 },
-                upsert_config,
-                storage_configuration,
-                prevent_snapshot_buffering,
-                snapshot_buffering_max,
-            )
+            ))
         } else {
-            upsert_operator(
-                &thin_input,
-                upsert_envelope.key_indices,
-                resume_upper,
-                previous,
-                previous_token,
-                upsert_metrics,
-                source_config,
-                rocksdb_init_fn,
-                upsert_config,
-                storage_configuration,
-                prevent_snapshot_buffering,
-                snapshot_buffering_max,
+            None
+        };
+        rocksdb::RocksDB::new(
+            mz_rocksdb::RocksDBInstance::new(
+                &rocksdb_dir,
+                mz_rocksdb::InstanceOptions::new(
+                    env,
+                    rocksdb_cleanup_tries,
+                    merge_operator,
+                    // For now, just use the same config as the one used for
+                    // merging snapshots.
+                    upsert_bincode_opts(),
+                ),
+                tuning,
+                rocksdb_shared_metrics,
+                rocksdb_instance_metrics,
             )
-        }
-    } else {
-        tracing::info!(
-            worker_id = %source_config.worker_id,
-            source_id = %source_config.id,
-            "rendering upsert source with memory-backed upsert state",
-        );
-        upsert_operator(
-            &thin_input,
-            upsert_envelope.key_indices,
-            resume_upper,
-            previous,
-            previous_token,
-            upsert_metrics,
-            source_config,
-            || async { InMemoryHashMap::default() },
-            upsert_config,
-            storage_configuration,
-            prevent_snapshot_buffering,
-            snapshot_buffering_max,
+            .unwrap(),
         )
-    }
+    };
+
+    upsert_operator(
+        &thin_input,
+        upsert_envelope.key_indices,
+        resume_upper,
+        previous,
+        previous_token,
+        upsert_metrics,
+        source_config,
+        rocksdb_init_fn,
+        upsert_config,
+        storage_configuration,
+        prevent_snapshot_buffering,
+        snapshot_buffering_max,
+    )
 }
 
 // A shim so we can dispatch based on the dyncfg that tells us which upsert
@@ -410,7 +365,7 @@ where
     G::Timestamp: Refines<mz_repr::Timestamp> + TotalOrder + Sync,
     F: FnOnce() -> Fut + 'static,
     Fut: std::future::Future<Output = US>,
-    US: UpsertStateBackend<G::Timestamp, Option<FromTime>>,
+    US: UpsertStateBackend<G::Timestamp, FromTime>,
     FromTime: Debug + timely::ExchangeData + Ord + Sync,
 {
     // Hard-coded to true because classic UPSERT cannot be used safely with
@@ -552,18 +507,15 @@ enum DrainStyle<'a, T> {
 /// from the input timely edge.
 async fn drain_staged_input<S, G, T, FromTime, E>(
     stash: &mut Vec<(T, UpsertKey, Reverse<FromTime>, Option<UpsertValue>)>,
-    commands_state: &mut indexmap::IndexMap<
-        UpsertKey,
-        types::UpsertValueAndSize<T, Option<FromTime>>,
-    >,
-    output_updates: &mut Vec<(Result<Row, UpsertError>, T, Diff)>,
+    commands_state: &mut indexmap::IndexMap<UpsertKey, types::UpsertValueAndSize<T, FromTime>>,
+    output_updates: &mut Vec<(UpsertValue, T, Diff)>,
     multi_get_scratch: &mut Vec<UpsertKey>,
     drain_style: DrainStyle<'_, T>,
     error_emitter: &mut E,
-    state: &mut UpsertState<'_, S, T, Option<FromTime>>,
+    state: &mut UpsertState<'_, S, T, FromTime>,
     source_config: &crate::source::SourceExportCreationConfig,
 ) where
-    S: UpsertStateBackend<T, Option<FromTime>>,
+    S: UpsertStateBackend<T, FromTime>,
     G: Scope,
     T: PartialOrder + Ord + Clone + Send + Sync + Serialize + Debug + 'static,
     FromTime: timely::ExchangeData + Ord + Sync,
@@ -639,7 +591,9 @@ async fn drain_staged_input<S, G, T, FromTime, E>(
         // Skip this command if its order key is below the one in the upsert state.
         // Note that the existing order key may be `None` if the existing value
         // is from snapshotting, which always sorts below new values/deletes.
-        let existing_order = existing_value.as_ref().and_then(|cs| cs.order().as_ref());
+        let existing_order = existing_value
+            .as_ref()
+            .and_then(|cs| cs.provisional_order(&ts));
         if existing_order >= Some(&from_time.0) {
             // Skip this update. If no later updates adjust this key, then we just
             // end up writing the same value back to state. If there
@@ -650,11 +604,10 @@ async fn drain_staged_input<S, G, T, FromTime, E>(
 
         match value {
             Some(value) => {
-                if let Some(old_value) = existing_value.replace(StateValue::finalized_value(
-                    value.clone(),
-                    Some(from_time.0.clone()),
-                )) {
-                    if let Value::FinalizedValue(old_value, _) = old_value.into_decoded() {
+                if let Some(old_value) =
+                    existing_value.replace(StateValue::finalized_value(value.clone()))
+                {
+                    if let Some(old_value) = old_value.into_decoded().finalized {
                         output_updates.push((old_value, ts.clone(), Diff::MINUS_ONE));
                     }
                 }
@@ -662,13 +615,13 @@ async fn drain_staged_input<S, G, T, FromTime, E>(
             }
             None => {
                 if let Some(old_value) = existing_value.take() {
-                    if let Value::FinalizedValue(old_value, _) = old_value.into_decoded() {
+                    if let Some(old_value) = old_value.into_decoded().finalized {
                         output_updates.push((old_value, ts, Diff::MINUS_ONE));
                     }
                 }
 
                 // Record a tombstone for deletes.
-                *existing_value = Some(StateValue::tombstone(Some(from_time.0.clone())));
+                *existing_value = Some(StateValue::tombstone());
             }
         }
     }
@@ -728,7 +681,7 @@ where
     G::Timestamp: TotalOrder + Sync,
     F: FnOnce() -> Fut + 'static,
     Fut: std::future::Future<Output = US>,
-    US: UpsertStateBackend<G::Timestamp, Option<FromTime>>,
+    US: UpsertStateBackend<G::Timestamp, FromTime>,
     FromTime: timely::ExchangeData + Ord + Sync,
 {
     let mut builder = AsyncOperatorBuilder::new("Upsert".to_string(), input.scope());
@@ -738,12 +691,16 @@ where
         let value = match result {
             Ok(ok) => Ok(ok),
             Err(DataflowError::EnvelopeError(err)) => match *err {
-                EnvelopeError::Upsert(err) => Err(err),
+                EnvelopeError::Upsert(err) => Err(Box::new(err)),
                 _ => return None,
             },
             Err(_) => return None,
         };
-        Some((UpsertKey::from_value(value.as_ref(), &key_indices), value))
+        let value_ref = match value {
+            Ok(ref row) => Ok(row),
+            Err(ref err) => Err(&**err),
+        };
+        Some((UpsertKey::from_value(value_ref, &key_indices), value))
     });
     let (output_handle, output) = builder.new_output();
 
@@ -769,10 +726,7 @@ where
     let shutdown_button = builder.build(move |caps| async move {
         let [mut output_cap, mut snapshot_cap, health_cap]: [_; 3] = caps.try_into().unwrap();
 
-        // The order key of the `UpsertState` is `Option<FromTime>`, which implements `Default`
-        // (as required for `consolidate_chunk`), with slightly more efficient serialization
-        // than a default `Partitioned`.
-        let mut state = UpsertState::<_, _, Option<FromTime>>::new(
+        let mut state = UpsertState::<_, _, FromTime>::new(
             state().await,
             upsert_shared_metrics,
             &upsert_metrics,
@@ -869,7 +823,7 @@ where
         // and have a consistent iteration order.
         let mut commands_state: indexmap::IndexMap<
             _,
-            types::UpsertValueAndSize<G::Timestamp, Option<FromTime>>,
+            types::UpsertValueAndSize<G::Timestamp, FromTime>,
         > = indexmap::IndexMap::new();
         let mut multi_get_scratch = Vec::new();
 
@@ -981,7 +935,7 @@ where
     (
         output.as_collection().map(|result| match result {
             Ok(ok) => Ok(ok),
-            Err(err) => Err(DataflowError::from(EnvelopeError::Upsert(err))),
+            Err(err) => Err(DataflowError::from(EnvelopeError::Upsert(*err))),
         }),
         health_stream,
         snapshot_stream,

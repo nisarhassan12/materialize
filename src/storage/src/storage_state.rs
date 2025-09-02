@@ -398,20 +398,18 @@ impl StorageInstanceContext {
         scratch_directory: Option<PathBuf>,
         cluster_memory_limit: Option<usize>,
     ) -> Result<Self, anyhow::Error> {
+        // If no file system is available, fall back to running RocksDB in memory.
+        let rocksdb_env = if scratch_directory.is_some() {
+            rocksdb::Env::new()?
+        } else {
+            rocksdb::Env::mem_env()?
+        };
+
         Ok(Self {
             scratch_directory,
-            rocksdb_env: rocksdb::Env::new()?,
+            rocksdb_env,
             cluster_memory_limit,
         })
-    }
-
-    /// Constructs a new connection context for usage in tests.
-    pub fn for_tests(rocksdb_env: rocksdb::Env) -> Self {
-        Self {
-            scratch_directory: None,
-            rocksdb_env,
-            cluster_memory_limit: None,
-        }
     }
 }
 
@@ -1017,8 +1015,8 @@ impl<'w, A: Allocate> Worker<'w, A> {
 
         for command in &mut commands {
             match command {
-                StorageCommand::CreateTimely { .. } => {
-                    panic!("CreateTimely must be captured before")
+                StorageCommand::Hello { .. } => {
+                    panic!("Hello must be captured before")
                 }
                 StorageCommand::AllowCompaction(id, since) => {
                     info!(%worker_id, ?id, ?since, "reconcile: received AllowCompaction command");
@@ -1084,8 +1082,8 @@ impl<'w, A: Allocate> Worker<'w, A> {
         for mut command in commands.into_iter().rev() {
             let mut should_keep = true;
             match &mut command {
-                StorageCommand::CreateTimely { .. } => {
-                    panic!("CreateTimely must be captured before")
+                StorageCommand::Hello { .. } => {
+                    panic!("Hello must be captured before")
                 }
                 StorageCommand::RunIngestion(ingestion) => {
                     // Subsources can be dropped independently of their
@@ -1288,7 +1286,7 @@ impl StorageState {
     /// commands to the `internal_cmd_tx`.
     pub fn handle_storage_command(&mut self, cmd: StorageCommand) {
         match cmd {
-            StorageCommand::CreateTimely { .. } => panic!("CreateTimely must be captured before"),
+            StorageCommand::Hello { .. } => panic!("Hello must be captured before"),
             StorageCommand::InitializationComplete => (),
             StorageCommand::AllowWrites => {
                 self.read_only_tx

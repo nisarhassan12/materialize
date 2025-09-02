@@ -37,12 +37,14 @@ CREATE PUBLICATION mz_source FOR ALL TABLES;
     USER postgres,
     PASSWORD SECRET pgpass
   )
+> BEGIN
 > CREATE SOURCE mz_source
   IN CLUSTER storage
   FROM POSTGRES CONNECTION pg (PUBLICATION 'mz_source')
   WITH (RETAIN HISTORY = FOR '365000 days');
 
 > CREATE TABLE t1 FROM SOURCE mz_source (REFERENCE t1);
+> COMMIT
 
 # Grab a cursor at timestamp 0
 > BEGIN
@@ -52,7 +54,7 @@ CREATE PUBLICATION mz_source FOR ALL TABLES;
 # Start ingestion by adding a replica to the cluster. We must do this from a
 # different connection to not disturbe the transaction we're in.
 $ postgres-execute connection=postgres://materialize:materialize@${testdrive.materialize-sql-addr}
-CREATE CLUSTER REPLICA storage.r1 SIZE = '1';
+CREATE CLUSTER REPLICA storage.r1 SIZE = 'scale=1,workers=1';
 
 # Verify that at timestamp 0 there is only one record whose value is the final value
 > FETCH 1 c WITH (timeout = '1d');

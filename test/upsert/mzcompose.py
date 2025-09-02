@@ -14,11 +14,15 @@
 Test Kafka Upsert sources using Testdrive.
 """
 
-from pathlib import Path
+import os
 from textwrap import dedent
 
 from materialize import ci_util
-from materialize.mzcompose.composition import Composition, WorkflowArgumentParser
+from materialize.mzcompose.composition import (
+    Composition,
+    Service,
+    WorkflowArgumentParser,
+)
 from materialize.mzcompose.services.clusterd import Clusterd
 from materialize.mzcompose.services.kafka import Kafka
 from materialize.mzcompose.services.materialized import Materialized
@@ -40,13 +44,13 @@ SERVICES = [
             "--orchestrator-process-scratch-directory=/scratch",
         ],
         additional_system_parameter_defaults={
-            "disk_cluster_replicas_default": "true",
             "unsafe_enable_unorchestrated_cluster_replicas": "true",
             "storage_dataflow_delay_sources_past_rehydration": "true",
-            "upsert_rocksdb_auto_spill_to_disk": "false",
+            "memory_limiter_interval": "0",
         },
         environment_extra=materialized_environment_extra,
         default_replication_factor=2,
+        support_external_clusterd=True,
     ),
     Testdrive(),
     Clusterd(name="clusterd1"),
@@ -87,7 +91,7 @@ def workflow_testdrive(c: Composition, parser: WorkflowArgumentParser) -> None:
         "--default-size",
         type=int,
         default=Materialized.Size.DEFAULT_SIZE,
-        help="Use SIZE 'N-N' for replicas and SIZE 'N' for sources",
+        help="Use SIZE 'scale=N,workers=N' for replicas and SIZE 'scale=N,workers=1' for sources",
     )
 
     parser.add_argument("--replicas", type=int, default=1, help="use multiple replicas")
@@ -114,14 +118,13 @@ def workflow_testdrive(c: Composition, parser: WorkflowArgumentParser) -> None:
         options=[
             "--orchestrator-process-scratch-directory=/scratch",
         ],
-        additional_system_parameter_defaults={
-            "disk_cluster_replicas_default": "true",
-        },
         environment_extra=materialized_environment_extra,
         default_replication_factor=2,
+        support_external_clusterd=True,
     )
 
     with c.override(testdrive, materialized):
+        c.rm("testdrive")
         c.up(*dependencies)
 
         if args.replicas > 1:
@@ -139,24 +142,19 @@ def workflow_testdrive(c: Composition, parser: WorkflowArgumentParser) -> None:
 
         junit_report = ci_util.junit_report_filename(c.name)
 
-        try:
-            junit_report = ci_util.junit_report_filename(c.name)
-
-            def process(file: str) -> None:
-                c.run_testdrive_files(
-                    f"--junit-report={junit_report}",
-                    f"--var=replicas={args.replicas}",
-                    f"--var=default-replica-size={materialized.default_replica_size}",
-                    f"--var=default-storage-size={materialized.default_storage_size}",
-                    file,
-                )
-
-            c.test_parts(args.files, process)
-            c.sanity_restart_mz()
-        finally:
-            ci_util.upload_junit_report(
-                "testdrive", Path(__file__).parent / junit_report
+        def process(file: str) -> None:
+            c.run_testdrive_files(
+                f"--junit-report={junit_report}",
+                f"--var=replicas={args.replicas}",
+                f"--var=default-replica-size={materialized.default_replica_size}",
+                f"--var=default-storage-size={materialized.default_storage_size}",
+                file,
             )
+            # Uploading successful junit files wastes time and contains no useful information
+            os.remove(f"test/upsert/{junit_report}")
+
+        c.test_parts(args.files, process)
+        c.sanity_restart_mz()
 
 
 def workflow_rehydration(c: Composition) -> None:
@@ -181,8 +179,6 @@ def workflow_rehydration(c: Composition) -> None:
                     "storage_statistics_collection_interval": "1000",
                     "storage_statistics_interval": "2000",
                     "unsafe_enable_unorchestrated_cluster_replicas": "true",
-                    "disk_cluster_replicas_default": "true",
-                    "enable_disk_cluster_replicas": "true",
                     # Force backpressure to be enabled.
                     "storage_dataflow_max_inflight_bytes": "1",
                     "storage_dataflow_max_inflight_bytes_to_cluster_size_fraction": "0.01",
@@ -194,6 +190,7 @@ def workflow_rehydration(c: Composition) -> None:
                 },
                 environment_extra=materialized_environment_extra,
                 default_replication_factor=2,
+                support_external_clusterd=True,
             ),
             Clusterd(
                 name="clusterd1",
@@ -213,8 +210,6 @@ def workflow_rehydration(c: Composition) -> None:
                     "storage_statistics_collection_interval": "1000",
                     "storage_statistics_interval": "2000",
                     "unsafe_enable_unorchestrated_cluster_replicas": "true",
-                    "disk_cluster_replicas_default": "true",
-                    "enable_disk_cluster_replicas": "true",
                     # Force backpressure to be enabled.
                     "storage_dataflow_max_inflight_bytes": "1",
                     "storage_dataflow_max_inflight_bytes_to_cluster_size_fraction": "0.01",
@@ -228,6 +223,7 @@ def workflow_rehydration(c: Composition) -> None:
                 },
                 environment_extra=materialized_environment_extra,
                 default_replication_factor=2,
+                support_external_clusterd=True,
             ),
             Clusterd(
                 name="clusterd1",
@@ -255,6 +251,7 @@ def workflow_rehydration(c: Composition) -> None:
                 },
                 environment_extra=materialized_environment_extra,
                 default_replication_factor=2,
+                support_external_clusterd=True,
             ),
             Clusterd(
                 name="clusterd1",
@@ -267,6 +264,7 @@ def workflow_rehydration(c: Composition) -> None:
             clusterd,
             Testdrive(no_reset=True, consistent_seed=True),
         ):
+            c.rm("testdrive")
             print(f"Running rehydration workflow {style}")
             c.down(destroy_volumes=True)
 
@@ -315,6 +313,7 @@ def run_one_failpoint(c: Composition, failpoint: str, error_message: str) -> Non
         Testdrive(no_reset=True, consistent_seed=True),
         Clusterd(name="clusterd1", workers=4),
     ):
+        c.rm("testdrive")
         c.run_testdrive_files("failpoint/01-setup.td")
         c.up("clusterd1")
         c.run_testdrive_files("failpoint/02-source.td")
@@ -356,7 +355,6 @@ def workflow_incident_49(c: Composition) -> None:
             "with DISK",
             Materialized(
                 additional_system_parameter_defaults={
-                    "disk_cluster_replicas_default": "true",
                     "storage_dataflow_delay_sources_past_rehydration": "true",
                 },
                 environment_extra=materialized_environment_extra,
@@ -367,7 +365,6 @@ def workflow_incident_49(c: Composition) -> None:
             "without DISK",
             Materialized(
                 additional_system_parameter_defaults={
-                    "disk_cluster_replicas_default": "false",
                     "storage_dataflow_delay_sources_past_rehydration": "true",
                 },
                 environment_extra=materialized_environment_extra,
@@ -379,6 +376,7 @@ def workflow_incident_49(c: Composition) -> None:
             mz,
             Testdrive(no_reset=True, consistent_seed=True),
         ):
+            c.rm("testdrive")
             print(f"Running incident-49 workflow {style}")
             c.down(destroy_volumes=True)
             c.up(*dependencies)
@@ -439,7 +437,8 @@ def workflow_rocksdb_cleanup(c: Composition) -> None:
         with c.override(
             Testdrive(no_reset=True),
         ):
-            c.up("testdrive", persistent=True)
+            c.rm("testdrive")
+            c.up(Service("testdrive", idle=True))
             c.exec("testdrive", f"rocksdb-cleanup/{testdrive_file}")
 
             (_, kept_source_path) = rocksdb_path("kept_upsert_tbl")
@@ -470,87 +469,6 @@ def workflow_rocksdb_cleanup(c: Composition) -> None:
         )
 
 
-def workflow_autospill(c: Composition) -> None:
-    """Testing auto spill to disk"""
-    dependencies = [
-        "zookeeper",
-        "kafka",
-        "materialized",
-        "schema-registry",
-        "clusterd1",
-    ]
-
-    # Helper function to get worker 0 autospill metrics for clusterd.
-    def fetch_auto_spill_metric() -> int | None:
-        metrics = c.exec(
-            "clusterd1", "curl", "localhost:6878/metrics", capture=True
-        ).stdout
-
-        value = None
-        for metric in metrics.splitlines():
-            if metric.startswith("mz_storage_upsert_state_rocksdb_autospill_in_use"):
-                if value:
-                    value += int(metric.split()[1])
-                else:
-                    value = int(metric.split()[1])
-
-        return value
-
-    for style, mz in [
-        (
-            "with DISK",
-            Materialized(
-                options=[
-                    "--orchestrator-process-scratch-directory=/mzdata/source_data",
-                ],
-                additional_system_parameter_defaults={
-                    "disk_cluster_replicas_default": "true",
-                    "upsert_rocksdb_auto_spill_to_disk": "true",
-                    "upsert_rocksdb_auto_spill_threshold_bytes": "290",
-                    "unsafe_enable_unorchestrated_cluster_replicas": "true",
-                    "storage_dataflow_delay_sources_past_rehydration": "true",
-                },
-                default_replication_factor=2,
-            ),
-        ),
-        (
-            "with DISK and RocksDB Merge Operator",
-            Materialized(
-                options=[
-                    "--orchestrator-process-scratch-directory=/mzdata/source_data",
-                ],
-                additional_system_parameter_defaults={
-                    "disk_cluster_replicas_default": "true",
-                    "upsert_rocksdb_auto_spill_to_disk": "true",
-                    "upsert_rocksdb_auto_spill_threshold_bytes": "290",
-                    "unsafe_enable_unorchestrated_cluster_replicas": "true",
-                    "storage_dataflow_delay_sources_past_rehydration": "true",
-                    # Enable the RocksDB merge operator
-                    "storage_rocksdb_use_merge_operator": "true",
-                },
-                default_replication_factor=2,
-            ),
-        ),
-    ]:
-        with c.override(
-            mz,
-            Clusterd(
-                name="clusterd1",
-            ),
-            Testdrive(no_reset=True, consistent_seed=True),
-        ):
-            c.down(destroy_volumes=True)
-            print(f"Running autospill workflow {style}")
-            c.up(*dependencies)
-            c.run_testdrive_files("autospill/01-setup.td")
-
-            c.run_testdrive_files("autospill/02-memory.td")
-            assert fetch_auto_spill_metric() == 0
-
-            c.run_testdrive_files("autospill/03-rocksdb.td")
-            assert fetch_auto_spill_metric() == 1
-
-
 # This should not be run on ci and is not added to workflow_default above!
 # This test is there to compare rehydration metrics with different configs.
 # Can be run locally with the command ./mzcompose run load-test
@@ -574,21 +492,20 @@ def workflow_load_test(c: Composition, parser: WorkflowArgumentParser) -> None:
                 "--orchestrator-process-scratch-directory=/scratch",
             ],
             additional_system_parameter_defaults={
-                "disk_cluster_replicas_default": "true",
-                "enable_disk_cluster_replicas": "true",
-                "upsert_rocksdb_auto_spill_threshold_bytes": "250",
                 # Force backpressure to be enabled.
                 "storage_dataflow_max_inflight_bytes": f"{backpressure_bytes}",
                 "storage_dataflow_max_inflight_bytes_disk_only": "true",
             },
             environment_extra=materialized_environment_extra,
             default_replication_factor=2,
+            support_external_clusterd=True,
         ),
         Clusterd(
             name="clusterd1",
         ),
     ):
-        c.up("testdrive", persistent=True)
+        c.rm("testdrive")
+        c.up(Service("testdrive", idle=True))
         c.exec("testdrive", "load-test/setup.td")
         c.testdrive(
             dedent(
@@ -628,9 +545,6 @@ def workflow_load_test(c: Composition, parser: WorkflowArgumentParser) -> None:
             (
                 "default",
                 {
-                    "disk_cluster_replicas_default": "true",
-                    "enable_disk_cluster_replicas": "true",
-                    "upsert_rocksdb_auto_spill_threshold_bytes": "250",
                     # Force backpressure to be enabled.
                     "storage_dataflow_max_inflight_bytes": f"{backpressure_bytes}",
                     "storage_dataflow_max_inflight_bytes_disk_only": "true",
@@ -640,9 +554,6 @@ def workflow_load_test(c: Composition, parser: WorkflowArgumentParser) -> None:
                 "default with RocksDB Merge Operator",
                 {
                     "storage_rocksdb_use_merge_operator": "true",
-                    "disk_cluster_replicas_default": "true",
-                    "enable_disk_cluster_replicas": "true",
-                    "upsert_rocksdb_auto_spill_threshold_bytes": "250",
                     # Force backpressure to be enabled.
                     "storage_dataflow_max_inflight_bytes": f"{backpressure_bytes}",
                     "storage_dataflow_max_inflight_bytes_disk_only": "true",
@@ -651,9 +562,6 @@ def workflow_load_test(c: Composition, parser: WorkflowArgumentParser) -> None:
             (
                 "with write_buffer_manager no stall",
                 {
-                    "disk_cluster_replicas_default": "true",
-                    "enable_disk_cluster_replicas": "true",
-                    "upsert_rocksdb_auto_spill_threshold_bytes": "250",
                     # Force backpressure to be enabled.
                     "storage_dataflow_max_inflight_bytes": f"{backpressure_bytes}",
                     "storage_dataflow_max_inflight_bytes_disk_only": "true",
@@ -664,9 +572,6 @@ def workflow_load_test(c: Composition, parser: WorkflowArgumentParser) -> None:
             (
                 "with write_buffer_manager stall enabled",
                 {
-                    "disk_cluster_replicas_default": "true",
-                    "enable_disk_cluster_replicas": "true",
-                    "upsert_rocksdb_auto_spill_threshold_bytes": "250",
                     # Force backpressure to be enabled.
                     "storage_dataflow_max_inflight_bytes": f"{backpressure_bytes}",
                     "storage_dataflow_max_inflight_bytes_disk_only": "true",
@@ -685,6 +590,7 @@ def workflow_load_test(c: Composition, parser: WorkflowArgumentParser) -> None:
                     additional_system_parameter_defaults=mz_configs,
                     environment_extra=materialized_environment_extra,
                     default_replication_factor=2,
+                    support_external_clusterd=True,
                 ),
             ):
                 c.kill("materialized", "clusterd1")
@@ -729,7 +635,8 @@ def workflow_large_scale(c: Composition, parser: WorkflowArgumentParser) -> None
     with c.override(
         Testdrive(no_reset=True, consistent_seed=True),
     ):
-        c.up("testdrive", persistent=True)
+        c.rm("testdrive")
+        c.up(Service("testdrive", idle=True))
 
         c.testdrive(
             dedent(
@@ -754,7 +661,7 @@ def workflow_large_scale(c: Composition, parser: WorkflowArgumentParser) -> None
             )
 
         num_rows = 100_000  # out of disk with 200_000 rows
-        batch_size = 10_000
+        batch_size = 1_000
         for i in range(0, num_rows, batch_size):
             batch_num = min(batch_size, num_rows - i)
             make_inserts(c, i, batch_num)

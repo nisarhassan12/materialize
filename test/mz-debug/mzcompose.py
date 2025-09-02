@@ -14,11 +14,22 @@ Basic test for mz-debug
 from dataclasses import dataclass
 
 from materialize import spawn
-from materialize.mzcompose.composition import Composition, WorkflowArgumentParser
+from materialize.mzcompose.composition import (
+    Composition,
+    Service,
+    WorkflowArgumentParser,
+)
 from materialize.mzcompose.services.materialized import Materialized
+from materialize.mzcompose.services.mz_debug import MzDebug
 
 SERVICES = [
-    Materialized(),
+    Materialized(
+        ports=[
+            "6875:6875",
+            "6877:6877",
+        ]
+    ),
+    MzDebug(),
 ]
 
 
@@ -40,27 +51,15 @@ test_cases = [
 
 
 def workflow_default(c: Composition, parser: WorkflowArgumentParser) -> None:
-    materialized = Materialized(
-        ports=[
-            "6875:6875",
-            "6877:6877",
-        ]
-    )
-
-    with c.override(materialized):
-        c.down()
-        c.up("materialized")
-
+    c.up("materialized", Service("mz-debug", idle=True))
+    c.invoke("cp", "mz-debug:/usr/local/bin/mz-debug", ".")
     container_id = c.container_id("materialized")
     if container_id is None:
         raise ValueError("Failed to get materialized container ID")
 
     spawn.runv(
         [
-            "cargo",
-            "run",
-            "--bin",
-            "mz-debug",
+            "./mz-debug",
             "emulator",
             "--docker-container-id",
             container_id,

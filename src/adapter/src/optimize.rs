@@ -241,6 +241,7 @@ impl From<&OptimizerConfig> for mz_sql::plan::HirToMirConfig {
         Self {
             enable_new_outer_join_lowering: config.features.enable_new_outer_join_lowering,
             enable_variadic_left_join_lowering: config.features.enable_variadic_left_join_lowering,
+            enable_guard_subquery_tablefunc: config.features.enable_guard_subquery_tablefunc,
         }
     }
 }
@@ -287,8 +288,12 @@ pub enum OptimizerError {
         func: UnmaterializableFunc,
         context: &'static str,
     },
-    #[error("MfpPlan couldn't be converted into SafeMfpPlan")]
-    UnsafeMfpPlan,
+    #[error("{0}")]
+    UnsupportedTemporalExpression(String),
+    /// This is a specific kind of internal error. It's distinct from `Internal`, because we want to
+    /// catch it and swallow it in some cases.
+    #[error("internal optimizer error: MfpPlan couldn't be converted into SafeMfpPlan")]
+    InternalUnsafeMfpPlan(String),
     #[error("internal optimizer error: {0}")]
     Internal(String),
 }

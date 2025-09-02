@@ -382,10 +382,14 @@ pub enum SqlServerSourcePurificationError {
         col_name: Arc<str>,
         col_type: Arc<str>,
     },
+    #[error("Table {tbl_name} had all columns excluded")]
+    AllColumnsExcluded { tbl_name: Arc<str> },
     #[error("No tables found for provided reference")]
     NoTables,
     #[error("programming error: {0}")]
     ProgrammingError(String),
+    #[error("No start_lsn found for capture instance {0}")]
+    NoStartLsn(String),
 }
 
 impl SqlServerSourcePurificationError {

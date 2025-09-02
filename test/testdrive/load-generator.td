@@ -7,7 +7,7 @@
 # the Business Source License, use of this software will be governed
 # by the Apache License, Version 2.0.
 
-$ set-arg-default default-replica-size=1
+$ set-arg-default default-replica-size=scale=1,workers=1
 $ set-arg-default single-replica-cluster=quickstart
 
 $ postgres-execute connection=postgres://mz_system:materialize@${testdrive.materialize-internal-sql-addr}
@@ -110,6 +110,7 @@ users                   ""
 contains:reference to user not found in source
 
 > CREATE SCHEMA another;
+> BEGIN
 > CREATE SOURCE another.auction_house
   IN CLUSTER ${arg.single-replica-cluster}
   FROM LOAD GENERATOR AUCTION;
@@ -119,6 +120,7 @@ contains:reference to user not found in source
 > CREATE TABLE another.bids FROM SOURCE another.auction_house (REFERENCE bids);
 > CREATE TABLE another.organizations FROM SOURCE another.auction_house (REFERENCE organizations);
 > CREATE TABLE another.users FROM SOURCE another.auction_house (REFERENCE users);
+> COMMIT
 
 > SHOW SOURCES FROM another;
 auction_house           load-generator ${arg.single-replica-cluster}    ""

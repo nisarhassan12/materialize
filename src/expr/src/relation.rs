@@ -1228,9 +1228,7 @@ impl MirRelationExpr {
             }
             Project { outputs, .. } => outputs.len(),
             Map { scalars, .. } => input_arities.next().unwrap() + scalars.len(),
-            FlatMap { func, .. } => {
-                input_arities.next().unwrap() + func.output_type().column_types.len()
-            }
+            FlatMap { func, .. } => input_arities.next().unwrap() + func.output_arity(),
             Join { .. } => input_arities.sum(),
             Reduce {
                 input: _,
@@ -3695,6 +3693,18 @@ impl<L> RowSetFinishing<L> {
     /// are still correct but maybe surprising for some users.
     pub fn is_streamable(&self, arity: usize) -> bool {
         self.order_by.is_empty() && self.project.iter().copied().eq(0..arity)
+    }
+}
+
+impl RowSetFinishing<NonNeg<i64>, usize> {
+    /// The number of rows needed from before the finishing to evaluate the finishing:
+    /// offset + limit.
+    ///
+    /// If it returns None, then we need all the rows.
+    pub fn num_rows_needed(&self) -> Option<usize> {
+        self.limit
+            .as_ref()
+            .map(|l| usize::cast_from(u64::from(l.clone())) + self.offset)
     }
 }
 

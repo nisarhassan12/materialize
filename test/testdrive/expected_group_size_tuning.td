@@ -7,11 +7,14 @@
 # the Business Source License, use of this software will be governed
 # by the Apache License, Version 2.0.
 
+$ set-sql-timeout duration=60s
+
 # This test uses introspection queries that need to be targeted to a replica
 > SET cluster_replica = r1
 
 # Start from a TPC-H load generator source with small data.
-> CREATE CLUSTER lgtpch_cluster_tuning SIZE '1';
+> CREATE CLUSTER lgtpch_cluster_tuning SIZE 'scale=1,workers=1';
+> BEGIN
 > CREATE SOURCE lgtpch IN CLUSTER lgtpch_cluster_tuning FROM LOAD GENERATOR TPCH (SCALE FACTOR 0.0001, TICK INTERVAL 0.1, UP TO 1000);
 
 > CREATE TABLE customer FROM SOURCE lgtpch (REFERENCE customer);
@@ -22,6 +25,7 @@
 > CREATE TABLE partsupp FROM SOURCE lgtpch (REFERENCE partsupp);
 > CREATE TABLE region FROM SOURCE lgtpch (REFERENCE region);
 > CREATE TABLE supplier FROM SOURCE lgtpch (REFERENCE supplier);
+> COMMIT
 
 # Create a set of materialized views for testing based on the TPC-H schema.
 > CREATE MATERIALIZED VIEW lineitem_by_orderkey AS

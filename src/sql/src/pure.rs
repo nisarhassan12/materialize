@@ -23,6 +23,7 @@ use mz_ccsr::{Client, GetByIdError, GetBySubjectError, Schema as CcsrSchema};
 use mz_controller_types::ClusterId;
 use mz_kafka_util::client::MzClientContext;
 use mz_mysql_util::MySqlTableDesc;
+use mz_ore::collections::CollectionExt;
 use mz_ore::error::ErrorExt;
 use mz_ore::future::InTask;
 use mz_ore::iter::IteratorExt;
@@ -39,7 +40,7 @@ use mz_sql_parser::ast::visit_mut::{VisitMut, visit_expr_mut};
 use mz_sql_parser::ast::{
     AlterSourceAction, AlterSourceAddSubsourceOptionName, AlterSourceStatement, AvroDocOn,
     ColumnName, CreateMaterializedViewStatement, CreateSinkConnection, CreateSinkOptionName,
-    CreateSinkStatement, CreateSubsourceOption, CreateSubsourceOptionName,
+    CreateSinkStatement, CreateSourceOptionName, CreateSubsourceOption, CreateSubsourceOptionName,
     CreateTableFromSourceStatement, CsrConfigOption, CsrConfigOptionName, CsrConnection,
     CsrSeedAvro, CsrSeedProtobuf, CsrSeedProtobufSchema, DeferredItemName, DocOnIdentifier,
     DocOnSchema, Expr, Function, FunctionArgs, Ident, KafkaSourceConfigOption,
@@ -261,6 +262,7 @@ pub enum PurifiedExportDetails {
         text_columns: Option<Vec<Ident>>,
         excl_columns: Option<Vec<Ident>>,
         capture_instance: Arc<str>,
+        initial_lsn: mz_sql_server_util::cdc::Lsn,
     },
     Kafka {},
     LoadGenerator {
@@ -625,6 +627,7 @@ async fn purify_create_source(
         include_metadata,
         external_references,
         progress_subsource,
+        with_options,
         ..
     } = &mut create_source_stmt;
 
@@ -1008,6 +1011,9 @@ async fn purify_create_source(
             retrieved_source_references = reference_client.get_source_references().await?;
             tracing::debug!(?retrieved_source_references, "got source references");
 
+            let timeout = mz_storage_types::sources::sql_server::MAX_LSN_WAIT
+                .get(storage_configuration.config_set());
+
             let purified_source_exports = sql_server::purify_source_exports(
                 &*database,
                 &mut client,
@@ -1016,6 +1022,7 @@ async fn purify_create_source(
                 &text_columns,
                 &exclude_columns,
                 source_name,
+                timeout,
                 &reference_policy,
             )
             .await?;
@@ -1029,9 +1036,13 @@ async fn purify_create_source(
             // Update our set of requested source exports.
             requested_subsource_map.extend(source_exports);
 
-            // Reset the 'DETAILS' to ensure they're empty, we don't use them
-            // in the SQL Server source.
-            let details = SqlServerSourceExtras {};
+            // Record the most recent restore_history_id, or none if the system has never been
+            // restored.
+
+            let restore_history_id =
+                mz_sql_server_util::inspect::get_latest_restore_history_id(&mut client).await?;
+            let details = SqlServerSourceExtras { restore_history_id };
+
             options.retain(|SqlServerConfigOption { name, .. }| {
                 name != &SqlServerConfigOptionName::Details
             });
@@ -1306,6 +1317,20 @@ async fn purify_create_source(
     let (columns, constraints) = scx.relation_desc_into_table_defs(progress_desc)?;
 
     // Create the subsource statement
+    let mut progress_with_options: Vec<_> = with_options
+        .iter()
+        .filter_map(|opt| match opt.name {
+            CreateSourceOptionName::TimestampInterval => None,
+            CreateSourceOptionName::RetainHistory => Some(CreateSubsourceOption {
+                name: CreateSubsourceOptionName::RetainHistory,
+                value: opt.value.clone(),
+            }),
+        })
+        .collect();
+    progress_with_options.push(CreateSubsourceOption {
+        name: CreateSubsourceOptionName::Progress,
+        value: Some(WithOptionValue::Value(Value::Boolean(true))),
+    });
     let create_progress_subsource_stmt = CreateSubsourceStatement {
         name,
         columns,
@@ -1315,10 +1340,7 @@ async fn purify_create_source(
         of_source: None,
         constraints,
         if_not_exists: false,
-        with_options: vec![CreateSubsourceOption {
-            name: CreateSubsourceOptionName::Progress,
-            value: Some(WithOptionValue::Value(Value::Boolean(true))),
-        }],
+        with_options: progress_with_options,
     };
 
     purify_source_format(
@@ -1620,6 +1642,9 @@ async fn purify_alter_source_add_subsources(
             .await?;
             let requested_references = Some(ExternalReferences::SubsetTables(external_references));
 
+            let timeout = mz_storage_types::sources::sql_server::MAX_LSN_WAIT
+                .get(storage_configuration.config_set());
+
             let result = sql_server::purify_source_exports(
                 &*database,
                 &mut client,
@@ -1628,6 +1653,7 @@ async fn purify_alter_source_add_subsources(
                 &text_columns,
                 &exclude_columns,
                 &unresolved_source_name,
+                timeout,
                 &SourceReferencePolicy::Required,
             )
             .await;
@@ -1807,6 +1833,7 @@ async fn purify_create_table_from_source(
     let crate::plan::statement::ddl::TableFromSourceOptionExtracted {
         text_columns,
         exclude_columns,
+        retain_history: _,
         details,
         partition_by: _,
         seen: _,
@@ -1914,7 +1941,7 @@ async fn purify_create_table_from_source(
             )
             .await?;
             // There should be exactly one source_export returned for this statement
-            let (_, purified_export) = source_exports.into_iter().next().unwrap();
+            let (_, purified_export) = source_exports.into_element();
             purified_export
         }
         GenericSourceConnection::MySql(mysql_source_connection) => {
@@ -1964,15 +1991,47 @@ async fn purify_create_table_from_source(
             )
             .await?;
             // There should be exactly one source_export returned for this statement
-            let (_, purified_export) = source_exports.into_iter().next().unwrap();
+            let (_, purified_export) = source_exports.into_element();
             purified_export
         }
-        GenericSourceConnection::SqlServer(_sql_server_source) => {
-            // TODO(sql_server2): Support CREATE TABLE ... FROM SOURCE.
-            return Err(PlanError::Unsupported {
-                feature: "CREATE TABLE ... FROM SQL SERVER SOURCE".to_string(),
-                discussion_no: None,
-            });
+        GenericSourceConnection::SqlServer(sql_server_source) => {
+            let connection = sql_server_source.connection;
+            let config = connection
+                .resolve_config(
+                    &storage_configuration.connection_context.secrets_reader,
+                    storage_configuration,
+                    InTask::No,
+                )
+                .await?;
+            let mut client = mz_sql_server_util::Client::connect(config).await?;
+
+            let database: Arc<str> = connection.database.into();
+            let reference_client = SourceReferenceClient::SqlServer {
+                client: &mut client,
+                database: Arc::clone(&database),
+            };
+            retrieved_source_references = reference_client.get_source_references().await?;
+            tracing::debug!(?retrieved_source_references, "got source references");
+
+            let timeout = mz_storage_types::sources::sql_server::MAX_LSN_WAIT
+                .get(storage_configuration.config_set());
+
+            let purified_source_exports = sql_server::purify_source_exports(
+                &*database,
+                &mut client,
+                &retrieved_source_references,
+                &requested_references,
+                &qualified_text_columns,
+                &qualified_exclude_columns,
+                &unresolved_source_name,
+                timeout,
+                &SourceReferencePolicy::Required,
+            )
+            .await?;
+
+            // There should be exactly one source_export returned for this statement
+            let (_, purified_export) = purified_source_exports.source_exports.into_element();
+            purified_export
         }
         GenericSourceConnection::LoadGenerator(load_gen_connection) => {
             let reference_client = SourceReferenceClient::LoadGenerator {
@@ -1983,7 +2042,7 @@ async fn purify_create_table_from_source(
             let requested_exports = retrieved_source_references
                 .requested_source_exports(requested_references.as_ref(), &unresolved_source_name)?;
             // There should be exactly one source_export returned
-            let export = requested_exports.into_iter().next().unwrap();
+            let export = requested_exports.into_element();
             PurifiedSourceExport {
                 external_reference: export.external_reference,
                 details: PurifiedExportDetails::LoadGenerator {
@@ -2008,7 +2067,7 @@ async fn purify_create_table_from_source(
             let requested_exports = retrieved_source_references
                 .requested_source_exports(requested_references.as_ref(), &unresolved_source_name)?;
             // There should be exactly one source_export returned
-            let export = requested_exports.into_iter().next().unwrap();
+            let export = requested_exports.into_element();
 
             format_options = SourceFormatOptions::Kafka {
                 topic: kafka_conn.topic.clone(),
@@ -2059,12 +2118,13 @@ async fn purify_create_table_from_source(
                 .iter_mut()
                 .find(|option| option.name == TableFromSourceOptionName::TextColumns)
             {
-                if let Some(gen_text_columns) = gen_text_columns {
-                    text_cols_option.value = Some(WithOptionValue::Sequence(gen_text_columns));
-                } else {
-                    soft_panic_or_log!(
+                match gen_text_columns {
+                    Some(gen_text_columns) => {
+                        text_cols_option.value = Some(WithOptionValue::Sequence(gen_text_columns))
+                    }
+                    None => soft_panic_or_log!(
                         "text_columns should be Some if text_cols_option is present"
-                    );
+                    ),
                 }
             }
             match columns {
@@ -2098,24 +2158,27 @@ async fn purify_create_table_from_source(
                 .iter_mut()
                 .find(|option| option.name == TableFromSourceOptionName::TextColumns)
             {
-                if let Some(gen_text_columns) = gen_text_columns {
-                    text_cols_option.value = Some(WithOptionValue::Sequence(gen_text_columns));
-                } else {
-                    soft_panic_or_log!(
+                match gen_text_columns {
+                    Some(gen_text_columns) => {
+                        text_cols_option.value = Some(WithOptionValue::Sequence(gen_text_columns))
+                    }
+                    None => soft_panic_or_log!(
                         "text_columns should be Some if text_cols_option is present"
-                    );
+                    ),
                 }
             }
             if let Some(ignore_cols_option) = with_options
                 .iter_mut()
                 .find(|option| option.name == TableFromSourceOptionName::ExcludeColumns)
             {
-                if let Some(gen_exclude_columns) = gen_exclude_columns {
-                    ignore_cols_option.value = Some(WithOptionValue::Sequence(gen_exclude_columns));
-                } else {
-                    soft_panic_or_log!(
-                        "text_columns should be Some if ignore_cols_option is present"
-                    );
+                match gen_exclude_columns {
+                    Some(gen_exclude_columns) => {
+                        ignore_cols_option.value =
+                            Some(WithOptionValue::Sequence(gen_exclude_columns))
+                    }
+                    None => soft_panic_or_log!(
+                        "exclude_columns should be Some if ignore_cols_option is present"
+                    ),
                 }
             }
             match columns {
@@ -2136,11 +2199,60 @@ async fn purify_create_table_from_source(
             })
         }
         PurifiedExportDetails::SqlServer { .. } => {
-            // TODO(sql_server2): Support CREATE TABLE ... FROM SOURCE.
-            return Err(PlanError::Unsupported {
-                feature: "CREATE TABLE ... FROM SQL SERVER SOURCE".to_string(),
-                discussion_no: None,
-            });
+            let sql_server::SqlServerExportStatementValues {
+                columns: gen_columns,
+                constraints: gen_constraints,
+                text_columns: gen_text_columns,
+                excl_columns: gen_excl_columns,
+                details: gen_details,
+                external_reference: _,
+            } = sql_server::generate_source_export_statement_values(&scx, purified_export)?;
+
+            if let Some(text_cols_option) = with_options
+                .iter_mut()
+                .find(|opt| opt.name == TableFromSourceOptionName::TextColumns)
+            {
+                match gen_text_columns {
+                    Some(gen_text_columns) => {
+                        text_cols_option.value = Some(WithOptionValue::Sequence(gen_text_columns))
+                    }
+                    None => soft_panic_or_log!(
+                        "text_columns should be Some if text_cols_option is present"
+                    ),
+                }
+            }
+            if let Some(exclude_cols_option) = with_options
+                .iter_mut()
+                .find(|opt| opt.name == TableFromSourceOptionName::ExcludeColumns)
+            {
+                match gen_excl_columns {
+                    Some(gen_excl_columns) => {
+                        exclude_cols_option.value =
+                            Some(WithOptionValue::Sequence(gen_excl_columns))
+                    }
+                    None => soft_panic_or_log!(
+                        "excl_columns should be Some if excl_cols_option is present"
+                    ),
+                }
+            }
+
+            match columns {
+                TableFromSourceColumns::NotSpecified => {
+                    *columns = TableFromSourceColumns::Defined(gen_columns);
+                    *constraints = gen_constraints;
+                }
+                TableFromSourceColumns::Named(_) => {
+                    sql_bail!("columns cannot be named for SQL Server sources")
+                }
+                TableFromSourceColumns::Defined(_) => unreachable!(),
+            }
+
+            with_options.push(TableFromSourceOption {
+                name: TableFromSourceOptionName::Details,
+                value: Some(WithOptionValue::Value(Value::String(hex::encode(
+                    gen_details.into_proto().encode_to_vec(),
+                )))),
+            })
         }
         PurifiedExportDetails::LoadGenerator { .. } => {
             let (desc, output) = match purified_export.details {

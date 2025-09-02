@@ -16,7 +16,11 @@ import time
 from dataclasses import dataclass
 from textwrap import dedent
 
-from materialize.mzcompose.composition import Composition, WorkflowArgumentParser
+from materialize.mzcompose.composition import (
+    Composition,
+    Service,
+    WorkflowArgumentParser,
+)
 from materialize.mzcompose.services.materialized import Materialized
 from materialize.mzcompose.services.postgres import Postgres
 from materialize.mzcompose.services.redpanda import Redpanda
@@ -227,9 +231,12 @@ def workflow_default(c: Composition, parser: WorkflowArgumentParser) -> None:
     parser.add_argument("tests", nargs="*", default=None, help="run specified tests")
     args = parser.parse_args()
 
-    c.up("redpanda", "postgres", "materialized")
-
-    c.up("testdrive", persistent=True)
+    c.up(
+        "redpanda",
+        "postgres",
+        "materialized",
+        Service("testdrive", idle=True),
+    )
 
     for database_object in database_objects:
         if (

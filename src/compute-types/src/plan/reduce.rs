@@ -398,7 +398,7 @@ pub struct MonotonicPlan {
     /// not a requirement that the input be directly subjected to consolidation.
     /// More details in the monotonic one-shot `SELECT`s design doc.[^1]
     ///
-    /// [^1] <https://github.com/MaterializeInc/materialize/blob/main/doc/developer/design/20230421_stabilize_monotonic_select.md>
+    /// [^1]: <https://github.com/MaterializeInc/materialize/blob/main/doc/developer/design/20230421_stabilize_monotonic_select.md>
     pub must_consolidate: bool,
 }
 
@@ -818,7 +818,7 @@ impl ReducePlan {
             .map(MirScalarExpr::column)
             .collect::<Vec<_>>();
         let (permutation, thinning) = permutation_for_arrangement(&key, arity);
-        AvailableCollections::new_arranged(vec![(key, permutation, thinning)], None)
+        AvailableCollections::new_arranged(vec![(key, permutation, thinning)])
     }
 
     /// Extracts a fusable MFP for the reduction from the given `mfp` along with a residual

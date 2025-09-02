@@ -25,7 +25,7 @@ use mz_proto::{IntoRustIfSome, ProtoType, RustType, TryFromProtoError};
 use mz_repr::explain::text::text_string_at;
 use mz_repr::explain::{DummyHumanizer, ExplainConfig, ExprHumanizer, PlanRenderingContext};
 use mz_repr::optimize::OptimizerFeatures;
-use mz_repr::{ColumnType, Diff, GlobalId, Row};
+use mz_repr::{Diff, GlobalId, Row};
 use proptest::arbitrary::Arbitrary;
 use proptest::prelude::*;
 use proptest::strategy::Strategy;
@@ -34,7 +34,6 @@ use serde::{Deserialize, Serialize};
 
 use crate::dataflows::DataflowDescription;
 use crate::plan::join::JoinPlan;
-use crate::plan::proto_available_collections::ProtoColumnTypes;
 use crate::plan::reduce::{KeyValPlan, ReducePlan};
 use crate::plan::threshold::ThresholdPlan;
 use crate::plan::top_k::TopKPlan;
@@ -74,10 +73,6 @@ pub struct AvailableCollections {
     /// The documentation for `KeyValRowMapping` explains these fields better.
     #[proptest(strategy = "prop::collection::vec(any_arranged_thin(), 0..3)")]
     pub arranged: Vec<(Vec<MirScalarExpr>, Vec<usize>, Vec<usize>)>,
-    /// The types of the columns in the raw form of the collection, if known. We
-    /// only capture types when necessary to support arrangement specialization,
-    /// so this only done for specific LIR operators during lowering.
-    pub types: Option<Vec<ColumnType>>,
 }
 
 /// A strategy that produces arrangements that are thinner than the default. That is
@@ -91,24 +86,11 @@ pub(crate) fn any_arranged_thin()
     )
 }
 
-impl RustType<ProtoColumnTypes> for Vec<ColumnType> {
-    fn into_proto(&self) -> ProtoColumnTypes {
-        ProtoColumnTypes {
-            types: self.into_proto(),
-        }
-    }
-
-    fn from_proto(proto: ProtoColumnTypes) -> Result<Self, TryFromProtoError> {
-        proto.types.into_rust()
-    }
-}
-
 impl RustType<ProtoAvailableCollections> for AvailableCollections {
     fn into_proto(&self) -> ProtoAvailableCollections {
         ProtoAvailableCollections {
             raw: self.raw,
             arranged: self.arranged.into_proto(),
-            types: self.types.into_proto(),
         }
     }
 
@@ -117,7 +99,6 @@ impl RustType<ProtoAvailableCollections> for AvailableCollections {
             Self {
                 raw: x.raw,
                 arranged: x.arranged.into_rust()?,
-                types: x.types.into_rust()?,
             }
         })
     }
@@ -129,17 +110,11 @@ impl AvailableCollections {
         Self {
             raw: true,
             arranged: Vec::new(),
-            types: None,
         }
     }
 
-    /// Represent a collection that is arranged in the
-    /// specified ways, with optionally given types describing
-    /// the rows that would be in the raw form of the collection.
-    pub fn new_arranged(
-        arranged: Vec<(Vec<MirScalarExpr>, Vec<usize>, Vec<usize>)>,
-        types: Option<Vec<ColumnType>>,
-    ) -> Self {
+    /// Represent a collection that is arranged in the specified ways.
+    pub fn new_arranged(arranged: Vec<(Vec<MirScalarExpr>, Vec<usize>, Vec<usize>)>) -> Self {
         assert!(
             !arranged.is_empty(),
             "Invariant violated: at least one collection must exist"
@@ -147,7 +122,6 @@ impl AvailableCollections {
         Self {
             raw: false,
             arranged,
-            types,
         }
     }
 
@@ -290,17 +264,17 @@ pub enum PlanNode<T = mz_repr::Timestamp> {
     /// are being unpacked, producing quadratic output in those cases. Instead,
     /// in these cases use a `mfp` member that projects away these large fields.
     FlatMap {
-        /// The input collection.
-        input: Box<Plan<T>>,
-        /// The variable-record emitting function.
-        func: TableFunc,
-        /// Expressions that for each row prepare the arguments to `func`.
-        exprs: Vec<MirScalarExpr>,
-        /// Linear operator to apply to each record produced by `func`.
-        mfp_after: MapFilterProject,
         /// The particular arrangement of the input we expect to use,
         /// if any
         input_key: Option<Vec<MirScalarExpr>>,
+        /// The input collection.
+        input: Box<Plan<T>>,
+        /// Expressions that for each row prepare the arguments to `func`.
+        exprs: Vec<MirScalarExpr>,
+        /// The variable-record emitting function.
+        func: TableFunc,
+        /// Linear operator to apply to each record produced by `func`.
+        mfp_after: MapFilterProject,
     },
     /// A multiway relational equijoin, with fused map, filter, and projection.
     ///
@@ -319,6 +293,9 @@ pub enum PlanNode<T = mz_repr::Timestamp> {
     },
     /// Aggregation by key.
     Reduce {
+        /// The particular arrangement of the input we expect to use,
+        /// if any
+        input_key: Option<Vec<MirScalarExpr>>,
         /// The input collection.
         input: Box<Plan<T>>,
         /// A plan for changing input records into key, value pairs.
@@ -329,13 +306,11 @@ pub enum PlanNode<T = mz_repr::Timestamp> {
         /// on the properties of the reduction, and the input itself. Please check
         /// out the documentation for this type for more detail.
         plan: ReducePlan,
-        /// The particular arrangement of the input we expect to use,
-        /// if any
-        input_key: Option<Vec<MirScalarExpr>>,
         /// An MFP that must be applied to results. The projection part of this
         /// MFP must preserve the key for the reduction; otherwise, the results
         /// become undefined. Additionally, the MFP must be free from temporal
         /// predicates so that it can be readily evaluated.
+        /// TODO(ggevay): should we wrap this in [`mz_expr::SafeMfpPlan`]?
         mfp_after: MapFilterProject,
     },
     /// Key-based "Top K" operator, retaining the first K records in each group.
@@ -387,17 +362,16 @@ pub enum PlanNode<T = mz_repr::Timestamp> {
     /// be important for e.g. the `Join` stage which benefits from multiple arrangements
     /// or to cap a `Plan` so that indexes can be exported.
     ArrangeBy {
-        /// The input collection.
-        input: Box<Plan<T>>,
-        /// A list of arrangement keys, and possibly a raw collection,
-        /// that will be added to those of the input.
-        ///
-        /// If any of these collection forms are already present in the input, they have no effect.
-        forms: AvailableCollections,
         /// The key that must be used to access the input.
         input_key: Option<Vec<MirScalarExpr>>,
+        /// The input collection.
+        input: Box<Plan<T>>,
         /// The MFP that must be applied to the input.
         input_mfp: MapFilterProject,
+        /// A list of arrangement keys, and possibly a raw collection,
+        /// that will be added to those of the input. Does not include
+        /// any other existing arrangements.
+        forms: AvailableCollections,
     },
 }
 
@@ -597,11 +571,11 @@ impl Arbitrary for Plan {
                 )
                     .prop_map(|(input, func, exprs, mfp, input_key, lir_id)| {
                         PlanNode::FlatMap {
-                            input: input.into(),
-                            func,
-                            exprs,
-                            mfp_after: mfp,
                             input_key,
+                            input: input.into(),
+                            exprs,
+                            func,
+                            mfp_after: mfp,
                         }
                         .as_plan(lir_id)
                     })
@@ -628,10 +602,10 @@ impl Arbitrary for Plan {
                     .prop_map(
                         |(input, key_val_plan, plan, input_key, mfp_after, lir_id)| {
                             PlanNode::Reduce {
+                                input_key,
                                 input: input.into(),
                                 key_val_plan,
                                 plan,
-                                input_key,
                                 mfp_after,
                             }
                             .as_plan(lir_id)
@@ -686,10 +660,10 @@ impl Arbitrary for Plan {
                 )
                     .prop_map(|(input, forms, input_key, input_mfp, lir_id)| {
                         PlanNode::ArrangeBy {
-                            input: input.into(),
-                            forms,
                             input_key,
+                            input: input.into(),
                             input_mfp,
+                            forms,
                         }
                         .as_plan(lir_id)
                     })
@@ -1062,23 +1036,23 @@ impl<T> CollectionPlan for PlanNode<T> {
                 input_key_val: _,
             }
             | PlanNode::FlatMap {
-                input,
-                func: _,
-                exprs: _,
-                mfp_after: _,
                 input_key: _,
+                input,
+                exprs: _,
+                func: _,
+                mfp_after: _,
             }
             | PlanNode::ArrangeBy {
-                input,
-                forms: _,
                 input_key: _,
+                input,
                 input_mfp: _,
+                forms: _,
             }
             | PlanNode::Reduce {
+                input_key: _,
                 input,
                 key_val_plan: _,
                 plan: _,
-                input_key: _,
                 mfp_after: _,
             }
             | PlanNode::TopK {

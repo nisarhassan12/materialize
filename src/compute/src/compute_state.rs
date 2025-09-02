@@ -17,7 +17,6 @@ use std::time::{Duration, Instant};
 
 use bytesize::ByteSize;
 use differential_dataflow::Hashable;
-use differential_dataflow::IntoOwned;
 use differential_dataflow::lattice::Lattice;
 use differential_dataflow::trace::{Cursor, TraceReader};
 use mz_compute_client::logging::LoggingConfig;
@@ -313,6 +312,8 @@ impl ComputeState {
             lgalloc::lgalloc_set_config(lgalloc::LgAlloc::new().disable());
         }
 
+        crate::memory_limiter::apply_limiter_config(config);
+
         mz_ore::region::ENABLE_LGALLOC_REGION.store(
             ENABLE_COLUMNATION_LGALLOC.get(config),
             std::sync::atomic::Ordering::Relaxed,
@@ -418,7 +419,7 @@ impl<'a, A: Allocate + 'static> ActiveComputeState<'a, A> {
             .start_timer();
 
         match cmd {
-            CreateTimely { .. } => panic!("CreateTimely must be captured before"),
+            Hello { .. } => panic!("Hello must be captured before"),
             CreateInstance(instance_config) => self.handle_create_instance(*instance_config),
             InitializationComplete => (),
             UpdateConfiguration(params) => self.handle_update_configuration(*params),
@@ -1516,19 +1517,24 @@ impl IndexPeek {
         peek_stash_threshold_bytes: usize,
     ) -> PeekStatus
     where
-        for<'a> Tr: TraceReader<DiffGat<'a> = &'a Diff>,
-        for<'a> Tr::Key<'a>: ToDatumIter + IntoOwned<'a, Owned = Row> + Eq,
-        for<'a> Tr::Val<'a>: ToDatumIter,
-        for<'a> Tr::TimeGat<'a>: PartialOrder<mz_repr::Timestamp>,
+        for<'a> Tr: TraceReader<
+                Key<'a>: ToDatumIter + Eq,
+                KeyOwn = Row,
+                Val<'a>: ToDatumIter,
+                TimeGat<'a>: PartialOrder<mz_repr::Timestamp>,
+                DiffGat<'a> = &'a Diff,
+            >,
     {
         let max_result_size = usize::cast_from(max_result_size);
-        let count_byte_size = std::mem::size_of::<NonZeroUsize>();
+        let count_byte_size = size_of::<NonZeroUsize>();
 
+        // We clone `literal_constraints` here because we don't want to move the constraints
+        // out of the peek struct, and don't want to modify in-place.
         let mut peek_iterator = peek_result_iterator::PeekResultIterator::new(
             peek.target.id().clone(),
             peek.map_filter_project.clone(),
             peek.timestamp,
-            peek.literal_constraints.clone(),
+            peek.literal_constraints.clone().as_deref_mut(),
             oks_handle,
         );
 
@@ -1541,10 +1547,7 @@ impl IndexPeek {
         // `order_by` field. Further limiting will happen when the results
         // are collected, so we don't need to have exactly this many results,
         // just at least those results that would have been returned.
-        let max_results = peek
-            .finishing
-            .limit
-            .map(|l| usize::cast_from(u64::from(l)) + peek.finishing.offset);
+        let max_results = peek.finishing.num_rows_needed();
 
         let mut l_datum_vec = DatumVec::new();
         let mut r_datum_vec = DatumVec::new();

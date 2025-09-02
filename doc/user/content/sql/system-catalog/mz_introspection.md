@@ -63,14 +63,14 @@ The size, capacity, and allocations are an approximation, which may underestimat
 Specifically, reductions can use more memory than we show here.
 
 <!-- RELATION_SPEC mz_introspection.mz_arrangement_sizes -->
-| Field         | Type        | Meaning                                                                                                                   |
-|---------------|-------------| --------                                                                                                                  |
-| `operator_id` | [`uint8`]   | The ID of the operator that created the arrangement. Corresponds to [`mz_dataflow_operators.id`](#mz_dataflow_operators). |
-| `records`     | [`numeric`] | The number of records in the arrangement.                                                                                 |
-| `batches`     | [`numeric`] | The number of batches in the arrangement.                                                                                 |
-| `size`        | [`numeric`] | The utilized size in bytes of the arrangement.                                                                            |
-| `capacity`    | [`numeric`] | The capacity in bytes of the arrangement. Can be larger than the size.                                                    |
-| `allocations` | [`numeric`] | The number of separate memory allocations backing the arrangement.                                                        |
+| Field         | Type       | Meaning                                                                                                                   |
+|---------------|------------| --------                                                                                                                  |
+| `operator_id` | [`uint8`]  | The ID of the operator that created the arrangement. Corresponds to [`mz_dataflow_operators.id`](#mz_dataflow_operators). |
+| `records`     | [`bigint`] | The number of records in the arrangement.                                                                                 |
+| `batches`     | [`bigint`] | The number of batches in the arrangement.                                                                                 |
+| `size`        | [`bigint`] | The utilized size in bytes of the arrangement.                                                                            |
+| `capacity`    | [`bigint`] | The capacity in bytes of the arrangement. Can be larger than the size.                                                    |
+| `allocations` | [`bigint`] | The number of separate memory allocations backing the arrangement.                                                        |
 
 <!-- RELATION_SPEC_UNDOCUMENTED mz_introspection.mz_arrangement_sizes_per_worker -->
 <!-- RELATION_SPEC_UNDOCUMENTED mz_introspection.mz_arrangement_records_raw -->
@@ -181,15 +181,15 @@ The `mz_dataflow_arrangement_sizes` view describes the size of arrangements per
 operators under each dataflow.
 
 <!-- RELATION_SPEC mz_introspection.mz_dataflow_arrangement_sizes -->
-| Field         | Type        | Meaning                                                                      |
-|---------------|-------------|------------------------------------------------------------------------------|
-| `id`          | [`uint8`]   | The ID of the [dataflow]. Corresponds to [`mz_dataflows.id`](#mz_dataflows). |
-| `name`        | [`text`]    | The name of the [dataflow].                                                  |
-| `records`     | [`numeric`] | The number of records in all arrangements in the dataflow.                   |
-| `batches`     | [`numeric`] | The number of batches in all arrangements in the dataflow.                   |
-| `size`        | [`numeric`] | The utilized size in bytes of the arrangements.                              |
-| `capacity`    | [`numeric`] | The capacity in bytes of the arrangements. Can be larger than the size.      |
-| `allocations` | [`numeric`] | The number of separate memory allocations backing the arrangements.          |
+| Field         | Type       | Meaning                                                                      |
+|---------------|------------|------------------------------------------------------------------------------|
+| `id`          | [`uint8`]  | The ID of the [dataflow]. Corresponds to [`mz_dataflows.id`](#mz_dataflows). |
+| `name`        | [`text`]   | The name of the [dataflow].                                                  |
+| `records`     | [`bigint`] | The number of records in all arrangements in the dataflow.                   |
+| `batches`     | [`bigint`] | The number of batches in all arrangements in the dataflow.                   |
+| `size`        | [`bigint`] | The utilized size in bytes of the arrangements.                              |
+| `capacity`    | [`bigint`] | The capacity in bytes of the arrangements. Can be larger than the size.      |
+| `allocations` | [`bigint`] | The number of separate memory allocations backing the arrangements.          |
 
 ## `mz_dataflow_channels`
 
@@ -204,6 +204,7 @@ A communication channel connects one of the outputs of a source operator to one 
 | `from_port`      | [`uint8`] | The source operator's output port.                                                                                      |
 | `to_index`       | [`uint8`] | The scope-local index of the target operator. Corresponds to [`mz_dataflow_addresses.address`](#mz_dataflow_addresses). |
 | `to_port`        | [`uint8`] | The target operator's input port.                                                                                       |
+| `type`           | [`text`]  | The container type of the channel.                                                                                      |
 
 <!-- RELATION_SPEC_UNDOCUMENTED mz_introspection.mz_dataflow_channels_per_worker -->
 
@@ -219,6 +220,7 @@ The `mz_dataflow_channel_operators` view associates [dataflow] channels with the
 | `from_operator_address` | [`uint8 list`] | The address of the source of the channel. Corresponds to [`mz_dataflow_addresses.address`](#mz_dataflow_addresses). |
 | `to_operator_id`        | [`uint8`]      | The ID of the target of the channel. Corresponds to [`mz_dataflow_operators.id`](#mz_dataflow_operators).           |
 | `to_operator_address`   | [`uint8 list`] | The address of the target of the channel. Corresponds to [`mz_dataflow_addresses.address`](#mz_dataflow_addresses). |
+| `type`                  | [`text`]  | The container type of the channel.                                                                                       |
 
 <!-- RELATION_SPEC_UNDOCUMENTED mz_introspection.mz_dataflow_channel_operators_per_worker -->
 
@@ -380,15 +382,15 @@ The `mz_peek_durations_histogram` view describes a histogram of the duration in 
 The `mz_records_per_dataflow` view describes the number of records in each [dataflow].
 
 <!-- RELATION_SPEC mz_introspection.mz_records_per_dataflow -->
-| Field         | Type        | Meaning                                                                    |
-| ------------  |-------------| --------                                                                   |
-| `id`          | [`uint8`]   | The ID of the dataflow. Corresponds to [`mz_dataflows.id`](#mz_dataflows). |
-| `name`        | [`text`]    | The internal name of the dataflow.                                         |
-| `records`     | [`numeric`] | The number of records in the dataflow.                                     |
-| `batches`     | [`numeric`] | The number of batches in the dataflow.                                     |
-| `size`        | [`numeric`] | The utilized size in bytes of the arrangements.                            |
-| `capacity`    | [`numeric`] | The capacity in bytes of the arrangements. Can be larger than the size.    |
-| `allocations` | [`numeric`] | The number of separate memory allocations backing the arrangements.        |
+| Field         | Type       | Meaning                                                                    |
+| ------------  |------------| --------                                                                   |
+| `id`          | [`uint8`]  | The ID of the dataflow. Corresponds to [`mz_dataflows.id`](#mz_dataflows). |
+| `name`        | [`text`]   | The internal name of the dataflow.                                         |
+| `records`     | [`bigint`] | The number of records in the dataflow.                                     |
+| `batches`     | [`bigint`] | The number of batches in the dataflow.                                     |
+| `size`        | [`bigint`] | The utilized size in bytes of the arrangements.                            |
+| `capacity`    | [`bigint`] | The capacity in bytes of the arrangements. Can be larger than the size.    |
+| `allocations` | [`bigint`] | The number of separate memory allocations backing the arrangements.        |
 
 <!-- RELATION_SPEC_UNDOCUMENTED mz_introspection.mz_records_per_dataflow_per_worker -->
 
@@ -397,16 +399,16 @@ The `mz_records_per_dataflow` view describes the number of records in each [data
 The `mz_records_per_dataflow_operator` view describes the number of records in each [dataflow] operator in the system.
 
 <!-- RELATION_SPEC mz_introspection.mz_records_per_dataflow_operator -->
-| Field          | Type        | Meaning                                                                                      |
-| -------------- |-------------| --------                                                                                     |
-| `id`           | [`uint8`]   | The ID of the operator. Corresponds to [`mz_dataflow_operators.id`](#mz_dataflow_operators). |
-| `name`         | [`text`]    | The internal name of the operator.                                                           |
-| `dataflow_id`  | [`uint8`]   | The ID of the dataflow. Corresponds to [`mz_dataflows.id`](#mz_dataflows).                   |
-| `records`      | [`numeric`] | The number of records in the operator.                                                       |
-| `batches`      | [`numeric`] | The number of batches in the dataflow.                                                       |
-| `size`         | [`numeric`] | The utilized size in bytes of the arrangement.                                               |
-| `capacity`     | [`numeric`] | The capacity in bytes of the arrangement. Can be larger than the size.                       |
-| `allocations`  | [`numeric`] | The number of separate memory allocations backing the arrangement.                           |
+| Field          | Type       | Meaning                                                                                      |
+| -------------- |------------| --------                                                                                     |
+| `id`           | [`uint8`]  | The ID of the operator. Corresponds to [`mz_dataflow_operators.id`](#mz_dataflow_operators). |
+| `name`         | [`text`]   | The internal name of the operator.                                                           |
+| `dataflow_id`  | [`uint8`]  | The ID of the dataflow. Corresponds to [`mz_dataflows.id`](#mz_dataflows).                   |
+| `records`      | [`bigint`] | The number of records in the operator.                                                       |
+| `batches`      | [`bigint`] | The number of batches in the dataflow.                                                       |
+| `size`         | [`bigint`] | The utilized size in bytes of the arrangement.                                               |
+| `capacity`     | [`bigint`] | The capacity in bytes of the arrangement. Can be larger than the size.                       |
+| `allocations`  | [`bigint`] | The number of separate memory allocations backing the arrangement.                           |
 
 <!-- RELATION_SPEC_UNDOCUMENTED mz_introspection.mz_records_per_dataflow_operator_per_worker -->
 

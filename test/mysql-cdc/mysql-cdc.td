@@ -8,7 +8,6 @@
 # by the Apache License, Version 2.0.
 
 $ set-sql-timeout duration=1s
-$ set-max-tries max-tries=20
 
 
 > CREATE SECRET mysqlpass AS '${arg.mysql-root-password}'
@@ -541,7 +540,7 @@ true
 # Ensure we can start a source with more workers
 #
 
-> CREATE CLUSTER large_cluster SIZE '16'
+> CREATE CLUSTER large_cluster SIZE 'scale=1,workers=16'
 
 > CREATE SOURCE large_cluster_source
   IN CLUSTER large_cluster
@@ -709,11 +708,13 @@ INSERT INTO pk_table VALUES (99999, 'abc');
 #
 # Check schema scoped tables
 
+> BEGIN
 > CREATE SOURCE another_source
   IN CLUSTER cdc_cluster
   FROM MYSQL CONNECTION mysql_conn;
 
 > CREATE TABLE another_table FROM SOURCE another_source (REFERENCE another_schema.another_table);
+> COMMIT
 
 > SHOW SOURCES
 another_source          mysql  cdc_cluster     ""

@@ -21,9 +21,7 @@ use clap::ArgAction;
 use mz_orchestrator_tracing::{StaticTracingConfig, TracingCliArgs};
 use mz_ore::cli::{self, CliConfig, KeyValueArg};
 use mz_ore::metrics::MetricsRegistry;
-use mz_sql::session::vars::{
-    DISK_CLUSTER_REPLICAS_DEFAULT, ENABLE_LOGICAL_COMPACTION_WINDOW, Var, VarInput,
-};
+use mz_sql::session::vars::{ENABLE_LOGICAL_COMPACTION_WINDOW, Var, VarInput};
 use mz_sqllogictest::runner::{self, Outcomes, RunConfig, Runner, WriteFmt};
 use mz_sqllogictest::util;
 use mz_tracing::CloneableEnvFilter;
@@ -56,6 +54,9 @@ struct Args {
     /// PostgreSQL connection URL to use for `persist` consensus.
     #[clap(long)]
     postgres_url: String,
+    /// PostgreSQL prefix for this SLT run
+    #[clap(long, default_value = "sqllogictest")]
+    prefix: String,
     /// Path to sqllogictest script to run.
     #[clap(value_name = "PATH", required = true)]
     paths: Vec<String>,
@@ -86,8 +87,8 @@ struct Args {
     #[clap(long, env = "ORCHESTRATOR_PROCESS_WRAPPER")]
     orchestrator_process_wrapper: Option<String>,
     /// Replica size
-    #[clap(long, default_value = "2")]
-    replica_size: usize,
+    #[clap(long, default_value = "scale=1,workers=2")]
+    replica_size: String,
     /// Replication factor
     #[clap(long, default_value = "1")]
     replicas: usize,
@@ -136,11 +137,7 @@ async fn main() -> ExitCode {
     // sqllogictest requires that Materialize have some system variables set to some specific value
     // to pass. If the caller hasn't set this variable, then we set it for them. If the caller has
     // set this variable, then we assert that it's set to the right value.
-    let required_system_defaults: Vec<_> = [
-        (&DISK_CLUSTER_REPLICAS_DEFAULT, "true"),
-        (ENABLE_LOGICAL_COMPACTION_WINDOW.flag, "true"),
-    ]
-    .into();
+    let required_system_defaults: Vec<_> = [(ENABLE_LOGICAL_COMPACTION_WINDOW.flag, "true")].into();
     let mut system_parameter_defaults: BTreeMap<_, _> = args
         .system_parameter_default
         .clone()
@@ -175,6 +172,7 @@ async fn main() -> ExitCode {
         stderr: &OutputStream::new(io::stderr(), args.timestamps),
         verbosity: args.verbosity,
         postgres_url: args.postgres_url.clone(),
+        prefix: args.prefix.clone(),
         no_fail: args.no_fail,
         fail_fast: args.fail_fast,
         auto_index_tables: args.auto_index_tables,
@@ -193,7 +191,7 @@ async fn main() -> ExitCode {
             }
         },
         replicas: args.replicas,
-        replica_size: args.replica_size,
+        replica_size: args.replica_size.clone(),
     };
 
     if let (Some(shard), Some(shard_count)) = (args.shard, args.shard_count) {

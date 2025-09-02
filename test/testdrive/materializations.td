@@ -7,7 +7,7 @@
 # the Business Source License, use of this software will be governed
 # by the Apache License, Version 2.0.
 
-$ set-arg-default default-replica-size=1
+$ set-arg-default default-replica-size=scale=1,workers=1
 $ set-arg-default single-replica-cluster=quickstart
 
 # Test creating and dropping various views and sources that depend upon
@@ -31,12 +31,14 @@ $ kafka-create-topic topic=data
     URL '${testdrive.schema-registry-url}'
   );
 
+> BEGIN
 > CREATE SOURCE data
   IN CLUSTER ${arg.single-replica-cluster}
   FROM KAFKA CONNECTION kafka_conn (TOPIC 'testdrive-data-${testdrive.seed}')
 
 > CREATE TABLE data_tbl FROM SOURCE data (REFERENCE "testdrive-data-${testdrive.seed}")
   FORMAT AVRO USING SCHEMA '${schema}'
+> COMMIT
 
 > SELECT * FROM data_tbl
 
@@ -335,12 +337,14 @@ b  c
 
 $ kafka-create-topic topic=mat
 
+> BEGIN
 > CREATE SOURCE mat_data
   IN CLUSTER ${arg.single-replica-cluster}
   FROM KAFKA CONNECTION kafka_conn (TOPIC 'testdrive-mat-${testdrive.seed}')
 
 > CREATE TABLE mat_data_tbl FROM SOURCE mat_data (REFERENCE "testdrive-mat-${testdrive.seed}")
   FORMAT AVRO USING SCHEMA '${schema}'
+> COMMIT
 
 > CREATE DEFAULT INDEX ON mat_data
 
@@ -468,6 +472,8 @@ c    d
 # in memory consumptions and should be understood before adapting the values.
 > SET cluster_replica = r1
 
+
+
 > SELECT mdod.dataflow_name, mdod.name
   FROM mz_introspection.mz_arrangement_sharing mash
   JOIN mz_introspection.mz_dataflow_operator_dataflows mdod ON mash.operator_id = mdod.id
@@ -505,12 +511,12 @@ c    d
 "Dataflow: materialize.public.test6" "Reduced Fallibly MinsMaxesHierarchical"
 "Dataflow: materialize.public.test6" "Reduced Fallibly MinsMaxesHierarchical"
 "Dataflow: materialize.public.test6" "Reduced Fallibly MinsMaxesHierarchical"
-"Dataflow: materialize.public.data_view_idx" "ArrangeBy[[Column(0)]]"
-"Dataflow: materialize.public.data_view_idx" "ArrangeBy[[Column(0)]]-errors"
-"Dataflow: materialize.public.data_view_primary_idx" "ArrangeBy[[Column(0), Column(1)]]"
-"Dataflow: materialize.public.data_view_primary_idx" "ArrangeBy[[Column(0), Column(1)]]-errors"
-"Dataflow: materialize.public.mat_data_idx3" "ArrangeBy[[Column(1)]]"
-"Dataflow: materialize.public.mat_data_idx3" "ArrangeBy[[Column(1)]]-errors"
+"Dataflow: materialize.public.data_view_idx" "ArrangeBy[[Column(0, \"a\")]]"
+"Dataflow: materialize.public.data_view_idx" "ArrangeBy[[Column(0, \"a\")]]-errors"
+"Dataflow: materialize.public.data_view_primary_idx" "ArrangeBy[[Column(0, \"a\"), Column(1, \"b\")]]"
+"Dataflow: materialize.public.data_view_primary_idx" "ArrangeBy[[Column(0, \"a\"), Column(1, \"b\")]]-errors"
+"Dataflow: materialize.public.mat_data_idx3" "ArrangeBy[[Column(1, \"b\")]]"
+"Dataflow: materialize.public.mat_data_idx3" "ArrangeBy[[Column(1, \"b\")]]-errors"
 "Dataflow: materialize.public.test1" AccumulableErrorCheck
 "Dataflow: materialize.public.test1" "ArrangeAccumulable [val: empty]"
 "Dataflow: materialize.public.test1" ReduceAccumulable

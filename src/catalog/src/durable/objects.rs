@@ -348,7 +348,6 @@ pub struct ClusterVariantManaged {
     pub availability_zones: Vec<String>,
     pub logging: ReplicaLogging,
     pub replication_factor: u32,
-    pub disk: bool,
     pub optimizer_feature_overrides: BTreeMap<String, String>,
     pub schedule: ClusterSchedule,
 }
@@ -470,16 +469,12 @@ impl From<mz_controller::clusters::ReplicaConfig> for ReplicaConfig {
 pub enum ReplicaLocation {
     Unmanaged {
         storagectl_addrs: Vec<String>,
-        storage_addrs: Vec<String>,
         computectl_addrs: Vec<String>,
-        compute_addrs: Vec<String>,
-        workers: usize,
     },
     Managed {
         size: String,
         /// `Some(az)` if the AZ was specified by the user and must be respected;
         availability_zone: Option<String>,
-        disk: bool,
         internal: bool,
         billed_as: Option<String>,
         pending: bool,
@@ -492,24 +487,17 @@ impl From<mz_controller::clusters::ReplicaLocation> for ReplicaLocation {
             mz_controller::clusters::ReplicaLocation::Unmanaged(
                 mz_controller::clusters::UnmanagedReplicaLocation {
                     storagectl_addrs,
-                    storage_addrs,
                     computectl_addrs,
-                    compute_addrs,
-                    workers,
                 },
             ) => Self::Unmanaged {
                 storagectl_addrs,
-                storage_addrs,
                 computectl_addrs,
-                compute_addrs,
-                workers,
             },
             mz_controller::clusters::ReplicaLocation::Managed(
                 mz_controller::clusters::ManagedReplicaLocation {
                     allocation: _,
                     size,
                     availability_zones,
-                    disk,
                     billed_as,
                     internal,
                     pending,
@@ -525,7 +513,6 @@ impl From<mz_controller::clusters::ReplicaLocation> for ReplicaLocation {
                     } else {
                         None
                     },
-                disk,
                 internal,
                 billed_as,
                 pending,

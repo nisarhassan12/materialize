@@ -36,7 +36,7 @@ from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
 from inspect import Traceback, getframeinfo, getmembers, isfunction, stack
 from tempfile import TemporaryFile
-from typing import Any, TextIO, TypeVar, cast
+from typing import IO, Any, TextIO, TypeVar, cast
 
 import psycopg
 import sqlparse
@@ -45,7 +45,7 @@ from psycopg import Connection, Cursor
 
 from materialize import MZ_ROOT, buildkite, mzbuild, spawn, ui
 from materialize.mzcompose import cluster_replica_size_map, loader
-from materialize.mzcompose.service import Service
+from materialize.mzcompose.service import Service as MzComposeService
 from materialize.mzcompose.services.materialized import (
     LEADER_STATUS_HEALTHCHECK,
     DeploymentStatus,
@@ -63,6 +63,13 @@ from materialize.ui import (
     CommandFailureCausedUIError,
     UIError,
 )
+from materialize.util import filter_cmd
+
+
+class Service:
+    def __init__(self, name: str, idle: bool = False):
+        self.name = name
+        self.idle = idle
 
 
 class UnknownCompositionError(UIError):
@@ -106,6 +113,7 @@ class Composition:
         project_name: str | None = None,
         sanity_restart_mz: bool = False,
     ):
+        self.conns = {}
         self.name = name
         self.description = None
         self.repo = repo
@@ -134,6 +142,7 @@ class Composition:
                 "mzdata": None,
                 "pgdata": None,
                 "mysqldata": None,
+                "mssqldata": None,
                 # Used for certain pg-cdc scenarios. The memory will not be
                 # allocated for compositions that do not require this volume.
                 "sourcedata_512Mb": {
@@ -279,11 +288,12 @@ class Composition:
         capture: bool | TextIO = False,
         capture_stderr: bool | TextIO = False,
         capture_and_print: bool = False,
-        stdin: str | None = None,
+        stdin: str | IO[bytes] | int | None = None,
         check: bool = True,
         max_tries: int = 1,
         silent: bool = False,
         environment: dict[str, str] | None = None,
+        build: str | None = None,
     ) -> subprocess.CompletedProcess:
         """Invoke `docker compose` on the rendered composition.
 
@@ -295,20 +305,13 @@ class Composition:
                 be an opened file to capture stderr into the file directly.
             capture_and_print: Print during execution and capture the stdout and
                 stderr of the `docker compose` invocation.
-            input: A string to provide as stdin for the command.
+            stdin: A string or IO handle to use as the process's stdin stream
         """
 
         if not self.silent and not silent:
-            # Don't print out secrets in test logs
-            filtered_args = [
-                (
-                    "[REDACTED]"
-                    if "mzp_" in arg or "-----BEGIN PRIVATE KEY-----" in arg
-                    else arg
-                )
-                for arg in args
-            ]
-            print(f"$ docker compose {' '.join(filtered_args)}", file=sys.stderr)
+            print(
+                f"$ docker compose {' '.join(filter_cmd(list(args)))}", file=sys.stderr
+            )
 
         stdout = None
         if capture:
@@ -409,7 +412,8 @@ class Composition:
                         check=check,
                         stdout=stdout,
                         stderr=stderr,
-                        input=stdin,
+                        input=stdin if isinstance(stdin, str) else None,
+                        stdin=stdin if isinstance(stdin, IO) else None,
                         text=True,
                         bufsize=1,
                         env=environment,
@@ -422,7 +426,26 @@ class Composition:
 
                 if retry < max_tries:
                     print("Retrying ...")
-                    time.sleep(3)
+                    if build:
+                        for retry in range(max_tries):
+                            try:
+                                build_status = buildkite.get_build_status(build)
+                            except subprocess.CalledProcessError:
+                                time.sleep(3)
+                                break
+                            if build_status == "failed":
+                                print(
+                                    f"Build {build} has been marked as failed, exiting hard"
+                                )
+                                sys.exit(1)
+                            elif build_status == "success":
+                                break
+                            assert (
+                                build_status == "pending"
+                            ), f"Unknown build status {build_status}"
+                            time.sleep(1)
+                    else:
+                        time.sleep(3)
                     continue
                 else:
                     raise CommandFailureCausedUIError(
@@ -495,7 +518,7 @@ class Composition:
 
     @contextmanager
     def override(
-        self, *services: "Service", fail_on_new_service: bool = True
+        self, *services: "MzComposeService", fail_on_new_service: bool = True
     ) -> Iterator[None]:
         """Temporarily update the composition with the specified services.
 
@@ -658,13 +681,17 @@ class Composition:
         password: str | None = None,
         sslmode: str = "disable",
         startup_params: dict[str, str] = {},
+        reuse_connection: bool = False,
     ) -> Connection:
         if service is None:
             service = "materialized"
 
         """Get a connection (with autocommit enabled) to the materialized service."""
         port = self.port(service, port) if port else self.default_port(service)
-        print(" ".join([f"-c {key}={val}" for key, val in startup_params.items()]))
+        options = " ".join([f"-c {key}={val}" for key, val in startup_params.items()])
+        key = (threading.get_ident(), database, user, password, port, sslmode, options)
+        if reuse_connection and key in self.conns:
+            return self.conns[key]
         conn = psycopg.connect(
             host="localhost",
             dbname=database,
@@ -672,11 +699,11 @@ class Composition:
             password=password,
             port=port,
             sslmode=sslmode,
-            options=" ".join(
-                [f"-c {key}={val}" for key, val in startup_params.items()]
-            ),
+            options=options,
         )
         conn.autocommit = True
+        if reuse_connection:
+            self.conns[key] = conn
         return conn
 
     def sql_cursor(
@@ -688,10 +715,18 @@ class Composition:
         password: str | None = None,
         sslmode: str = "disable",
         startup_params: dict[str, str] = {},
+        reuse_connection: bool = False,
     ) -> Cursor:
         """Get a cursor to run SQL queries against the materialized service."""
         conn = self.sql_connection(
-            service, user, database, port, password, sslmode, startup_params
+            service,
+            user,
+            database,
+            port,
+            password,
+            sslmode,
+            startup_params,
+            reuse_connection,
         )
         return conn.cursor()
 
@@ -704,10 +739,16 @@ class Composition:
         port: int | None = None,
         password: str | None = None,
         print_statement: bool = True,
+        reuse_connection: bool = True,
     ) -> None:
         """Run a batch of SQL statements against the materialized service."""
         with self.sql_cursor(
-            service=service, user=user, database=database, port=port, password=password
+            service=service,
+            user=user,
+            database=database,
+            port=port,
+            password=password,
+            reuse_connection=reuse_connection,
         ) as cursor:
             for statement in sqlparse.split(sql):
                 if print_statement:
@@ -722,10 +763,16 @@ class Composition:
         database: str = "materialize",
         port: int | None = None,
         password: str | None = None,
+        reuse_connection: bool = True,
     ) -> Any:
         """Execute and return results of a SQL query."""
         with self.sql_cursor(
-            service=service, user=user, database=database, port=port, password=password
+            service=service,
+            user=user,
+            database=database,
+            port=port,
+            password=password,
+            reuse_connection=reuse_connection,
         ) as cursor:
             cursor.execute(sql.encode())
             return cursor.fetchall()
@@ -746,6 +793,7 @@ class Composition:
         stdin: str | None = None,
         entrypoint: str | None = None,
         check: bool = True,
+        silent: bool = False,
     ) -> subprocess.CompletedProcess:
         """Run a one-off command in a service.
 
@@ -766,10 +814,6 @@ class Composition:
             capture_and_print: Print during execution and capture the
                 stdout+stderr of the `docker compose` invocation.
         """
-        # Restart any dependencies whose definitions have changed. The trick,
-        # taken from Buildkite's Docker Compose plugin, is to run an `up`
-        # command that requests zero instances of the requested service.
-        self.up("--scale", f"{service}=0", service, wait=False)
         return self.invoke(
             "run",
             *(["--entrypoint", entrypoint] if entrypoint else []),
@@ -784,14 +828,16 @@ class Composition:
             stdin=stdin,
             check=check,
             environment=os.environ | env_extra,
+            silent=silent,
         )
 
     def run_testdrive_files(
         self,
         *args: str,
-        rm: bool = False,
+        service: str = "testdrive",
         mz_service: str | None = None,
         quiet: bool = False,
+        persistent: bool = True,
     ) -> subprocess.CompletedProcess:
         if mz_service is not None:
             args = tuple(
@@ -802,16 +848,32 @@ class Composition:
                 ]
             )
         environment = {"CLUSTER_REPLICA_SIZES": json.dumps(cluster_replica_size_map())}
-        return self.run(
-            "testdrive",
-            *args,
-            rm=rm,
-            # needed for sufficient error information in the junit.xml while still printing to stdout during execution
-            capture_and_print=not quiet,
-            capture=quiet,
-            capture_stderr=quiet,
-            env_extra=environment,
-        )
+
+        if persistent:
+            if not self.is_running(service):
+                self.up(Service(service, idle=True))
+
+            return self.exec(
+                service,
+                *args,
+                # needed for sufficient error information in the junit.xml while still printing to stdout during execution
+                capture_and_print=not quiet,
+                capture=quiet,
+                capture_stderr=quiet,
+                env_extra=environment,
+                silent=True,
+            )
+        else:
+            return self.run(
+                service,
+                *args,
+                # needed for sufficient error information in the junit.xml while still printing to stdout during execution
+                capture_and_print=not quiet,
+                capture=quiet,
+                capture_stderr=quiet,
+                env_extra=environment,
+                silent=True,
+            )
 
     def exec(
         self,
@@ -877,9 +939,11 @@ class Composition:
     def pull_single_image_by_service_name(
         self, service_name: str, max_tries: int
     ) -> None:
-        self.invoke("pull", service_name, max_tries=max_tries)
+        self.invoke("pull", service_name, max_tries=max_tries, stdin=subprocess.DEVNULL)
 
-    def try_pull_service_image(self, service: Service, max_tries: int = 2) -> bool:
+    def try_pull_service_image(
+        self, service: MzComposeService, max_tries: int = 2
+    ) -> bool:
         """Tries to pull the specified image and returns if this was successful."""
         try:
             with self.override(service):
@@ -892,10 +956,9 @@ class Composition:
 
     def up(
         self,
-        *services: str,
+        *services: str | Service,
         detach: bool = True,
         wait: bool = True,
-        persistent: bool = False,
         max_tries: int = 5,  # increased since quay.io returns 502 sometimes
     ) -> None:
         """Build, (re)create, and start the named services.
@@ -907,17 +970,27 @@ class Composition:
             detach: Run containers in the background.
             wait: Wait for health checks to complete before returning.
                 Implies `detach` mode.
-            persistent: Replace the container's entrypoint and command with
-                `sleep infinity` so that additional commands can be scheduled
-                on the container with `Composition.exec`.
             max_tries: Number of tries on failure.
         """
-        if persistent:
+        idle = set(
+            [
+                service.name
+                for service in services
+                if isinstance(service, Service) and service.idle
+            ]
+        )
+        if idle:
             old_compose = copy.deepcopy(self.compose)
-            for service in self.compose["services"].values():
-                service["entrypoint"] = ["sleep", "infinity"]
-                service["command"] = []
+            for service_name, service in self.compose["services"].items():
+                if service_name in idle:
+                    service["entrypoint"] = ["sleep", "infinity"]
+                    service["command"] = []
             self.files = {}
+
+        service_names = [
+            service.name if isinstance(service, Service) else service
+            for service in services
+        ]
 
         self.capture_logs()
         self.invoke(
@@ -925,11 +998,12 @@ class Composition:
             *(["--detach"] if detach else []),
             *(["--wait"] if wait else []),
             *(["--quiet-pull"] if ui.env_is_truthy("CI") else []),
-            *services,
-            max_tries=max_tries,
+            *service_names,
+            max_tries=300 if os.getenv("CI_WAITING_FOR_BUILD") else max_tries,
+            build=os.getenv("CI_WAITING_FOR_BUILD"),
         )
 
-        if persistent:
+        if idle:
             self.compose = old_compose  # type: ignore
             self.files = {}
 
@@ -1022,7 +1096,7 @@ class Composition:
                 if i == NUM_RETRIES:
                     raise ValueError(error)
                 # Sources and cluster replicas need a few seconds to start up
-                print(f"Retrying ({i+1}/{NUM_RETRIES})...")
+                print(f"Retrying ({i + 1}/{NUM_RETRIES})...")
                 time.sleep(1)
 
             # In case the test has to continue, reset state
@@ -1062,7 +1136,7 @@ class Composition:
                 if i == NUM_RETRIES:
                     raise ValueError(error)
                 # Sources and cluster replicas need a few seconds to start up
-                print(f"Retrying ({i+1}/{NUM_RETRIES})...")
+                print(f"Retrying ({i + 1}/{NUM_RETRIES})...")
                 time.sleep(1)
         else:
             ui.header(
@@ -1338,11 +1412,11 @@ class Composition:
         self,
         input: str,
         service: str = "testdrive",
-        persistent: bool = True,
         args: list[str] = [],
         caller: Traceback | None = None,
         mz_service: str | None = None,
         quiet: bool = False,
+        silent: bool = False,
     ) -> subprocess.CompletedProcess:
         """Run a string as a testdrive script.
 
@@ -1365,31 +1439,21 @@ class Composition:
                 f"--persist-consensus-url=postgres://root@{mz_service}:26257?options=--search_path=consensus",
             ]
 
-        if persistent:
-            return self.exec(
-                service,
-                *args,
-                stdin=input,
-                capture_and_print=not quiet,
-                capture=quiet,
-                capture_stderr=quiet,
-            )
-        else:
-            assert (
-                mz_service is None
-            ), "testdrive(mz_service = ...) can only be used with persistent Testdrive containers."
-            return self.run(
-                service,
-                *args,
-                stdin=input,
-                capture_and_print=not quiet,
-                capture=quiet,
-                capture_stderr=quiet,
-            )
+        if not self.is_running(service):
+            self.up(Service(service, idle=True))
+
+        return self.exec(
+            service,
+            *args,
+            stdin=input,
+            capture_and_print=not quiet,
+            capture=quiet,
+            capture_stderr=quiet,
+            silent=silent,
+        )
 
     def enable_minio_versioning(self) -> None:
-        self.up("minio")
-        self.up("mc", persistent=True)
+        self.up("minio", Service("mc", idle=True))
         self.exec(
             "mc",
             "mc",
@@ -1404,7 +1468,7 @@ class Composition:
         self.exec("mc", "mc", "version", "enable", "persist/persist")
 
     def backup_cockroach(self) -> None:
-        self.up("mc", persistent=True)
+        self.up(Service("mc", idle=True))
         self.exec("mc", "mc", "mb", "--ignore-existing", "persist/crdb-backup")
         self.exec(
             "cockroach",
@@ -1437,7 +1501,7 @@ class Composition:
                 DROP EXTERNAL CONNECTION backup_bucket;
             """,
         )
-        self.up("persistcli", persistent=True)
+        self.up(Service("persistcli", idle=True))
         self.exec(
             "persistcli",
             "persistcli",
@@ -1476,7 +1540,7 @@ class Composition:
             "-",
             stdin=backup,
         )
-        self.up("persistcli", persistent=True)
+        self.up(Service("persistcli", idle=True))
         self.exec(
             "persistcli",
             "persistcli",
@@ -1567,23 +1631,18 @@ class Composition:
     T = TypeVar("T")
 
     def test_parts(self, parts: list[T], process_func: Callable[[T], Any]) -> None:
-        from materialize.test_analytics.config.test_analytics_db_config import (
-            create_test_analytics_config,
-        )
-        from materialize.test_analytics.test_analytics_db import TestAnalyticsDb
-
         priority: dict[str, int] = {}
-        test_analytics: TestAnalyticsDb | None = None
 
-        if buildkite.is_in_buildkite():
-            print("~~~ Fetching part priorities")
-            test_analytics_config = create_test_analytics_config(self)
-            test_analytics = TestAnalyticsDb(test_analytics_config)
-            try:
-                priority = test_analytics.builds.get_part_priorities(timeout=15)
-                print(f"Priorities: {priority}")
-            except Exception as e:
-                print(f"Failed to fetch part priorities, using default order: {e}")
+        # TODO(def-): Revisit if this is worth enabling, currently adds ~15 seconds to each run
+        # if buildkite.is_in_buildkite():
+        #     print("~~~ Fetching part priorities")
+        #     test_analytics_config = create_test_analytics_config(self)
+        #     test_analytics = TestAnalyticsDb(test_analytics_config)
+        #     try:
+        #         priority = test_analytics.builds.get_part_priorities(timeout=15)
+        #         print(f"Priorities: {priority}")
+        #     except Exception as e:
+        #         print(f"Failed to fetch part priorities, using default order: {e}")
 
         sorted_parts = sorted(
             parts, key=lambda part: priority.get(str(part), 0), reverse=True
@@ -1595,9 +1654,9 @@ class Composition:
                 try:
                     process_func(part)
                 except Exception as e:
-                    if buildkite.is_in_buildkite():
-                        assert test_analytics
-                        test_analytics.builds.add_build_job_failure(str(part))
+                    # if buildkite.is_in_buildkite():
+                    #     assert test_analytics
+                    #     test_analytics.builds.add_build_job_failure(str(part))
                     # raise
                     # We could also keep running, but then runtime is still
                     # slow when a test fails, and the annotation only shows up
@@ -1605,8 +1664,29 @@ class Composition:
                     exceptions.append(e)
         finally:
             if buildkite.is_in_buildkite():
-                assert test_analytics
+                from materialize.test_analytics.config.test_analytics_db_config import (
+                    create_test_analytics_config,
+                )
+                from materialize.test_analytics.test_analytics_db import TestAnalyticsDb
+
+                test_analytics_config = create_test_analytics_config(self)
+                test_analytics = TestAnalyticsDb(test_analytics_config)
                 test_analytics.database_connector.submit_update_statements()
         if exceptions:
             print(f"Further exceptions were raised:\n{exceptions[1:]}")
             raise exceptions[0]
+
+    def verify_build_profile(self, container: str = "materialized") -> None:
+        """Make sure the container is using the same build profile as we have set locally. This is mostly useful to ensure benchmarks compare using the same profile (release vs release, or optimized vs optimized)."""
+        image = self.compose["services"][container]["image"]
+        labels = json.loads(
+            spawn.capture(
+                ["docker", "inspect", "--format={{json .Config.Labels}}", image]
+            )
+        )
+        # TODO: When we have a few versions released with build.profile labels, assert that exists
+        if build_profile := labels.get("build.profile"):
+            expected_profile = self.repo.rd.profile.name
+            assert (
+                build_profile == expected_profile
+            ), f"Expected {image} to be of profile {expected_profile}, but found {build_profile} instead. Consider passing `--release` or `--optimized` to `mzcompose` explicitly."

@@ -455,17 +455,17 @@ where
             let req = CompactReq {
                 shard_id,
                 desc: req.desc,
-                inputs: req
-                    .inputs
-                    .into_iter()
-                    .map(|b| Arc::unwrap_or_clone(b.batch))
-                    .collect(),
+                inputs: req.inputs,
             };
-            let parts = req.inputs.iter().map(|x| x.part_count()).sum::<usize>();
+            let parts = req
+                .inputs
+                .iter()
+                .map(|x| x.batch.part_count())
+                .sum::<usize>();
             let bytes = req
                 .inputs
                 .iter()
-                .map(|x| x.encoded_size_bytes())
+                .map(|x| x.batch.encoded_size_bytes())
                 .sum::<usize>();
             let start = Instant::now();
             info!(
@@ -494,7 +494,10 @@ where
                 Arc::clone(&blob),
                 Arc::clone(&metrics),
                 Arc::clone(&machine.applier.shard_metrics),
-                Arc::new(IsolatedRuntime::default()),
+                Arc::new(IsolatedRuntime::new(
+                    metrics_registry,
+                    Some(cfg.isolated_runtime_worker_threads),
+                )),
                 req,
                 schemas,
             )
@@ -509,7 +512,11 @@ where
                 start.elapsed(),
             );
             let (apply_res, maintenance) = machine
-                .merge_res(&FueledMergeRes { output: res.output })
+                .merge_res(&FueledMergeRes {
+                    output: res.output,
+                    input: res.input,
+                    new_active_compaction: None,
+                })
                 .await;
             if !maintenance.is_empty() {
                 info!("ignoring non-empty requested maintenance: {maintenance:?}")
@@ -631,7 +638,10 @@ where
         state_versions,
         Arc::new(StateCache::new(cfg, metrics, Arc::new(NoopPubSubSender))),
         Arc::new(NoopPubSubSender),
-        Arc::new(IsolatedRuntime::default()),
+        Arc::new(IsolatedRuntime::new(
+            &MetricsRegistry::new(),
+            Some(cfg.isolated_runtime_worker_threads),
+        )),
         Diagnostics::from_purpose("admin"),
     )
     .await?;
@@ -739,14 +749,18 @@ pub async fn dangerous_force_compaction_and_break_pushdown<K, V, T, D>(
         let (reqs, mut maintenance) = machine.spine_exert(fuel).await;
         for req in reqs {
             info!(
-                "force_compaction {} {} compacting {} batches in {} parts totaling {} bytes: lower={:?} upper={:?} since={:?}",
+                "force_compaction {} {} compacting {} batches in {} parts with {} runs totaling {} bytes: lower={:?} upper={:?} since={:?}",
                 machine.applier.shard_metrics.name,
                 machine.applier.shard_metrics.shard_id,
                 req.inputs.len(),
-                req.inputs.iter().flat_map(|x| &x.parts).count(),
+                req.inputs.iter().flat_map(|x| &x.batch.parts).count(),
                 req.inputs
                     .iter()
-                    .flat_map(|x| &x.parts)
+                    .map(|x| x.batch.runs().count())
+                    .sum::<usize>(),
+                req.inputs
+                    .iter()
+                    .flat_map(|x| &x.batch.parts)
                     .map(|x| x.encoded_size_bytes())
                     .sum::<usize>(),
                 req.desc.lower().elements(),
@@ -791,13 +805,18 @@ pub async fn dangerous_force_compaction_and_break_pushdown<K, V, T, D>(
 
         // NB: This check is intentionally at the end so that it's safe to call
         // this method in a loop.
-        let num_batches = machine.applier.all_batches().len();
-        if num_batches < 2 {
+        let num_runs: usize = machine
+            .applier
+            .all_batches()
+            .iter()
+            .map(|x| x.runs().count())
+            .sum();
+        if num_runs <= 1 {
             info!(
-                "force_compaction {} {} exiting with {} batches",
+                "force_compaction {} {} exiting with {} runs",
                 machine.applier.shard_metrics.name,
                 machine.applier.shard_metrics.shard_id,
-                num_batches
+                num_runs
             );
             return;
         }

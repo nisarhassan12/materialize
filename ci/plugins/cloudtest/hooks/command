@@ -88,8 +88,8 @@ cleanup() {
       ci_uncollapsed_heading "cloudtest: Fetching binaries for coverage"
       mkdir -p coverage/
       chmod 777 coverage/
-      kubectl cp environmentd-0:/usr/local/bin/environmentd coverage/environmentd
-      kubectl cp environmentd-0:/coverage coverage/
+      kubectl cp environmentd-0:/usr/local/bin/environmentd coverage/environmentd || true
+      kubectl cp environmentd-0:/coverage coverage/ || true
       for pod in $(kubectl get pods -o name | grep -E 'cluster-'); do
         kubectl cp "$pod":/coverage coverage/ || true # Could get deleted
         kubectl cp "$pod":/usr/local/bin/clusterd coverage/clusterd || true
@@ -119,9 +119,7 @@ cleanup() {
   fi
 
   ci_unimportant_heading "cloudtest: Cleaning up mz_debug files from test/cloudtest/test_mz_debug_tool.py"
-  if find mz_debug*; then
-      rm -rf mz_debug*
-  fi
+  find . -type d -name 'mz_debug*' -exec rm -r {} +
 
   ci_unimportant_heading "kail: Stopping instance..."
   docker logs kail > kail-output.log 2>&1
@@ -162,17 +160,20 @@ cleanup() {
   sudo journalctl --merge --since "$STEP_START_TIMESTAMP" > journalctl-merge.log
 
   mapfile -t artifacts < <(printf "run.log\nkubectl-get-logs.log\nkubectl-get-logs-previous.log\nkubectl-get-events.log\nkubectl-get-all.log\nkubectl-describe-all.log\nkubectl-pods-with-nodes.log\nkubectl-get-events-kube-system.log\nkubectl-get-all-kube-system.log\nkubectl-describe-all-kube-system.log\njournalctl-merge.log\nkail-output.log\n"; find . -name 'junit_*.xml')
-  artifacts_str=$(IFS=";"; echo "${artifacts[*]}")
 
-  bin/ci-builder run stable trufflehog --no-update --no-verification --json --exclude-detectors=coda,dockerhub,box,npmtoken,github,snykkey,eightxeight filesystem "${artifacts[@]}" | trufflehog_jq_filter_logs > trufflehog.log
+  {
+    bin/ci-builder run stable trufflehog --no-update --no-verification --json --exclude-detectors=coda,dockerhub,box,npmtoken,github,snykkey,eightxeight,sumologickey,miro,fmfw,logzio,qase,cannyio,uplead,tatumio filesystem "${artifacts[@]}" | trufflehog_jq_filter_logs > trufflehog.log
+  } &
+  artifacts_str=$(IFS=";"; echo "${artifacts[*]}")
 
   unset CI_EXTRA_ARGS # We don't want extra args for the annotation
   # Continue even if ci-annotate-errors fails
   CI_ANNOTATE_ERRORS_RESULT=0
   # We have to upload artifacts before ci-annotate-errors, so that the annotations can link to the artifacts
-  buildkite-agent artifact upload "$artifacts_str"
-  bin/ci-builder run stable bin/ci-annotate-errors --test-cmd="$TEST_CMD" --test-result="$TEST_RESULT" "${artifacts[@]}" > ci-annotate-errors.log || CI_ANNOTATE_ERRORS_RESULT=$?
-  buildkite-agent artifact upload "ci-annotate-errors.log"
+  buildkite-agent artifact upload "$artifacts_str" &
+  wait
+  bin/ci-builder run stable bin/ci-annotate-errors --test-cmd="$TEST_CMD" --test-result="$TEST_RESULT" "${artifacts[@]}" trufflehog.log > ci-annotate-errors.log || CI_ANNOTATE_ERRORS_RESULT=$?
+  buildkite-agent artifact upload "ci-annotate-errors.log" &
 
   # File should not be empty, see database-issues#7569
   test -s kubectl-get-logs-previous.log
@@ -189,7 +190,8 @@ cleanup() {
 
 trap cleanup EXIT SIGTERM SIGINT
 
-{ stdbuf --output=L --error=L bin/ci-builder run stable bin/pytest "${run_args[@]}" |& tee run.log; } || TEST_RESULT=$?
+# sed command to filter out ANSI command codes in run.log, while keeping them in Buildkite's view
+{ stdbuf --output=L --error=L bin/ci-builder run stable bin/pytest "${run_args[@]}" |& tee >(sed -r "s/\x1B\[[0-9;]*[A-Za-z]//g" > run.log); } || TEST_RESULT=$?
 if [ "$TEST_RESULT" != "0" ]; then
     # Give the logs some time to log panics, otherwise they might be missing later
     sleep 10

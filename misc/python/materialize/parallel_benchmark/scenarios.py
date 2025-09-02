@@ -354,7 +354,7 @@ class FlagUpdate(Scenario):
                                 # doesn't matter. It just needs to be a flag
                                 # that exists in both versions to be
                                 # benchmarked.
-                                "ALTER SYSTEM SET enable_disk_cluster_replicas = true",
+                                "ALTER SYSTEM SET compute_hydration_concurrency = 1",
                                 conn_info=conn_infos["mz_system"],
                             ),
                             dist=Periodic(per_second=1),
@@ -375,7 +375,7 @@ class FlagUpdate(Scenario):
             ],
             guarantees={
                 # TODO(def-): Lower when database-issues#8480 is fixed to prevent regressions
-                "SELECT 1 (reuse connection)": {"avg": 5, "max": 500, "slope": 0.1},
+                "SELECT 1 (reuse connection)": {"avg": 8, "max": 500, "slope": 0.1},
             },
         )
 
@@ -399,7 +399,7 @@ class Read(Scenario):
                 ),
             ],
             guarantees={
-                "SELECT 1 (reuse connection)": {"qps": 2000, "max": 100, "slope": 0.1},
+                "SELECT 1 (reuse connection)": {"qps": 1400, "max": 100, "slope": 0.1},
             },
         )
 

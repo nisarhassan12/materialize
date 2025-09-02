@@ -7,8 +7,8 @@
 # the Business Source License, use of this software will be governed
 # by the Apache License, Version 2.0.
 
-$ set-arg-default default-storage-size=1
-$ set-arg-default default-replica-size=1
+$ set-arg-default default-storage-size=scale=1,workers=1
+$ set-arg-default default-replica-size=scale=1,workers=1
 $ set-arg-default single-replica-cluster=quickstart
 
 $ postgres-execute connection=postgres://mz_system:materialize@${testdrive.materialize-internal-sql-addr}
@@ -27,6 +27,7 @@ goofus,gallant
   );
 
 > CREATE CLUSTER src_cluster SIZE '${arg.default-storage-size}';
+> BEGIN
 > CREATE SOURCE src
   IN CLUSTER src_cluster
   FROM KAFKA CONNECTION kafka_conn (TOPIC 'testdrive-test-${testdrive.seed}')
@@ -34,8 +35,10 @@ goofus,gallant
 > CREATE TABLE src_tbl (a, b) FROM SOURCE src (REFERENCE "testdrive-test-${testdrive.seed}")
   FORMAT CSV WITH 2 COLUMNS
   INCLUDE OFFSET
+> COMMIT
 
 > CREATE CLUSTER src_materialized_cluster SIZE '${arg.default-storage-size}';
+> BEGIN
 > CREATE SOURCE src_materialized
   IN CLUSTER src_materialized_cluster
   FROM KAFKA CONNECTION kafka_conn (TOPIC 'testdrive-test-${testdrive.seed}')
@@ -43,6 +46,7 @@ goofus,gallant
 > CREATE TABLE src_materialized_tbl (a, b) FROM SOURCE src_materialized (REFERENCE "testdrive-test-${testdrive.seed}")
   FORMAT CSV WITH 2 COLUMNS
   INCLUDE OFFSET
+> COMMIT
 
 > CREATE VIEW v1 AS
   SELECT a || b AS c FROM src_tbl
@@ -287,7 +291,7 @@ $ kafka-create-topic topic=snk9 partitions=4
   INTO KAFKA CONNECTION kafka_conn (TOPIC 'testdrive-snk1-${testdrive.seed}')
   FORMAT AVRO USING CONFLUENT SCHEMA REGISTRY CONNECTION csr_conn
   ENVELOPE DEBEZIUM
-  WITH (SIZE = '2')
+  WITH (SIZE = 'scale=1,workers=2')
 contains:Expected one of PARTITION or SNAPSHOT or VERSION, found SIZE
 
 # create sink with SNAPSHOT set
@@ -300,7 +304,7 @@ contains:Expected one of PARTITION or SNAPSHOT or VERSION, found SIZE
   ENVELOPE DEBEZIUM
   WITH (SNAPSHOT = false)
 
-> CREATE CLUSTER c SIZE '4'
+> CREATE CLUSTER c SIZE 'scale=1,workers=4'
 
 > CREATE SINK cluster_c_sink
   IN CLUSTER c

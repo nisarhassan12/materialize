@@ -15,6 +15,10 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use anyhow::{Context, anyhow, bail};
+use iceberg::{Catalog, CatalogBuilder};
+use iceberg_catalog_rest::{
+    REST_CATALOG_PROP_URI, REST_CATALOG_PROP_WAREHOUSE, RestCatalogBuilder,
+};
 use itertools::Itertools;
 use mz_ccsr::tls::{Certificate, Identity};
 use mz_cloud_resources::{AwsExternalIdPrefix, CloudResourceReader, vpc_endpoint_host};
@@ -25,6 +29,7 @@ use mz_kafka_util::client::{
 use mz_ore::assert_none;
 use mz_ore::error::ErrorExt;
 use mz_ore::future::{InTask, OreFutureExt};
+use mz_ore::netio::DUMMY_DNS_PORT;
 use mz_ore::netio::resolve_address;
 use mz_ore::num::NonNeg;
 use mz_postgres_util::tunnel::PostgresFlavor;
@@ -38,6 +43,7 @@ use mz_ssh_util::tunnel::SshTunnelConfig;
 use mz_ssh_util::tunnel_manager::{ManagedSshTunnelHandle, SshTunnelManager};
 use mz_tls_util::Pkcs12Archive;
 use mz_tracing::CloneableEnvFilter;
+use proptest::prelude::{Arbitrary, BoxedStrategy};
 use proptest::strategy::Strategy;
 use proptest_derive::Arbitrary;
 use rdkafka::ClientContext;
@@ -69,6 +75,9 @@ pub mod inline;
 pub mod string_or_secret;
 
 include!(concat!(env!("OUT_DIR"), "/mz_storage_types.connections.rs"));
+
+const REST_CATALOG_PROP_SCOPE: &str = "scope";
+const REST_CATALOG_PROP_CREDENTIAL: &str = "credential";
 
 /// An extension trait for [`SecretsReader`]
 #[async_trait::async_trait]
@@ -201,6 +210,7 @@ pub enum Connection<C: ConnectionAccess = InlinedConnection> {
     AwsPrivatelink(AwsPrivatelinkConnection),
     MySql(MySqlConnection<C>),
     SqlServer(SqlServerConnectionDetails<C>),
+    IcebergCatalog(IcebergCatalogConnection<C>),
 }
 
 impl<R: ConnectionResolver> IntoInlineConnection<Connection, R>
@@ -218,6 +228,9 @@ impl<R: ConnectionResolver> IntoInlineConnection<Connection, R>
             Connection::SqlServer(sql_server) => {
                 Connection::SqlServer(sql_server.into_inline_connection(r))
             }
+            Connection::IcebergCatalog(iceberg) => {
+                Connection::IcebergCatalog(iceberg.into_inline_connection(r))
+            }
         }
     }
 }
@@ -234,6 +247,7 @@ impl<C: ConnectionAccess> Connection<C> {
             Connection::AwsPrivatelink(conn) => conn.validate_by_default(),
             Connection::MySql(conn) => conn.validate_by_default(),
             Connection::SqlServer(conn) => conn.validate_by_default(),
+            Connection::IcebergCatalog(conn) => conn.validate_by_default(),
         }
     }
 }
@@ -254,6 +268,7 @@ impl Connection<InlinedConnection> {
             Connection::AwsPrivatelink(conn) => conn.validate(id, storage_configuration).await?,
             Connection::MySql(conn) => conn.validate(id, storage_configuration).await?,
             Connection::SqlServer(conn) => conn.validate(id, storage_configuration).await?,
+            Connection::IcebergCatalog(conn) => conn.validate(id, storage_configuration).await?,
         }
         Ok(())
     }
@@ -354,6 +369,217 @@ impl<C: ConnectionAccess> AlterCompatible for Connection<C> {
                 Err(AlterError { id })
             }
         }
+    }
+}
+
+#[derive(Arbitrary, Clone, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
+pub struct RestIcebergCatalog {
+    /// For REST catalogs, the oauth2 credential in a `CLIENT_ID:CLIENT_SECRET` format
+    pub credential: StringOrSecret,
+    /// The oauth2 scope for REST catalogs
+    pub scope: Option<String>,
+    /// The warehouse for REST catalogs
+    pub warehouse: Option<String>,
+}
+
+#[derive(Arbitrary, Clone, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
+pub struct S3TablesRestIcebergCatalog<C: ConnectionAccess = InlinedConnection> {
+    /// The AWS connection details, for s3tables
+    pub aws_connection: AwsConnectionReference<C>,
+    /// The warehouse for s3tables
+    pub warehouse: String,
+}
+
+impl<R: ConnectionResolver> IntoInlineConnection<S3TablesRestIcebergCatalog, R>
+    for S3TablesRestIcebergCatalog<ReferencedConnection>
+{
+    fn into_inline_connection(self, r: R) -> S3TablesRestIcebergCatalog {
+        S3TablesRestIcebergCatalog {
+            aws_connection: self.aws_connection.into_inline_connection(&r),
+            warehouse: self.warehouse,
+        }
+    }
+}
+
+#[derive(Arbitrary, Clone, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
+pub enum IcebergCatalogType {
+    Rest,
+    S3TablesRest,
+}
+
+#[derive(Arbitrary, Clone, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
+pub enum IcebergCatalogImpl<C: ConnectionAccess = InlinedConnection> {
+    Rest(RestIcebergCatalog),
+    S3TablesRest(S3TablesRestIcebergCatalog<C>),
+}
+
+impl<R: ConnectionResolver> IntoInlineConnection<IcebergCatalogImpl, R>
+    for IcebergCatalogImpl<ReferencedConnection>
+{
+    fn into_inline_connection(self, r: R) -> IcebergCatalogImpl {
+        match self {
+            IcebergCatalogImpl::Rest(rest) => IcebergCatalogImpl::Rest(rest),
+            IcebergCatalogImpl::S3TablesRest(s3tables) => {
+                IcebergCatalogImpl::S3TablesRest(s3tables.into_inline_connection(r))
+            }
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
+pub struct IcebergCatalogConnection<C: ConnectionAccess = InlinedConnection> {
+    /// The catalog impl impl of that catalog
+    pub catalog: IcebergCatalogImpl<C>,
+    /// Where the catalog is located
+    pub uri: reqwest::Url,
+}
+
+impl<C: ConnectionAccess> Arbitrary for IcebergCatalogConnection<C> {
+    type Parameters = ();
+    type Strategy = BoxedStrategy<Self>;
+
+    fn arbitrary_with((): Self::Parameters) -> Self::Strategy {
+        (
+            IcebergCatalogImpl::arbitrary(),
+            proptest::sample::select(vec![
+                reqwest::Url::parse("https://example.com/catalog").unwrap(),
+                reqwest::Url::parse("https://catalog.example.org").unwrap(),
+            ]),
+        )
+            .prop_map(|(catalog, uri)| IcebergCatalogConnection { catalog, uri })
+            .boxed()
+    }
+}
+
+impl AlterCompatible for IcebergCatalogConnection {
+    fn alter_compatible(&self, id: GlobalId, _other: &Self) -> Result<(), AlterError> {
+        Err(AlterError { id })
+    }
+}
+
+impl<R: ConnectionResolver> IntoInlineConnection<IcebergCatalogConnection, R>
+    for IcebergCatalogConnection<ReferencedConnection>
+{
+    fn into_inline_connection(self, r: R) -> IcebergCatalogConnection {
+        IcebergCatalogConnection {
+            catalog: self.catalog.into_inline_connection(&r),
+            uri: self.uri,
+        }
+    }
+}
+
+impl<C: ConnectionAccess> IcebergCatalogConnection<C> {
+    fn validate_by_default(&self) -> bool {
+        true
+    }
+}
+
+impl IcebergCatalogConnection<InlinedConnection> {
+    async fn connect(
+        &self,
+        storage_configuration: &StorageConfiguration,
+        in_task: InTask,
+    ) -> Result<Arc<dyn Catalog>, anyhow::Error> {
+        match self.catalog {
+            IcebergCatalogImpl::S3TablesRest(ref s3tables) => {
+                self.connect_s3tables(s3tables, storage_configuration, in_task)
+                    .await
+            }
+            IcebergCatalogImpl::Rest(ref rest) => {
+                self.connect_rest(rest, storage_configuration, in_task)
+                    .await
+            }
+        }
+    }
+
+    async fn connect_s3tables(
+        &self,
+        s3tables: &S3TablesRestIcebergCatalog,
+        storage_configuration: &StorageConfiguration,
+        in_task: InTask,
+    ) -> Result<Arc<dyn Catalog>, anyhow::Error> {
+        let mut props = BTreeMap::from([(
+            REST_CATALOG_PROP_URI.to_string(),
+            self.uri.to_string().clone(),
+        )]);
+
+        let aws_ref = &s3tables.aws_connection;
+        let aws_config = aws_ref
+            .connection
+            .load_sdk_config(
+                &storage_configuration.connection_context,
+                aws_ref.connection_id,
+                in_task,
+            )
+            .await?;
+
+        props.insert(
+            REST_CATALOG_PROP_WAREHOUSE.to_string(),
+            s3tables.warehouse.clone(),
+        );
+
+        let catalog = RestCatalogBuilder::default()
+            .with_aws_client(aws_config)
+            .load("IcebergCatalog", props.into_iter().collect())
+            .await
+            .map_err(|e| anyhow!("failed to create Iceberg catalog: {e}"))?;
+        Ok(Arc::new(catalog))
+    }
+
+    async fn connect_rest(
+        &self,
+        rest: &RestIcebergCatalog,
+        storage_configuration: &StorageConfiguration,
+        in_task: InTask,
+    ) -> Result<Arc<dyn Catalog>, anyhow::Error> {
+        let mut props = BTreeMap::from([(
+            REST_CATALOG_PROP_URI.to_string(),
+            self.uri.to_string().clone(),
+        )]);
+
+        if let Some(warehouse) = &rest.warehouse {
+            props.insert(REST_CATALOG_PROP_WAREHOUSE.to_string(), warehouse.clone());
+        }
+
+        let credential = rest
+            .credential
+            .get_string(
+                in_task,
+                &storage_configuration.connection_context.secrets_reader,
+            )
+            .await
+            .map_err(|e| anyhow!("failed to read Iceberg catalog credential: {e}"))?;
+        props.insert(REST_CATALOG_PROP_CREDENTIAL.to_string(), credential);
+
+        if let Some(scope) = &rest.scope {
+            props.insert(REST_CATALOG_PROP_SCOPE.to_string(), scope.clone());
+        }
+
+        let catalog = RestCatalogBuilder::default()
+            .load("IcebergCatalog", props.into_iter().collect())
+            .await
+            .map_err(|e| anyhow!("failed to create Iceberg catalog: {e}"))?;
+        Ok(Arc::new(catalog))
+    }
+
+    async fn validate(
+        &self,
+        _id: CatalogItemId,
+        storage_configuration: &StorageConfiguration,
+    ) -> Result<(), ConnectionValidationError> {
+        let catalog = self
+            .connect(storage_configuration, InTask::No)
+            .await
+            .map_err(|e| {
+                ConnectionValidationError::Other(anyhow!("failed to connect to catalog: {e}"))
+            })?;
+
+        // If we can list namespaces, the connection is valid.
+        catalog.list_namespaces(None).await.map_err(|e| {
+            ConnectionValidationError::Other(anyhow!("failed to list namespaces: {e}"))
+        })?;
+
+        Ok(())
     }
 }
 
@@ -520,7 +746,7 @@ impl<C: ConnectionAccess> KafkaConnection<C> {
         &self,
         connection_context: &ConnectionContext,
         connection_id: CatalogItemId,
-    ) -> Cow<str> {
+    ) -> Cow<'_, str> {
         if let Some(progress_topic) = &self.progress_topic {
             Cow::Borrowed(progress_topic)
         } else {
@@ -1101,12 +1327,6 @@ impl CsrConnection {
             client_config = client_config.auth(username, password);
         }
 
-        // `net::lookup_host` requires a port but the port will be ignored when
-        // passed to `resolve_to_addrs`. We use a dummy port that will be easy
-        // to spot in the logs to make it obvious if some component downstream
-        // incorrectly starts using this port.
-        const DUMMY_PORT: u16 = 11111;
-
         // TODO: use types to enforce that the URL has a string hostname.
         let host = self
             .url
@@ -1124,7 +1344,7 @@ impl CsrConnection {
                     host,
                     &resolved
                         .iter()
-                        .map(|addr| SocketAddr::new(*addr, DUMMY_PORT))
+                        .map(|addr| SocketAddr::new(*addr, DUMMY_DNS_PORT))
                         .collect::<Vec<_>>(),
                 )
             }
@@ -1154,7 +1374,10 @@ impl CsrConnection {
                     // Unfortunately the port here is ignored...
                     .resolve_to_addrs(
                         host,
-                        &[SocketAddr::new(ssh_tunnel.local_addr().ip(), DUMMY_PORT)],
+                        &[SocketAddr::new(
+                            ssh_tunnel.local_addr().ip(),
+                            DUMMY_DNS_PORT,
+                        )],
                     )
                     // ...so we also dynamically rewrite the URL to use the
                     // current port for the SSH tunnel.
@@ -1183,7 +1406,7 @@ impl CsrConnection {
                     connection.connection_id,
                     connection.availability_zone.as_deref(),
                 );
-                let addrs: Vec<_> = net::lookup_host((privatelink_host, DUMMY_PORT))
+                let addrs: Vec<_> = net::lookup_host((privatelink_host, DUMMY_DNS_PORT))
                     .await
                     .context("resolving PrivateLink host")?
                     .collect();
@@ -2048,6 +2271,10 @@ pub struct SqlServerConnectionDetails<C: ConnectionAccess = InlinedConnection> {
     pub tunnel: Tunnel<C>,
     /// Level of encryption to use for the connection.
     pub encryption: mz_sql_server_util::config::EncryptionLevel,
+    /// Certificate validation policy
+    pub certificate_validation_policy: mz_sql_server_util::config::CertificateValidationPolicy,
+    /// TLS CA Certifiecate in PEM format
+    pub tls_root_cert: Option<StringOrSecret>,
 }
 
 impl<C: ConnectionAccess> SqlServerConnectionDetails<C> {
@@ -2100,8 +2327,24 @@ impl SqlServerConnectionDetails<InlinedConnection> {
         inner_config.host(&self.host);
         inner_config.port(self.port);
         inner_config.database(self.database.clone());
-        // TODO(sql_server1): Figure out the right settings for encryption.
         inner_config.encryption(self.encryption.into());
+        match self.certificate_validation_policy {
+            mz_sql_server_util::config::CertificateValidationPolicy::TrustAll => {
+                inner_config.trust_cert()
+            }
+            mz_sql_server_util::config::CertificateValidationPolicy::VerifyCA => {
+                inner_config.trust_cert_ca_pem(
+                    self.tls_root_cert
+                        .as_ref()
+                        .unwrap()
+                        .get_string(in_task, secrets_reader)
+                        .await
+                        .context("ca certificate")?,
+                );
+            }
+            mz_sql_server_util::config::CertificateValidationPolicy::VerifySystem => (), // no-op
+        }
+
         inner_config.application_name("materialize");
 
         // Read our auth settings from
@@ -2117,12 +2360,6 @@ impl SqlServerConnectionDetails<InlinedConnection> {
         // TODO(sql_server3): Support other methods of authentication besides
         // username and password.
         inner_config.authentication(tiberius::AuthMethod::sql_server(user, password));
-
-        // TODO(sql_server2): Fork the tiberius library and add support for
-        // specifying a cert bundle from a binary blob.
-        //
-        // See: <https://github.com/prisma/tiberius/pull/290>
-        inner_config.trust_cert();
 
         // Prevent users from probing our internal network ports by trying to
         // connect to localhost, or another non-external IP.
@@ -2166,6 +2403,7 @@ impl SqlServerConnectionDetails<InlinedConnection> {
                 assert_none!(private_link_connection.port);
                 mz_sql_server_util::config::TunnelConfig::AwsPrivatelink {
                     connection_id: private_link_connection.connection_id,
+                    port: self.port,
                 }
             }
         };
@@ -2190,6 +2428,8 @@ impl<R: ConnectionResolver> IntoInlineConnection<SqlServerConnectionDetails, R>
             password,
             tunnel,
             encryption,
+            certificate_validation_policy,
+            tls_root_cert,
         } = self;
 
         SqlServerConnectionDetails {
@@ -2200,6 +2440,8 @@ impl<R: ConnectionResolver> IntoInlineConnection<SqlServerConnectionDetails, R>
             password,
             tunnel: tunnel.into_inline_connection(&r),
             encryption,
+            certificate_validation_policy,
+            tls_root_cert,
         }
     }
 }
@@ -2219,6 +2461,8 @@ impl<C: ConnectionAccess> AlterCompatible for SqlServerConnectionDetails<C> {
             user: _,
             password: _,
             encryption: _,
+            certificate_validation_policy: _,
+            tls_root_cert: _,
         } = self;
 
         let compatibility_checks = [(tunnel.alter_compatible(id, &other.tunnel).is_ok(), "tunnel")];
@@ -2248,6 +2492,8 @@ impl RustType<ProtoSqlServerConnectionDetails> for SqlServerConnectionDetails {
             password: Some(self.password.into_proto()),
             tunnel: Some(self.tunnel.into_proto()),
             encryption: self.encryption.into_proto().into(),
+            certificate_validation_policy: self.certificate_validation_policy.into_proto().into(),
+            tls_root_cert: self.tls_root_cert.into_proto(),
         }
     }
 
@@ -2266,6 +2512,11 @@ impl RustType<ProtoSqlServerConnectionDetails> for SqlServerConnectionDetails {
                 .tunnel
                 .into_rust_if_some("ProtoSqlServerConnectionDetails::tunnel")?,
             encryption: ProtoSqlServerEncryptionLevel::try_from(proto.encryption)?.into_rust()?,
+            certificate_validation_policy: ProtoSqlServerCertificateValidationPolicy::try_from(
+                proto.certificate_validation_policy,
+            )?
+            .into_rust()?,
+            tls_root_cert: proto.tls_root_cert.into_rust()?,
         })
     }
 }
@@ -2293,6 +2544,40 @@ impl RustType<ProtoSqlServerEncryptionLevel> for mz_sql_server_util::config::Enc
             }
             ProtoSqlServerEncryptionLevel::SqlServerRequired => {
                 mz_sql_server_util::config::EncryptionLevel::Required
+            }
+        })
+    }
+}
+
+impl RustType<ProtoSqlServerCertificateValidationPolicy>
+    for mz_sql_server_util::config::CertificateValidationPolicy
+{
+    fn into_proto(&self) -> ProtoSqlServerCertificateValidationPolicy {
+        match self {
+            mz_sql_server_util::config::CertificateValidationPolicy::TrustAll => {
+                ProtoSqlServerCertificateValidationPolicy::SqlServerTrustAll
+            }
+            mz_sql_server_util::config::CertificateValidationPolicy::VerifySystem => {
+                ProtoSqlServerCertificateValidationPolicy::SqlServerVerifySystem
+            }
+            mz_sql_server_util::config::CertificateValidationPolicy::VerifyCA => {
+                ProtoSqlServerCertificateValidationPolicy::SqlServerVerifyCa
+            }
+        }
+    }
+
+    fn from_proto(
+        proto: ProtoSqlServerCertificateValidationPolicy,
+    ) -> Result<Self, TryFromProtoError> {
+        Ok(match proto {
+            ProtoSqlServerCertificateValidationPolicy::SqlServerTrustAll => {
+                mz_sql_server_util::config::CertificateValidationPolicy::TrustAll
+            }
+            ProtoSqlServerCertificateValidationPolicy::SqlServerVerifySystem => {
+                mz_sql_server_util::config::CertificateValidationPolicy::VerifySystem
+            }
+            ProtoSqlServerCertificateValidationPolicy::SqlServerVerifyCa => {
+                mz_sql_server_util::config::CertificateValidationPolicy::VerifyCA
             }
         })
     }

@@ -7,7 +7,7 @@
 # the Business Source License, use of this software will be governed
 # by the Apache License, Version 2.0.
 
-$ set-arg-default default-replica-size=1
+$ set-arg-default default-replica-size=scale=1,workers=1
 $ set-arg-default single-replica-cluster=quickstart
 
 # This test verifies the get started page works.
@@ -17,6 +17,7 @@ ALTER SYSTEM SET enable_create_table_from_source = true
 
 > SET cluster TO ${arg.single-replica-cluster}
 
+> BEGIN
 > CREATE SOURCE demo
   FROM LOAD GENERATOR AUCTION (TICK INTERVAL '50ms', UP TO 1000)
 
@@ -25,6 +26,7 @@ ALTER SYSTEM SET enable_create_table_from_source = true
 > CREATE TABLE bids FROM SOURCE demo (REFERENCE bids);
 > CREATE TABLE organizations FROM SOURCE demo (REFERENCE organizations);
 > CREATE TABLE users FROM SOURCE demo (REFERENCE users);
+> COMMIT
 
 > SHOW SOURCES
 name          type           cluster                        comment

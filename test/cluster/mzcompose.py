@@ -34,7 +34,11 @@ from psycopg.errors import (
 )
 
 from materialize import buildkite, ui
-from materialize.mzcompose.composition import Composition, WorkflowArgumentParser
+from materialize.mzcompose.composition import (
+    Composition,
+    Service,
+    WorkflowArgumentParser,
+)
 from materialize.mzcompose.services.clusterd import Clusterd
 from materialize.mzcompose.services.kafka import Kafka
 from materialize.mzcompose.services.localstack import Localstack
@@ -71,6 +75,7 @@ SERVICES = [
             "unsafe_enable_unsafe_functions": "true",
             "unsafe_enable_unorchestrated_cluster_replicas": "true",
         },
+        support_external_clusterd=True,
     ),
     CockroachOrPostgresMetadata(),
     Postgres(),
@@ -86,16 +91,22 @@ SERVICES = [
 
 def workflow_default(c: Composition, parser: WorkflowArgumentParser) -> None:
     def process(name: str) -> None:
-        # incident-70 requires more memory, runs in separate CI step
+        # incident-70, crash-on-replica-expiration-index and refresh-mv-restart
+        # are slow, run in separate CI step
         # concurrent-connections is too flaky
+        # TODO: Reenable test-memory-limiter when database-issues/9502 is fixed
         if name in (
             "default",
+            "crash-on-replica-expiration-index",
             "test-incident-70",
             "test-concurrent-connections",
+            "test-refresh-mv-restart",
+            "test-memory-limiter",
         ):
             return
         with c.test_case(name):
             c.workflow(name)
+            c.down()
 
     files = buildkite.shard_list(list(c.workflows.keys()), lambda workflow: workflow)
     c.test_parts(files, process)
@@ -111,8 +122,6 @@ def workflow_test_smoke(c: Composition, parser: WorkflowArgumentParser) -> None:
         help="run against the specified files",
     )
     args = parser.parse_args()
-
-    c.down(destroy_volumes=True)
 
     with c.override(
         Clusterd(
@@ -140,16 +149,13 @@ def workflow_test_smoke(c: Composition, parser: WorkflowArgumentParser) -> None:
         c.up("materialized")
 
         # Create a cluster and verify that tests pass.
-        c.up("clusterd1")
-        c.up("clusterd2")
+        c.up("clusterd1", "clusterd2")
 
         # Make sure cluster1 is owned by the system so it doesn't get dropped
         # between testdrive runs.
         c.sql(
             """
             ALTER SYSTEM SET unsafe_enable_unorchestrated_cluster_replicas = true;
-
-            DROP CLUSTER IF EXISTS cluster1 CASCADE;
 
             CREATE CLUSTER cluster1 REPLICAS (
                 replica1 (
@@ -201,61 +207,9 @@ def workflow_test_smoke(c: Composition, parser: WorkflowArgumentParser) -> None:
         c.sql("DROP CLUSTER cluster1 CASCADE", port=6877, user="mz_system")
 
 
-def workflow_test_invalid_compute_reuse(c: Composition) -> None:
-    """Ensure clusterds correctly crash if used in unsupported communication config"""
-    c.down(destroy_volumes=True)
-    c.up("materialized")
-
-    # Create a remote cluster and verify that tests pass.
-    c.up("clusterd1")
-    c.up("clusterd2")
-    c.sql("DROP CLUSTER IF EXISTS cluster1 CASCADE;")
-    c.sql(
-        "ALTER SYSTEM SET unsafe_enable_unorchestrated_cluster_replicas = true;",
-        port=6877,
-        user="mz_system",
-    )
-
-    c.sql(
-        """CREATE CLUSTER cluster1 REPLICAS (replica1 (
-            STORAGECTL ADDRESSES ['clusterd1:2100', 'clusterd2:2100'],
-            STORAGE ADDRESSES ['clusterd1:2103', 'clusterd2:2103'],
-            COMPUTECTL ADDRESSES ['clusterd1:2101', 'clusterd2:2101'],
-            COMPUTE ADDRESSES ['clusterd1:2102', 'clusterd2:2102'],
-            WORKERS 2
-        ));
-    """
-    )
-    c.sql("DROP CLUSTER cluster1 CASCADE;")
-
-    # Note the different WORKERS argument
-    c.sql(
-        """CREATE CLUSTER cluster1 REPLICAS (replica1 (
-            STORAGECTL ADDRESSES ['clusterd1:2100', 'clusterd2:2100'],
-            STORAGE ADDRESSES ['clusterd1:2103', 'clusterd2:2103'],
-            COMPUTECTL ADDRESSES ['clusterd1:2101', 'clusterd2:2101'],
-            COMPUTE ADDRESSES ['clusterd1:2102', 'clusterd2:2102'],
-            WORKERS 1
-        ));
-    """
-    )
-
-    for i in range(5):
-        # This should ensure that compute crashed (and does not just hang forever)
-        c1 = c.invoke("logs", "clusterd1", capture=True)
-        if (
-            "halting process: new timely configuration does not match existing timely configuration"
-            in c1.stdout
-        ):
-            break
-        # Waiting for logs to arrive
-        time.sleep(1)
-
-
 def workflow_test_github_3553(c: Composition) -> None:
     """Test that clients do not wait indefinitely for a crashed resource."""
 
-    c.down(destroy_volumes=True)
     c.up("materialized")
 
     c.sql(
@@ -294,8 +248,6 @@ def workflow_test_github_4443(c: Composition) -> None:
 
     Regression test for https://github.com/MaterializeInc/database-issues/issues/4443.
     """
-
-    c.down(destroy_volumes=True)
 
     with c.override(Clusterd(name="clusterd1", workers=1)):
         c.up("materialized", "clusterd1")
@@ -476,9 +428,7 @@ def workflow_test_github_4444(c: Composition) -> None:
     Regression test for https://github.com/MaterializeInc/database-issues/issues/4444.
     """
 
-    c.down(destroy_volumes=True)
-    c.up("materialized")
-    c.up("clusterd1")
+    c.up("materialized", "clusterd1")
 
     c.sql(
         "ALTER SYSTEM SET unsafe_enable_unorchestrated_cluster_replicas = true;",
@@ -537,10 +487,7 @@ def workflow_test_github_4545(c: Composition) -> None:
     Regression test for https://github.com/MaterializeInc/database-issues/issues/4545.
     """
 
-    c.down(destroy_volumes=True)
-    c.up("materialized")
-    c.up("clusterd1")
-    c.up("clusterd2")
+    c.up("materialized", "clusterd1", "clusterd2")
 
     c.sql(
         "ALTER SYSTEM SET unsafe_enable_unorchestrated_cluster_replicas = true;",
@@ -588,13 +535,10 @@ def workflow_test_github_4587(c: Composition) -> None:
     Regression test for https://github.com/MaterializeInc/database-issues/issues/4587.
     """
 
-    c.down(destroy_volumes=True)
     with c.override(
         Testdrive(no_reset=True),
     ):
-        c.up("testdrive", persistent=True)
-        c.up("materialized")
-        c.up("clusterd1")
+        c.up("materialized", "clusterd1", Service("testdrive", idle=True))
 
         c.sql(
             "ALTER SYSTEM SET unsafe_enable_unorchestrated_cluster_replicas = true;",
@@ -686,7 +630,6 @@ def workflow_test_github_4433(c: Composition) -> None:
     Regression test for https://github.com/MaterializeInc/database-issues/issues/4433.
     """
 
-    c.down(destroy_volumes=True)
     with c.override(
         Clusterd(
             name="clusterd1",
@@ -697,9 +640,7 @@ def workflow_test_github_4433(c: Composition) -> None:
         ),
         Testdrive(no_reset=True),
     ):
-        c.up("testdrive", persistent=True)
-        c.up("materialized")
-        c.up("clusterd1")
+        c.up("materialized", "clusterd1", Service("testdrive", idle=True))
 
         c.sql(
             "ALTER SYSTEM SET unsafe_enable_unorchestrated_cluster_replicas = true;",
@@ -766,13 +707,10 @@ def workflow_test_github_4966(c: Composition) -> None:
     Regression test for https://github.com/MaterializeInc/database-issues/issues/4966.
     """
 
-    c.down(destroy_volumes=True)
     with c.override(
         Testdrive(no_reset=True),
     ):
-        c.up("testdrive", persistent=True)
-        c.up("materialized")
-        c.up("clusterd1")
+        c.up("materialized", "clusterd1", Service("testdrive", idle=True))
 
         c.sql(
             "ALTER SYSTEM SET unsafe_enable_unorchestrated_cluster_replicas = true;",
@@ -845,13 +783,10 @@ def workflow_test_github_5087(c: Composition) -> None:
     Regression test for https://github.com/MaterializeInc/database-issues/issues/5087.
     """
 
-    c.down(destroy_volumes=True)
     with c.override(
         Testdrive(no_reset=True),
     ):
-        c.up("testdrive", persistent=True)
-        c.up("materialized")
-        c.up("clusterd1")
+        c.up("materialized", "clusterd1", Service("testdrive", idle=True))
 
         c.sql(
             "ALTER SYSTEM SET unsafe_enable_unorchestrated_cluster_replicas = true;",
@@ -1000,7 +935,6 @@ def workflow_test_github_5086(c: Composition) -> None:
     initially not covered, but eventually got supported as well.
     """
 
-    c.down(destroy_volumes=True)
     with c.override(
         Clusterd(
             name="clusterd1",
@@ -1011,9 +945,7 @@ def workflow_test_github_5086(c: Composition) -> None:
         ),
         Testdrive(no_reset=True),
     ):
-        c.up("testdrive", persistent=True)
-        c.up("materialized")
-        c.up("clusterd1")
+        c.up("materialized", "clusterd1", Service("testdrive", idle=True))
 
         c.sql(
             "ALTER SYSTEM SET unsafe_enable_unorchestrated_cluster_replicas = true;",
@@ -1095,7 +1027,6 @@ def workflow_test_github_5831(c: Composition) -> None:
     underlying correctness issue has been fixed.
     """
 
-    c.down(destroy_volumes=True)
     with c.override(
         Clusterd(
             name="clusterd1",
@@ -1106,9 +1037,7 @@ def workflow_test_github_5831(c: Composition) -> None:
         ),
         Testdrive(no_reset=True),
     ):
-        c.up("testdrive", persistent=True)
-        c.up("materialized")
-        c.up("clusterd1")
+        c.up("materialized", "clusterd1", Service("testdrive", idle=True))
 
         c.sql(
             "ALTER SYSTEM SET unsafe_enable_unorchestrated_cluster_replicas = true;",
@@ -1204,7 +1133,6 @@ def workflow_test_single_time_monotonicity_enforcers(c: Composition) -> None:
     behavior of performing repetitions to see if the output matches.
     """
 
-    c.down(destroy_volumes=True)
     with c.override(
         Clusterd(
             name="clusterd1",
@@ -1215,9 +1143,7 @@ def workflow_test_single_time_monotonicity_enforcers(c: Composition) -> None:
         ),
         Testdrive(no_reset=True),
     ):
-        c.up("testdrive", persistent=True)
-        c.up("materialized")
-        c.up("clusterd1")
+        c.up("materialized", "clusterd1", Service("testdrive", idle=True))
 
         c.sql(
             "ALTER SYSTEM SET unsafe_enable_unorchestrated_cluster_replicas = true;",
@@ -1308,8 +1234,6 @@ def workflow_test_single_time_monotonicity_enforcers(c: Composition) -> None:
 def workflow_test_github_7645(c: Composition) -> None:
     """Regression test for database-issues#7645"""
 
-    c.down(destroy_volumes=True)
-
     with c.override(
         Testdrive(no_reset=True, consistent_seed=True),
     ):
@@ -1343,7 +1267,6 @@ def workflow_test_upsert(c: Composition) -> None:
     with c.override(
         Testdrive(default_timeout="30s", no_reset=True, consistent_seed=True),
     ):
-        c.down(destroy_volumes=True)
         c.up("materialized", "zookeeper", "kafka", "schema-registry")
 
         c.run_testdrive_files("upsert/01-create-sources.td")
@@ -1361,8 +1284,6 @@ def workflow_test_upsert(c: Composition) -> None:
 
 def workflow_test_remote_storage(c: Composition) -> None:
     """Test creating sources in a remote clusterd process."""
-
-    c.down(destroy_volumes=True)
 
     with c.override(
         Testdrive(no_reset=True, consistent_seed=True),
@@ -1391,8 +1312,7 @@ def workflow_test_remote_storage(c: Composition) -> None:
         c.kill("materialized")
         c.up("materialized")
         c.kill("clusterd1")
-        c.up("clusterd1")
-        c.up("clusterd2")
+        c.up("clusterd1", "clusterd2")
         c.run_testdrive_files("storage/02-after-environmentd-restart.td")
 
         # just kill one of the clusterd's and make sure we can recover.
@@ -1401,20 +1321,18 @@ def workflow_test_remote_storage(c: Composition) -> None:
         c.run_testdrive_files("storage/03-while-clusterd-down.td")
 
         # Bring back both clusterd's
-        c.up("clusterd1")
-        c.up("clusterd2")
+        c.up("clusterd1", "clusterd2")
         c.run_testdrive_files("storage/04-after-clusterd-restart.td")
 
 
 def workflow_test_drop_quickstart_cluster(c: Composition) -> None:
     """Test that the quickstart cluster can be dropped"""
 
-    c.down(destroy_volumes=True)
     c.up("materialized")
 
     c.sql("DROP CLUSTER quickstart CASCADE", user="mz_system", port=6877)
     c.sql(
-        "CREATE CLUSTER quickstart REPLICAS (quickstart (SIZE '1'))",
+        "CREATE CLUSTER quickstart REPLICAS (quickstart (SIZE 'scale=1,workers=1'))",
         user="mz_system",
         port=6877,
     )
@@ -1422,8 +1340,6 @@ def workflow_test_drop_quickstart_cluster(c: Composition) -> None:
 
 def workflow_test_resource_limits(c: Composition) -> None:
     """Test resource limits in Materialize."""
-
-    c.down(destroy_volumes=True)
 
     with c.override(
         Testdrive(),
@@ -1436,8 +1352,6 @@ def workflow_test_resource_limits(c: Composition) -> None:
 
 def workflow_pg_snapshot_resumption(c: Composition) -> None:
     """Test PostgreSQL snapshot resumption."""
-
-    c.down(destroy_volumes=True)
 
     with c.override(
         # Start postgres for the pg source
@@ -1470,8 +1384,6 @@ def workflow_pg_snapshot_resumption(c: Composition) -> None:
 def workflow_sink_failure(c: Composition) -> None:
     """Test specific sink failure scenarios"""
 
-    c.down(destroy_volumes=True)
-
     with c.override(
         # Start postgres for the pg source
         Testdrive(no_reset=True),
@@ -1496,8 +1408,6 @@ def workflow_sink_failure(c: Composition) -> None:
 
 def workflow_test_bootstrap_vars(c: Composition) -> None:
     """Test default system vars values passed with a CLI option."""
-
-    c.down(destroy_volumes=True)
 
     with c.override(
         Testdrive(no_reset=True),
@@ -1526,19 +1436,17 @@ def workflow_test_bootstrap_vars(c: Composition) -> None:
 def workflow_test_system_table_indexes(c: Composition) -> None:
     """Test system table indexes."""
 
-    c.down(destroy_volumes=True)
-
     with c.override(
         Testdrive(),
         Materialized(),
     ):
-        c.up("testdrive", persistent=True)
-        c.up("materialized")
+        c.up("materialized", Service("testdrive", idle=True))
         c.testdrive(
             input=dedent(
                 """
         $ postgres-execute connection=postgres://mz_system@materialized:6877/materialize
         SET CLUSTER TO DEFAULT;
+        DROP VIEW IF EXISTS v_mz_views;
         CREATE VIEW v_mz_views AS SELECT \
             id, \
             oid, \
@@ -1563,8 +1471,7 @@ def workflow_test_system_table_indexes(c: Composition) -> None:
         Testdrive(no_reset=True),
         Materialized(),
     ):
-        c.up("testdrive", persistent=True)
-        c.up("materialized")
+        c.up("materialized", Service("testdrive", idle=True))
         c.testdrive(
             input=dedent(
                 """
@@ -1581,10 +1488,7 @@ def workflow_test_replica_targeted_subscribe_abort(c: Composition) -> None:
     replica disconnects.
     """
 
-    c.down(destroy_volumes=True)
-    c.up("materialized")
-    c.up("clusterd1")
-    c.up("clusterd2")
+    c.up("materialized", "clusterd1", "clusterd2")
 
     c.sql(
         "ALTER SYSTEM SET unsafe_enable_unorchestrated_cluster_replicas = true;",
@@ -1594,7 +1498,6 @@ def workflow_test_replica_targeted_subscribe_abort(c: Composition) -> None:
 
     c.sql(
         """
-        DROP CLUSTER IF EXISTS cluster1 CASCADE;
         CREATE CLUSTER cluster1 REPLICAS (
             replica1 (
                 STORAGECTL ADDRESSES ['clusterd1:2100'],
@@ -1657,7 +1560,8 @@ def workflow_test_replica_targeted_subscribe_abort(c: Composition) -> None:
             BEGIN;
             DECLARE c CURSOR FOR SUBSCRIBE t;
             FETCH c WITH (timeout = '5s');
-            """
+            """,
+            reuse_connection=False,
         )
     except InternalError_ as e:
         assert (
@@ -1676,10 +1580,7 @@ def workflow_test_replica_targeted_select_abort(c: Composition) -> None:
     replica disconnects.
     """
 
-    c.down(destroy_volumes=True)
-    c.up("materialized")
-    c.up("clusterd1")
-    c.up("clusterd2")
+    c.up("materialized", "clusterd1", "clusterd2")
 
     c.sql(
         "ALTER SYSTEM SET unsafe_enable_unorchestrated_cluster_replicas = true;",
@@ -1689,7 +1590,6 @@ def workflow_test_replica_targeted_select_abort(c: Composition) -> None:
 
     c.sql(
         """
-        DROP CLUSTER IF EXISTS cluster1 CASCADE;
         CREATE CLUSTER cluster1 REPLICAS (
             replica1 (
                 STORAGECTL ADDRESSES ['clusterd1:2100'],
@@ -1766,8 +1666,6 @@ def workflow_test_compute_reconciliation_reuse(c: Composition) -> None:
     Test that compute reconciliation reuses existing dataflows.
     """
 
-    c.down(destroy_volumes=True)
-
     with c.override(
         Clusterd(name="clusterd1", workers=1),
         Clusterd(name="clusterd2", workers=1),
@@ -1775,7 +1673,10 @@ def workflow_test_compute_reconciliation_reuse(c: Composition) -> None:
         c.up("materialized", "clusterd1", "clusterd2")
 
         c.sql(
-            "ALTER SYSTEM SET unsafe_enable_unorchestrated_cluster_replicas = true;",
+            """
+            ALTER SYSTEM SET unsafe_enable_unorchestrated_cluster_replicas = true;
+            ALTER SYSTEM SET enable_introspection_subscribes = false;
+            """,
             port=6877,
             user="mz_system",
         )
@@ -1918,15 +1819,16 @@ def workflow_test_compute_reconciliation_replace(c: Composition) -> None:
     Regression test for database-issues#8444.
     """
 
-    c.down(destroy_volumes=True)
-
     with c.override(
         Clusterd(name="clusterd1", workers=1),
     ):
         c.up("materialized", "clusterd1")
 
         c.sql(
-            "ALTER SYSTEM SET unsafe_enable_unorchestrated_cluster_replicas = true;",
+            """
+            ALTER SYSTEM SET unsafe_enable_unorchestrated_cluster_replicas = true;
+            ALTER SYSTEM SET enable_introspection_subscribes = false;
+            """,
             port=6877,
             user="mz_system",
         )
@@ -2010,10 +1912,7 @@ def workflow_test_compute_reconciliation_no_errors(c: Composition) -> None:
     in the process of reconciliation.
     """
 
-    c.down(destroy_volumes=True)
-
-    c.up("materialized")
-    c.up("clusterd1")
+    c.up("materialized", "clusterd1")
 
     c.sql(
         "ALTER SYSTEM SET unsafe_enable_unorchestrated_cluster_replicas = true;",
@@ -2097,14 +1996,13 @@ def workflow_test_drop_during_reconciliation(c: Composition) -> None:
     Regression test for database-issues#8399.
     """
 
-    c.down(destroy_volumes=True)
-
     with c.override(
         Materialized(
             additional_system_parameter_defaults={
                 "unsafe_enable_unsafe_functions": "true",
                 "unsafe_enable_unorchestrated_cluster_replicas": "true",
             },
+            support_external_clusterd=True,
         ),
         Clusterd(
             name="clusterd1",
@@ -2120,8 +2018,12 @@ def workflow_test_drop_during_reconciliation(c: Composition) -> None:
             default_timeout="30s",
         ),
     ):
-        c.up("materialized", "clusterd1", "toxiproxy")
-        c.up("testdrive", persistent=True)
+        c.up(
+            "materialized",
+            "clusterd1",
+            "toxiproxy",
+            Service("testdrive", idle=True),
+        )
 
         # Set up toxi-proxies for clusterd GRPC endpoints.
         toxi_url = "http://toxiproxy:8474/proxies"
@@ -2206,7 +2108,6 @@ def workflow_test_mz_subscriptions(c: Composition) -> None:
     mz_subscriptions.
     """
 
-    c.down(destroy_volumes=True)
     c.up("materialized", "clusterd1")
 
     c.sql(
@@ -2304,9 +2205,7 @@ def workflow_test_mv_source_sink(c: Composition) -> None:
     Regression test for https://github.com/MaterializeInc/database-issues/issues/5676
     """
 
-    c.down(destroy_volumes=True)
-    c.up("materialized")
-    c.up("clusterd1")
+    c.up("materialized", "clusterd1")
 
     c.sql(
         "ALTER SYSTEM SET unsafe_enable_unorchestrated_cluster_replicas = true;",
@@ -2351,8 +2250,6 @@ def workflow_test_mv_source_sink(c: Composition) -> None:
 def workflow_test_query_without_default_cluster(c: Composition) -> None:
     """Test queries without a default cluster in Materialize."""
 
-    c.down(destroy_volumes=True)
-
     with c.override(
         Testdrive(),
         Materialized(),
@@ -2371,8 +2268,6 @@ def workflow_test_clusterd_death_detection(c: Composition) -> None:
     Regression test for https://github.com/MaterializeInc/database-issues/issues/6095
     """
 
-    c.down(destroy_volumes=True)
-
     with c.override(
         Clusterd(
             name="clusterd1",
@@ -2384,8 +2279,12 @@ def workflow_test_clusterd_death_detection(c: Composition) -> None:
             ],
         ),
     ):
-        c.up("materialized", "clusterd1", "toxiproxy")
-        c.up("testdrive", persistent=True)
+        c.up(
+            "materialized",
+            "clusterd1",
+            "toxiproxy",
+            Service("testdrive", idle=True),
+        )
 
         c.testdrive(
             input=dedent(
@@ -2434,13 +2333,11 @@ def workflow_test_clusterd_death_detection(c: Composition) -> None:
             """
             )
         )
-        # Should detect broken connection after a few seconds, works with c.kill("clusterd1")
+        # Should detect broken connection after a few seconds.
         time.sleep(10)
         envd = c.invoke("logs", "materialized", capture=True)
-        assert (
-            "error reading a body from connection: stream closed because of a broken pipe"
-            in envd.stdout
-        )
+        print(envd.stdout)
+        assert "replica task failed: timed out" in envd.stdout
 
 
 class Metrics:
@@ -2507,21 +2404,17 @@ class Metrics:
             "mz_storage_controller_history_command_count", command_type
         )
 
-    def get_commands_total(self, command_type: str) -> float:
+    def get_compute_commands_total(self, command_type: str) -> float:
         return self.get_command_count("mz_compute_commands_total", command_type)
 
-    def get_command_bytes_total(self, command_type: str) -> float:
-        return self.get_command_count(
-            "mz_compute_command_message_bytes_total", command_type
-        )
-
-    def get_responses_total(self, response_type: str) -> float:
+    def get_compute_responses_total(self, response_type: str) -> float:
         return self.get_response_count("mz_compute_responses_total", response_type)
 
-    def get_response_bytes_total(self, response_type: str) -> float:
-        return self.get_response_count(
-            "mz_compute_response_message_bytes_total", response_type
-        )
+    def get_storage_commands_total(self, command_type: str) -> float:
+        return self.get_command_count("mz_storage_commands_total", command_type)
+
+    def get_storage_responses_total(self, response_type: str) -> float:
+        return self.get_response_count("mz_storage_responses_total", response_type)
 
     def get_peeks_total(self, result: str) -> float:
         metrics = self.with_name("mz_compute_peeks_total")
@@ -2579,8 +2472,6 @@ class Metrics:
 def workflow_test_replica_metrics(c: Composition) -> None:
     """Test metrics exposed by replicas."""
 
-    c.down(destroy_volumes=True)
-
     with c.override(Clusterd(name="clusterd1", workers=1)):
         c.up("materialized", "clusterd1")
 
@@ -2633,8 +2524,8 @@ def workflow_test_replica_metrics(c: Composition) -> None:
         # Check that expected metrics exist and have sensible values.
         metrics = fetch_metrics()
 
-        count = metrics.get_replica_history_command_count("create_timely")
-        assert count == 0, f"unexpected create_timely count: {count}"
+        count = metrics.get_replica_history_command_count("hello")
+        assert count == 0, f"unexpected hello count: {count}"
         count = metrics.get_replica_history_command_count("create_instance")
         assert count == 1, f"unexpected create_instance count: {count}"
         count = metrics.get_replica_history_command_count("allow_compaction")
@@ -2714,9 +2605,7 @@ def workflow_test_replica_metrics(c: Composition) -> None:
 def workflow_test_compute_controller_metrics(c: Composition) -> None:
     """Test metrics exposed by the compute controller."""
 
-    c.down(destroy_volumes=True)
-    c.up("materialized")
-    c.up("testdrive", persistent=True)
+    c.up("materialized", Service("testdrive", idle=True))
 
     def fetch_metrics() -> Metrics:
         resp = c.exec(
@@ -2727,7 +2616,7 @@ def workflow_test_compute_controller_metrics(c: Composition) -> None:
     # Set up a cluster with a couple dataflows.
     c.sql(
         """
-        CREATE CLUSTER test MANAGED, SIZE '1';
+        CREATE CLUSTER test MANAGED, SIZE 'scale=1,workers=1';
         SET cluster = test;
 
         CREATE TABLE t (a int);
@@ -2751,57 +2640,41 @@ def workflow_test_compute_controller_metrics(c: Composition) -> None:
     metrics = fetch_metrics()
 
     # mz_compute_commands_total
-    count = metrics.get_commands_total("create_timely")
+    count = metrics.get_compute_commands_total("hello")
     assert count == 1, f"got {count}"
-    count = metrics.get_commands_total("create_instance")
+    count = metrics.get_compute_commands_total("create_instance")
     assert count == 1, f"got {count}"
-    count = metrics.get_commands_total("allow_compaction")
+    count = metrics.get_compute_commands_total("allow_compaction")
     assert count > 0, f"got {count}"
-    count = metrics.get_commands_total("create_dataflow")
+    count = metrics.get_compute_commands_total("create_dataflow")
     assert count >= 3, f"got {count}"
-    count = metrics.get_commands_total("peek")
+    count = metrics.get_compute_commands_total("peek")
     assert count == 2, f"got {count}"
-    count = metrics.get_commands_total("cancel_peek")
+    count = metrics.get_compute_commands_total("cancel_peek")
     assert count == 2, f"got {count}"
-    count = metrics.get_commands_total("initialization_complete")
+    count = metrics.get_compute_commands_total("initialization_complete")
     assert count == 1, f"got {count}"
-    count = metrics.get_commands_total("update_configuration")
+    count = metrics.get_compute_commands_total("update_configuration")
     assert count == 1, f"got {count}"
-
-    # mz_compute_command_message_bytes_total
-    count = metrics.get_command_bytes_total("create_timely")
+    count = metrics.get_compute_commands_total("schedule")
     assert count > 0, f"got {count}"
-    count = metrics.get_command_bytes_total("create_instance")
-    assert count > 0, f"got {count}"
-    count = metrics.get_command_bytes_total("allow_compaction")
-    assert count > 0, f"got {count}"
-    count = metrics.get_command_bytes_total("create_dataflow")
-    assert count > 0, f"got {count}"
-    count = metrics.get_command_bytes_total("peek")
-    assert count > 0, f"got {count}"
-    count = metrics.get_command_bytes_total("cancel_peek")
-    assert count > 0, f"got {count}"
-    count = metrics.get_command_bytes_total("initialization_complete")
-    assert count > 0, f"got {count}"
-    count = metrics.get_command_bytes_total("update_configuration")
-    assert count > 0, f"got {count}"
+    count = metrics.get_compute_commands_total("allow_writes")
+    assert count == 1, f"got {count}"
 
     # mz_compute_responses_total
-    count = metrics.get_responses_total("frontiers")
+    count = metrics.get_compute_responses_total("frontiers")
     assert count > 0, f"got {count}"
-    count = metrics.get_responses_total("peek_response")
+    count = metrics.get_compute_responses_total("peek_response")
     assert count == 2, f"got {count}"
-    count = metrics.get_responses_total("subscribe_response")
+    count = metrics.get_compute_responses_total("subscribe_response")
+    assert count >= 0, f"got {count}"
+    count = metrics.get_compute_responses_total("status")
     assert count > 0, f"got {count}"
 
-    # mz_compute_response_message_bytes_total
-    count = metrics.get_response_bytes_total("frontiers")
+    count = metrics.get_value("mz_compute_command_message_bytes_total")
     assert count > 0, f"got {count}"
-    count = metrics.get_response_bytes_total("peek_response")
+    count = metrics.get_value("mz_compute_response_message_bytes_total")
     assert count > 0, f"got {count}"
-    count = metrics.get_response_bytes_total("subscribe_response")
-    assert count > 0, f"got {count}"
-
     count = metrics.get_value("mz_compute_controller_replica_count")
     assert count == 1, f"got {count}"
     count = metrics.get_value("mz_compute_controller_collection_count")
@@ -2823,7 +2696,7 @@ def workflow_test_compute_controller_metrics(c: Composition) -> None:
     assert count == 0, f"got {count}"
 
     # mz_compute_controller_history_command_count
-    count = metrics.get_compute_controller_history_command_count("create_timely")
+    count = metrics.get_compute_controller_history_command_count("hello")
     assert count == 1, f"got {count}"
     count = metrics.get_compute_controller_history_command_count("create_instance")
     assert count == 1, f"got {count}"
@@ -2900,9 +2773,12 @@ def workflow_test_compute_controller_metrics(c: Composition) -> None:
 def workflow_test_storage_controller_metrics(c: Composition) -> None:
     """Test metrics exposed by the storage controller."""
 
-    c.down(destroy_volumes=True)
-    c.up("materialized", "kafka", "schema-registry")
-    c.up("testdrive", persistent=True)
+    c.up(
+        "materialized",
+        "kafka",
+        "schema-registry",
+        Service("testdrive", idle=True),
+    )
 
     def fetch_metrics() -> Metrics:
         resp = c.exec(
@@ -2917,7 +2793,7 @@ def workflow_test_storage_controller_metrics(c: Composition) -> None:
             $ postgres-execute connection=postgres://mz_system:materialize@${testdrive.materialize-internal-sql-addr}
             ALTER SYSTEM SET enable_alter_table_add_column = true
 
-            > CREATE CLUSTER test SIZE '1'
+            > CREATE CLUSTER test SIZE 'scale=1,workers=1'
             > SET cluster = test
 
             > CREATE TABLE t (a int)
@@ -2966,19 +2842,41 @@ def workflow_test_storage_controller_metrics(c: Composition) -> None:
     metrics_u2 = metrics.for_instance("u2")
     metrics_ux = metrics.for_instance("")
 
-    count = metrics_u2.get_summed_value("mz_storage_messages_sent_bytes")
+    # mz_storage_commands_total
+    count = metrics_u2.get_storage_commands_total("hello")
+    assert count == 1, f"got {count}"
+    count = metrics_u2.get_storage_commands_total("initialization_complete")
+    assert count == 1, f"got {count}"
+    count = metrics_u2.get_storage_commands_total("allow_writes")
+    assert count == 1, f"got {count}"
+    count = metrics_u2.get_storage_commands_total("update_configuration")
+    assert count == 1, f"got {count}"
+    count = metrics_u2.get_storage_commands_total("run_ingestion")
+    assert count == 1, f"got {count}"
+    count = metrics_u2.get_storage_commands_total("allow_compaction")
     assert count > 0, f"got {count}"
-    count = metrics_u2.get_summed_value("mz_storage_messages_received_bytes")
+    count = metrics_u2.get_storage_commands_total("run_sink")
+    assert count == 1, f"got {count}"
+
+    # mz_storage_responses_total
+    count = metrics_u2.get_storage_responses_total("frontier_upper")
+    assert count > 0, f"got {count}"
+    count = metrics_u2.get_storage_responses_total("status_update")
+    assert count > 0, f"got {count}"
+
+    count = metrics_u2.get_value("mz_storage_command_message_bytes_total")
+    assert count > 0, f"got {count}"
+    count = metrics_u2.get_value("mz_storage_response_message_bytes_total")
     assert count > 0, f"got {count}"
 
     # mz_storage_controller_history_command_count
-    count = metrics_u2.get_storage_controller_history_command_count("create_timely")
+    count = metrics_u2.get_storage_controller_history_command_count("hello")
     assert count == 1, f"got {count}"
     count = metrics_u2.get_storage_controller_history_command_count("allow_compaction")
     assert count > 0, f"got {count}"
-    count = metrics_u2.get_storage_controller_history_command_count("run_ingestions")
+    count = metrics_u2.get_storage_controller_history_command_count("run_ingestion")
     assert count == 1, f"got {count}"
-    count = metrics_u2.get_storage_controller_history_command_count("run_sinks")
+    count = metrics_u2.get_storage_controller_history_command_count("run_sink")
     assert count == 1, f"got {count}"
     count = metrics_u2.get_storage_controller_history_command_count(
         "initialization_complete"
@@ -2991,12 +2889,12 @@ def workflow_test_storage_controller_metrics(c: Composition) -> None:
     count = metrics_u2.get_storage_controller_history_command_count("allow_writes")
     assert count == 1, f"got {count}"
 
-    count = metrics_u2.get_value("mz_compute_controller_connected_replica_count")
+    count = metrics_u2.get_value("mz_storage_controller_connected_replica_count")
     assert count == 1, f"got {count}"
-    count = metrics_u2.get_value("mz_compute_controller_replica_connects_total")
+    count = metrics_u2.get_value("mz_storage_controller_replica_connects_total")
     assert count == 1, f"got {count}"
     duration = metrics_u2.get_value(
-        "mz_compute_controller_replica_connect_wait_time_seconds_total"
+        "mz_storage_controller_replica_connect_wait_time_seconds_total"
     )
     assert duration > 0, f"got {duration}"
 
@@ -3041,7 +2939,6 @@ def workflow_test_storage_controller_metrics(c: Composition) -> None:
 def workflow_test_optimizer_metrics(c: Composition) -> None:
     """Test metrics exposed by the optimizer."""
 
-    c.down(destroy_volumes=True)
     c.up("materialized")
 
     def fetch_metrics() -> Metrics:
@@ -3097,13 +2994,10 @@ def workflow_test_pgwire_metrics(c: Composition) -> None:
         ).stdout
         return Metrics(resp)
 
-    c.down(destroy_volumes=True)
-
     with c.override(
         Testdrive(no_reset=True),
     ):
-        c.up("testdrive", persistent=True)
-        c.up("materialized")
+        c.up("materialized", Service("testdrive", idle=True))
 
         c.sql(
             """
@@ -3196,9 +3090,9 @@ def workflow_test_pgwire_metrics(c: Composition) -> None:
         c.sql(
             """
             BEGIN;
-            DECLARE c1 CURSOR FOR (SELECT * FROM t);
-            FETCH 1 c1;
-            FETCH 1 c1;
+            DECLARE c2 CURSOR FOR (SELECT * FROM t);
+            FETCH 1 c2;
+            FETCH 1 c2;
             """
         )
         metrics = fetch_metrics()
@@ -3211,10 +3105,10 @@ def workflow_test_pgwire_metrics(c: Composition) -> None:
         c.sql(
             """
             BEGIN;
-            DECLARE c1 CURSOR FOR (SELECT * FROM t);
-            FETCH 1 c1;
-            FETCH 1 c1;
-            FETCH 1 c1;
+            DECLARE c3 CURSOR FOR (SELECT * FROM t);
+            FETCH 1 c3;
+            FETCH 1 c3;
+            FETCH 1 c3;
             """
         )
         metrics = fetch_metrics()
@@ -3227,8 +3121,8 @@ def workflow_test_pgwire_metrics(c: Composition) -> None:
         c.sql(
             """
             BEGIN;
-            DECLARE c1 CURSOR FOR (SELECT * FROM t);
-            FETCH ALL c1;
+            DECLARE c4 CURSOR FOR (SELECT * FROM t);
+            FETCH ALL c4;
             """
         )
         metrics = fetch_metrics()
@@ -3244,10 +3138,11 @@ def workflow_test_pgwire_metrics(c: Composition) -> None:
             """
             CREATE VIEW v1 AS SELECT 3;
             BEGIN;
-            DECLARE c1 CURSOR FOR SUBSCRIBE (SELECT * FROM v1);
-            FETCH ALL c1;
-            FETCH ALL c1;
-            """
+            DECLARE c5 CURSOR FOR SUBSCRIBE (SELECT * FROM v1);
+            FETCH ALL c5;
+            FETCH ALL c5;
+            """,
+            reuse_connection=False,
         )
         metrics = fetch_metrics()
         rrftlbs_subscribe_1 = metrics.get_result_rows_first_to_last_byte_seconds(
@@ -3259,10 +3154,11 @@ def workflow_test_pgwire_metrics(c: Composition) -> None:
         c.sql(
             """
             BEGIN;
-            DECLARE c1 CURSOR FOR SUBSCRIBE (SELECT * FROM v1);
-            FETCH ALL c1;
-            FETCH ALL c1;
-            """
+            DECLARE c6 CURSOR FOR SUBSCRIBE (SELECT * FROM v1);
+            FETCH ALL c6;
+            FETCH ALL c6;
+            """,
+            reuse_connection=False,
         )
         metrics = fetch_metrics()
         rrftlbs_subscribe_2 = metrics.get_result_rows_first_to_last_byte_seconds(
@@ -3276,10 +3172,11 @@ def workflow_test_pgwire_metrics(c: Composition) -> None:
         c.sql(
             """
             BEGIN;
-            DECLARE c1 CURSOR FOR SUBSCRIBE (SELECT * FROM t);
-            FETCH ALL c1;
-            FETCH ALL c1 WITH (TIMEOUT = INTERVAL '1500 milliseconds');
-            """
+            DECLARE c7 CURSOR FOR SUBSCRIBE (SELECT * FROM t);
+            FETCH ALL c7;
+            FETCH ALL c7 WITH (TIMEOUT = INTERVAL '1500 milliseconds');
+            """,
+            reuse_connection=False,
         )
         metrics = fetch_metrics()
         rrftlbs_subscribe_3 = metrics.get_result_rows_first_to_last_byte_seconds(
@@ -3336,7 +3233,6 @@ def workflow_test_metrics_retention_across_restart(c: Composition) -> None:
             diff.days < 30
         ), f"{name} greater than expected (since={since}, diff={diff})"
 
-    c.down(destroy_volumes=True)
     c.up("materialized")
 
     table_since1, index_since1 = collect_sinces()
@@ -3381,13 +3277,12 @@ def workflow_test_workload_class_in_metrics(c: Composition) -> None:
 
     RE_WORKLOAD_CLASS_LABEL = re.compile(r'workload_class="(?P<value>\w+)"')
 
-    c.down(destroy_volumes=True)
     c.up("materialized")
 
     # Create a cluster and wait for it to come up.
     c.sql(
         """
-        CREATE CLUSTER test SIZE '1';
+        CREATE CLUSTER test SIZE 'scale=1,workers=1';
         SET cluster = test;
         SELECT * FROM mz_introspection.mz_dataflow_operators;
         """
@@ -3480,7 +3375,6 @@ def workflow_test_concurrent_connections(c: Composition) -> None:
         end_time = time.time()
         runtimes[i] = end_time - start_time
 
-    c.down(destroy_volumes=True)
     c.up("materialized")
 
     c.sql(
@@ -3527,9 +3421,7 @@ def workflow_test_profile_fetch(c: Composition) -> None:
     endpoint.
     """
 
-    c.down(destroy_volumes=True)
-    c.up("materialized")
-    c.up("clusterd1")
+    c.up("materialized", "clusterd1")
 
     envd_port = c.port("materialized", 6878)
     envd_url = f"http://localhost:{envd_port}/prof/"
@@ -3635,7 +3527,6 @@ def workflow_test_incident_70(c: Composition) -> None:
         ),
         Minio(setup_materialize=True),
     ):
-        c.down(destroy_volumes=True)
         c.up("minio", "materialized")
 
         c.sql(
@@ -3715,15 +3606,14 @@ def workflow_test_github_cloud_7998(
 ) -> None:
     """Regression test for MaterializeInc/cloud#7998."""
 
-    c.down(destroy_volumes=True)
-
     with c.override(
         Testdrive(no_reset=True),
         Clusterd(name="clusterd1"),
-        Materialized(),
+        Materialized(
+            support_external_clusterd=True,
+        ),
     ):
-        c.up("materialized")
-        c.up("clusterd1")
+        c.up("materialized", "clusterd1")
 
         c.run_testdrive_files("github-cloud-7998/setup.td")
 
@@ -3745,19 +3635,16 @@ def workflow_test_github_cloud_7998(
 def workflow_test_github_7000(c: Composition, parser: WorkflowArgumentParser) -> None:
     """Regression test for database-issues#7000."""
 
-    c.down(destroy_volumes=True)
-
     with c.override(
         Testdrive(no_reset=True),
     ):
-        c.up("testdrive", persistent=True)
-        c.up("materialized")
+        c.up("materialized", Service("testdrive", idle=True))
 
         # Create an MV reading from an index. Make sure it doesn't produce its
         # snapshot by installing it in a cluster without replicas.
         c.sql(
             """
-            CREATE CLUSTER test SIZE '1', REPLICATION FACTOR 0;
+            CREATE CLUSTER test SIZE 'scale=1,workers=1', REPLICATION FACTOR 0;
             SET cluster = test;
 
             CREATE TABLE t (a int);
@@ -3792,8 +3679,6 @@ def workflow_test_github_7000(c: Composition, parser: WorkflowArgumentParser) ->
 def workflow_statement_logging(c: Composition, parser: WorkflowArgumentParser) -> None:
     """Statement logging test needs to run with 100% logging of tests (as opposed to the default 1% )"""
 
-    c.down(destroy_volumes=True)
-
     with c.override(
         Testdrive(no_reset=True),
         Materialized(),
@@ -3816,8 +3701,6 @@ def workflow_blue_green_deployment(
     c: Composition, parser: WorkflowArgumentParser
 ) -> None:
     """Blue/Green Deployment testing, see https://www.notion.so/materialize/Testing-Plan-Blue-Green-Deployments-01528a1eec3b42c3a25d5faaff7a9bf9#f53b51b110b044859bf954afc771c63a"""
-    c.down(destroy_volumes=True)
-
     running = True
 
     def selects():
@@ -3899,12 +3782,10 @@ def workflow_blue_green_deployment(
                 "unsafe_enable_unsafe_functions": "true",
                 "unsafe_enable_unorchestrated_cluster_replicas": "true",
             },
+            support_external_clusterd=True,
         ),
     ):
-        c.up("materialized")
-        c.up("clusterd1")
-        c.up("clusterd2")
-        c.up("clusterd3")
+        c.up("materialized", "clusterd1", "clusterd2", "clusterd3")
         c.run_testdrive_files("blue-green-deployment/setup.td")
 
         threads = [PropagatingThread(target=fn) for fn in (selects, subscribe)]
@@ -3924,9 +3805,7 @@ def workflow_test_subscribe_hydration_status(
 ) -> None:
     """Test that hydration status tracking works for subscribe dataflows."""
 
-    c.down(destroy_volumes=True)
-    c.up("materialized")
-    c.up("testdrive", persistent=True)
+    c.up("materialized", Service("testdrive", idle=True))
 
     # Start a subscribe.
     cursor = c.sql_cursor()
@@ -3976,7 +3855,6 @@ def workflow_cluster_drop_concurrent(
     Test that dropping a cluster will close already running queries against
     that cluster, both SELECTs and SUBSCRIBEs.
     """
-    c.down(destroy_volumes=True)
 
     def select():
         with c.sql_cursor() as cursor:
@@ -3996,10 +3874,9 @@ def workflow_cluster_drop_concurrent(
             no_reset=True,
         ),
         Clusterd(name="clusterd1"),
-        Materialized(),
+        Materialized(support_external_clusterd=True),
     ):
-        c.up("materialized")
-        c.up("clusterd1")
+        c.up("materialized", "clusterd1")
         c.run_testdrive_files("cluster-drop-concurrent/setup.td")
         threads = [
             PropagatingThread(target=fn, name=name)
@@ -4042,17 +3919,16 @@ def workflow_test_refresh_mv_warmup(
             additional_system_parameter_defaults={
                 "enable_refresh_every_mvs": "true",
             },
+            support_external_clusterd=True,
         ),
         Testdrive(no_reset=True),
     ):
-        c.down(destroy_volumes=True)
-        c.up("materialized")
-        c.up("testdrive", persistent=True)
+        c.up("materialized", Service("testdrive", idle=True))
 
         c.testdrive(
             input=dedent(
                 """
-                > CREATE CLUSTER cluster12 SIZE '1';
+                > CREATE CLUSTER cluster12 SIZE 'scale=1,workers=1';
                 > SET cluster = cluster12;
 
                 ## 1. Create a materialized view that has only one refresh, and takes at least a few seconds to hydrate.
@@ -4124,12 +4000,13 @@ def workflow_test_refresh_mv_warmup(
         )
 
 
-def check_read_frontier_not_stuck(c: Composition, object_name: str):
+def check_read_frontiers_not_stuck(c: Composition, object_names: list[str]):
+    name_filter = ",".join(f"'{n}'" for n in object_names)
     query = f"""
-        SELECT f.read_frontier
+        SELECT o.name, f.read_frontier
         FROM mz_internal.mz_frontiers f
         JOIN mz_objects o ON o.id = f.object_id
-        WHERE o.name = '{object_name}';
+        WHERE o.name in ({name_filter});
         """
 
     # Because `mz_frontiers` isn't a linearizable relation it's possible that
@@ -4139,12 +4016,18 @@ def check_read_frontier_not_stuck(c: Composition, object_name: str):
         time.sleep(2)
         result = c.sql_query(query)
 
-    before = int(result[0][0])
+    before = {r[0]: int(r[1]) for r in result}
     time.sleep(3)
-    after = int(c.sql_query(query)[0][0])
-    assert (
-        before < after
-    ), f"read frontier of {object_name} is stuck, {before} >= {after}"
+
+    result = c.sql_query(query)
+    after = {r[0]: int(r[1]) for r in result}
+
+    for name in object_names:
+        before_ = before[name]
+        after_ = after[name]
+        assert (
+            before_ < after_
+        ), f"read frontier of {name} is stuck, {before_} >= {after_}"
 
 
 def workflow_test_refresh_mv_restart(
@@ -4220,6 +4103,7 @@ def workflow_test_refresh_mv_restart(
                 "enable_refresh_every_mvs": "true",
                 "enable_cluster_schedule_refresh": "true",
             },
+            support_external_clusterd=True,
         ),
         Testdrive(no_reset=True),
     ):
@@ -4230,9 +4114,9 @@ def workflow_test_refresh_mv_restart(
             > CREATE TABLE t (x int);
             > INSERT INTO t VALUES (100);
 
-            > CREATE CLUSTER cluster_acj SIZE '1';
-            > CREATE CLUSTER cluster_b SIZE '1';
-            > CREATE CLUSTER cluster_auto_scheduled (SIZE '1', SCHEDULE = ON REFRESH);
+            > CREATE CLUSTER cluster_acj SIZE 'scale=1,workers=1';
+            > CREATE CLUSTER cluster_b SIZE 'scale=1,workers=1';
+            > CREATE CLUSTER cluster_auto_scheduled (SIZE 'scale=1,workers=1', SCHEDULE = ON REFRESH);
 
             > CREATE MATERIALIZED VIEW mv_a
               IN CLUSTER cluster_acj
@@ -4262,8 +4146,8 @@ def workflow_test_refresh_mv_restart(
               WITH (REFRESH EVERY '1000000 sec' ALIGNED TO mz_now()::text::int8 + 2000) AS
               SELECT count(*) FROM (SELECT generate_series(1,x) FROM t);
 
-            > CREATE CLUSTER serving SIZE '1';
-            > CREATE CLUSTER serving_indexed SIZE '1';
+            > CREATE CLUSTER serving SIZE 'scale=1,workers=1';
+            > CREATE CLUSTER serving_indexed SIZE 'scale=1,workers=1';
 
             > CREATE DEFAULT INDEX IN CLUSTER serving_indexed ON mv_a;
             > CREATE DEFAULT INDEX IN CLUSTER serving_indexed ON mv_b;
@@ -4399,9 +4283,7 @@ def workflow_test_refresh_mv_restart(
             """
         )
 
-        c.down(destroy_volumes=True)
-        c.up("materialized")
-        c.up("testdrive", persistent=True)
+        c.up("materialized", Service("testdrive", idle=True))
 
         # 1. (quick restart)
         c.testdrive(input=before_restart)
@@ -4410,13 +4292,12 @@ def workflow_test_refresh_mv_restart(
         c.up("materialized")
         check_introspection()
         c.testdrive(input=after_restart)
-        check_read_frontier_not_stuck(c, "t")
+        check_read_frontiers_not_stuck(c, ["t"])
         check_introspection()
 
         # Reset the testing context.
         c.down(destroy_volumes=True)
-        c.up("materialized")
-        c.up("testdrive", persistent=True)
+        c.up("materialized", Service("testdrive", idle=True))
 
         # 2. (slow restart)
         c.testdrive(input=before_restart)
@@ -4426,13 +4307,12 @@ def workflow_test_refresh_mv_restart(
         c.up("materialized")
         check_introspection()
         c.testdrive(input=after_restart)
-        check_read_frontier_not_stuck(c, "t")
+        check_read_frontiers_not_stuck(c, ["t"])
         check_introspection()
 
         # Reset the testing context.
         c.down(destroy_volumes=True)
-        c.up("materialized")
-        c.up("testdrive", persistent=True)
+        c.up("materialized", Service("testdrive", idle=True))
 
         # 3.
         c.testdrive(
@@ -4441,7 +4321,7 @@ def workflow_test_refresh_mv_restart(
                 > CREATE TABLE t (x int);
                 > INSERT INTO t VALUES (100);
 
-                > CREATE CLUSTER cluster_defgh (SIZE '1', REPLICATION FACTOR 0);
+                > CREATE CLUSTER cluster_defgh (SIZE 'scale=1,workers=1', REPLICATION FACTOR 0);
 
                 > CREATE MATERIALIZED VIEW mv_3h
                   IN CLUSTER cluster_defgh
@@ -4472,7 +4352,7 @@ def workflow_test_refresh_mv_restart(
                   WITH (REFRESH AT CREATION) AS
                   SELECT count(*) FROM (SELECT generate_series(1,x) FROM t);
 
-                > CREATE CLUSTER serving_indexed SIZE '1';
+                > CREATE CLUSTER serving_indexed SIZE 'scale=1,workers=1';
                 > CREATE DEFAULT INDEX IN CLUSTER serving_indexed ON mv_3d;
                 > CREATE DEFAULT INDEX IN CLUSTER serving_indexed ON mv_3e;
                 > CREATE DEFAULT INDEX IN CLUSTER serving_indexed ON mv_3f;
@@ -4493,7 +4373,7 @@ def workflow_test_refresh_mv_restart(
                 """
                 > ALTER CLUSTER cluster_defgh SET (REPLICATION FACTOR 2);
 
-                > CREATE CLUSTER serving SIZE '1';
+                > CREATE CLUSTER serving SIZE 'scale=1,workers=1';
 
                 > SET TRANSACTION_ISOLATION TO 'STRICT SERIALIZABLE';
 
@@ -4577,7 +4457,7 @@ def workflow_test_refresh_mv_restart(
                 """
             )
         )
-        check_read_frontier_not_stuck(c, "t")
+        check_read_frontiers_not_stuck(c, ["t"])
         check_introspection()
 
         # Drop some MVs and check that this is reflected in the introspection objects.
@@ -4602,18 +4482,16 @@ def workflow_test_github_8734(c: Composition) -> None:
     Regression test for database-issues#8734.
     """
 
-    c.down(destroy_volumes=True)
-
     with c.override(
         Materialized(
             additional_system_parameter_defaults={
                 "enable_refresh_every_mvs": "true",
             },
+            support_external_clusterd=True,
         ),
         Testdrive(no_reset=True),
     ):
-        c.up("materialized")
-        c.up("testdrive", persistent=True)
+        c.up("materialized", Service("testdrive", idle=True))
 
         # Create a REFRESH MV and wait for it to refresh once, then take down
         # its cluster.
@@ -4621,7 +4499,7 @@ def workflow_test_github_8734(c: Composition) -> None:
             """
             CREATE TABLE t (a int);
 
-            CREATE CLUSTER test SIZE '1';
+            CREATE CLUSTER test SIZE 'scale=1,workers=1';
             CREATE MATERIALIZED VIEW mv
                 IN CLUSTER test
                 WITH (REFRESH EVERY '60m')
@@ -4632,7 +4510,7 @@ def workflow_test_github_8734(c: Composition) -> None:
             """
         )
 
-        check_read_frontier_not_stuck(c, "t")
+        check_read_frontiers_not_stuck(c, ["t"])
 
         # Restart envd, then verify that the table's frontier still advances.
         c.kill("materialized")
@@ -4640,13 +4518,11 @@ def workflow_test_github_8734(c: Composition) -> None:
 
         c.sql("SELECT * FROM mv")
 
-        check_read_frontier_not_stuck(c, "t")
+        check_read_frontiers_not_stuck(c, ["t"])
 
 
 def workflow_test_github_7798(c: Composition, parser: WorkflowArgumentParser) -> None:
     """Regression test for database-issues#7798."""
-
-    c.down(destroy_volumes=True)
 
     with c.override(
         Materialized(
@@ -4654,6 +4530,7 @@ def workflow_test_github_7798(c: Composition, parser: WorkflowArgumentParser) ->
                 "unsafe_enable_unsafe_functions": "true",
                 "unsafe_enable_unorchestrated_cluster_replicas": "true",
             },
+            support_external_clusterd=True,
         ),
         Testdrive(
             no_reset=True,
@@ -4695,9 +4572,7 @@ def workflow_test_github_7798(c: Composition, parser: WorkflowArgumentParser) ->
                 )
             )
 
-        c.up("materialized")
-        c.up("clusterd1")
-        c.up("testdrive", persistent=True)
+        c.up("materialized", "clusterd1", Service("testdrive", idle=True))
 
         # Create an unmanaged cluster that isn't restarted together with materialized,
         # and therein a source with subsources.
@@ -4740,7 +4615,6 @@ def workflow_test_github_7798(c: Composition, parser: WorkflowArgumentParser) ->
 def workflow_test_http_race_condition(
     c: Composition, parser: WorkflowArgumentParser
 ) -> None:
-    c.down(destroy_volumes=True)
     c.up("materialized")
 
     def worker() -> None:
@@ -4797,14 +4671,13 @@ def workflow_test_read_frontier_advancement(
     regressions in downgrading read holds.
     """
 
-    c.down(destroy_volumes=True)
     c.up("materialized")
 
     # Create various dataflows on a cluster with multiple replicas, to also
     # test tracking of per-replica read holds.
     c.sql(
         """
-        CREATE CLUSTER test SIZE '2-2', REPLICATION FACTOR 4;
+        CREATE CLUSTER test SIZE 'scale=2,workers=2', REPLICATION FACTOR 4;
         SET cluster = test;
 
         CREATE TABLE t1 (x int);
@@ -4884,7 +4757,6 @@ def workflow_test_adhoc_system_indexes(
     are handled normally by the system.
     """
 
-    c.down(destroy_volumes=True)
     c.up("materialized")
 
     # The system user should be able to create a new index on a catalog object
@@ -4996,14 +4868,12 @@ def workflow_test_mz_introspection_cluster_compat(
     are automatically translated to the new names.
     """
 
-    c.down(destroy_volumes=True)
     c.up("materialized")
 
     with c.override(
         Testdrive(no_reset=True),
     ):
-        c.up("testdrive", persistent=True)
-        c.up("materialized")
+        c.up("materialized", Service("testdrive", idle=True))
 
         # Setting variables through `SET <variable>`.
         c.testdrive(
@@ -5093,23 +4963,20 @@ def workflow_test_unified_introspection_during_replica_disconnect(c: Composition
     introspection data.
     """
 
-    c.down(destroy_volumes=True)
-
     with c.override(
         Materialized(
             additional_system_parameter_defaults={
                 "unsafe_enable_unsafe_functions": "true",
                 "unsafe_enable_unorchestrated_cluster_replicas": "true",
             },
+            support_external_clusterd=True,
         ),
         Testdrive(
             no_reset=True,
             default_timeout="10s",
         ),
     ):
-        c.up("materialized")
-        c.up("clusterd1")
-        c.up("testdrive", persistent=True)
+        c.up("materialized", "clusterd1", Service("testdrive", idle=True))
 
         # Set up an unorchestrated replica with a couple dataflows.
         c.sql(
@@ -5200,12 +5067,17 @@ def workflow_test_zero_downtime_reconfigure(
     """
     Tests reconfiguring a managed cluster with zero downtime
     """
-    c.down(destroy_volumes=True)
     with c.override(
         Testdrive(no_reset=True),
     ):
-        c.up("testdrive", persistent=True)
-        c.up("materialized", "clusterd1", "zookeeper", "kafka", "schema-registry")
+        c.up(
+            "materialized",
+            "clusterd1",
+            "zookeeper",
+            "kafka",
+            "schema-registry",
+            Service("testdrive", idle=True),
+        )
         c.testdrive(
             dedent(
                 """
@@ -5216,9 +5088,7 @@ def workflow_test_zero_downtime_reconfigure(
 
             $ postgres-execute connection=postgres://mz_system:materialize@${testdrive.materialize-internal-sql-addr}
             ALTER SYSTEM SET enable_zero_downtime_cluster_reconfiguration = true;
-            DROP CLUSTER IF EXISTS cluster1 CASCADE;
-            DROP TABLE IF EXISTS t CASCADE;
-            CREATE CLUSTER cluster1 ( SIZE = '1');
+            CREATE CLUSTER cluster1 ( SIZE = 'scale=1,workers=1');
             GRANT ALL ON CLUSTER cluster1 TO materialize;
 
             > SET CLUSTER = cluster1;
@@ -5274,7 +5144,7 @@ def workflow_test_zero_downtime_reconfigure(
             try:
                 c.sql(
                     """
-                    ALTER CLUSTER cluster1 SET (SIZE = '2') WITH ( WAIT FOR '10s')
+                    ALTER CLUSTER cluster1 SET (SIZE = 'scale=1,workers=2') WITH ( WAIT FOR '10s')
                     """,
                     port=6877,
                     user="mz_system",
@@ -5334,7 +5204,7 @@ def workflow_test_zero_downtime_reconfigure(
             SELECT size FROM mz_clusters WHERE name='cluster1';
             """
             )
-            == [("1",)]
+            == [("scale=1,workers=1",)]
         )
         c.sql(
             """
@@ -5351,21 +5221,16 @@ def workflow_crash_on_replica_expiration_mv(
     """
     Tests that clusterd crashes when a replica is set to expire
     """
-    c.down(destroy_volumes=True)
     with c.override(
         Clusterd(name="clusterd1", restart="on-failure"),
     ):
         offset = 20
 
-        c.up("materialized")
-        c.up("clusterd1")
+        c.up("materialized", "clusterd1")
         c.sql(
             f"""
             ALTER SYSTEM SET unsafe_enable_unorchestrated_cluster_replicas = 'true';
             ALTER SYSTEM SET compute_replica_expiration_offset = '{offset}s';
-
-            DROP CLUSTER IF EXISTS test CASCADE;
-            DROP TABLE IF EXISTS t CASCADE;
 
             CREATE CLUSTER test REPLICAS (
                 test (
@@ -5416,21 +5281,16 @@ def workflow_crash_on_replica_expiration_index(
     """
     Tests that clusterd crashes when a replica is set to expire
     """
-    c.down(destroy_volumes=True)
     with c.override(
         Clusterd(name="clusterd1", restart="on-failure"),
     ):
         offset = 20
 
-        c.up("materialized")
-        c.up("clusterd1")
+        c.up("materialized", "clusterd1")
         c.sql(
             f"""
             ALTER SYSTEM SET unsafe_enable_unorchestrated_cluster_replicas = 'true';
             ALTER SYSTEM SET compute_replica_expiration_offset = '{offset}s';
-
-            DROP CLUSTER IF EXISTS test CASCADE;
-            DROP TABLE IF EXISTS t CASCADE;
 
             CREATE CLUSTER test REPLICAS (
                 test (
@@ -5502,24 +5362,18 @@ def workflow_replica_expiration_creates_retraction_diffs_after_panic(
     """
     Test that retraction diffs within the expiration time are generated after the replica expires and panics
     """
-    c.down(destroy_volumes=True)
     with c.override(
         Testdrive(no_reset=True),
         Clusterd(name="clusterd1", restart="on-failure"),
     ):
 
-        c.up("testdrive", persistent=True)
-        c.up("materialized")
-        c.up("clusterd1")
+        c.up("materialized", "clusterd1", Service("testdrive", idle=True))
         c.testdrive(
             dedent(
                 """
             $ postgres-execute connection=postgres://mz_system:materialize@${testdrive.materialize-internal-sql-addr}
             ALTER SYSTEM SET unsafe_enable_unorchestrated_cluster_replicas = 'true';
             ALTER SYSTEM SET compute_replica_expiration_offset = '50s';
-
-            > DROP CLUSTER IF EXISTS test CASCADE;
-            > DROP TABLE IF EXISTS events CASCADE;
 
             > CREATE CLUSTER test REPLICAS (
                 test (
@@ -5556,8 +5410,6 @@ def workflow_replica_expiration_creates_retraction_diffs_after_panic(
             > SELECT records FROM mz_introspection.mz_dataflow_arrangement_sizes
               WHERE name LIKE '%events_view_primary_idx';
             2000
-            > DROP TABLE events CASCADE;
-            > DROP CLUSTER test CASCADE;
             """
             )
         )
@@ -5572,16 +5424,19 @@ def workflow_test_constant_sink(c: Composition) -> None:
     become a regression test.
     """
 
-    c.down(destroy_volumes=True)
-
     with c.override(Testdrive(no_reset=True)):
-        c.up("testdrive", persistent=True)
-        c.up("materialized", "zookeeper", "kafka", "schema-registry")
+        c.up(
+            "materialized",
+            "zookeeper",
+            "kafka",
+            "schema-registry",
+            Service("testdrive", idle=True),
+        )
 
         c.testdrive(
             dedent(
                 """
-                > CREATE CLUSTER test SIZE '1';
+                > CREATE CLUSTER test SIZE 'scale=1,workers=1';
 
                 > CREATE MATERIALIZED VIEW const IN CLUSTER test AS SELECT 1
 
@@ -5640,15 +5495,17 @@ def workflow_test_lgalloc_limiter(c: Composition) -> None:
     does, or does not, manage to hydrate with various limiter configurations.
     """
 
-    c.down(destroy_volumes=True)
-
     with c.override(
         Materialized(
             additional_system_parameter_defaults={
+                "enable_lgalloc": "true",
+                "enable_columnar_lgalloc": "true",
+                "enable_columnation_lgalloc": "true",
                 "unsafe_enable_unorchestrated_cluster_replicas": "true",
                 "enable_compute_correction_v2": "true",
                 "lgalloc_limiter_interval": "100ms",
             },
+            support_external_clusterd=True,
         ),
         Clusterd(
             name="clusterd1",
@@ -5658,22 +5515,7 @@ def workflow_test_lgalloc_limiter(c: Composition) -> None:
         ),
         Testdrive(no_reset=True),
     ):
-        c.up("materialized")
-        c.up("testdrive", persistent=True)
-
-        c.sql(
-            """
-            CREATE CLUSTER test REPLICAS (
-                r1 (
-                    STORAGECTL ADDRESSES ['clusterd1:2100'],
-                    STORAGE ADDRESSES ['clusterd1:2103'],
-                    COMPUTECTL ADDRESSES ['clusterd1:2101'],
-                    COMPUTE ADDRESSES ['clusterd1:2102'],
-                    WORKERS 1
-                )
-            )
-            """
-        )
+        c.up("materialized", Service("testdrive", idle=True))
 
         def setup_workload():
             """
@@ -5682,6 +5524,17 @@ def workflow_test_lgalloc_limiter(c: Composition) -> None:
             """
             c.sql(
                 """
+                DROP CLUSTER IF EXISTS test CASCADE;
+                CREATE CLUSTER test REPLICAS (
+                    r1 (
+                        STORAGECTL ADDRESSES ['clusterd1:2100'],
+                        STORAGE ADDRESSES ['clusterd1:2103'],
+                        COMPUTECTL ADDRESSES ['clusterd1:2101'],
+                        COMPUTE ADDRESSES ['clusterd1:2102'],
+                        WORKERS 1
+                    )
+                );
+
                 DROP TABLE IF EXISTS t CASCADE;
                 CREATE TABLE t (i int, x text);
                 INSERT INTO t
@@ -5727,8 +5580,6 @@ def workflow_test_lgalloc_limiter(c: Composition) -> None:
         else:
             raise RuntimeError("replica did not exit with code 167")
 
-        c.kill("clusterd1")
-
         # Test 3: The MV should be able to hydrate with a disk limit of 10 MiB
         # and a burst budget of 10 GiB-seconds.
         c.sql(
@@ -5745,3 +5596,258 @@ def workflow_test_lgalloc_limiter(c: Composition) -> None:
         c.testdrive("> SELECT count(*) FROM mv\n1000000")
 
         c.kill("clusterd1")
+
+
+def workflow_test_memory_limiter(c: Composition) -> None:
+    """
+    Test that the memory limiter functions as expected.
+
+    We run a workload whose memory usage is roughly known and then assert that it
+    does, or does not, manage to hydrate with various limiter configurations.
+    """
+
+    with c.override(
+        Materialized(
+            additional_system_parameter_defaults={
+                "enable_lgalloc": "false",
+                "memory_limiter_interval": "100ms",
+                "unsafe_enable_unorchestrated_cluster_replicas": "true",
+            },
+            support_external_clusterd=True,
+        ),
+        Clusterd(
+            name="clusterd1",
+            # Announce an (unenforced) memory limit of 1GiB. Memory limits are
+            # derived from this memory limit.
+            options=["--announce-memory-limit=1073741824"],
+        ),
+        Testdrive(no_reset=True),
+    ):
+        c.up("materialized", Service("testdrive", idle=True))
+
+        def setup_workload():
+            """
+            For our workload we use a large MV, which we obtain by performing a cross
+            join. We make sure that the rows are large, so they consume some memory.
+            """
+            c.sql(
+                """
+                DROP CLUSTER IF EXISTS test CASCADE;
+                CREATE CLUSTER test REPLICAS (
+                    r1 (
+                        STORAGECTL ADDRESSES ['clusterd1:2100'],
+                        STORAGE ADDRESSES ['clusterd1:2103'],
+                        COMPUTECTL ADDRESSES ['clusterd1:2101'],
+                        COMPUTE ADDRESSES ['clusterd1:2102'],
+                        WORKERS 1
+                    )
+                );
+
+                DROP TABLE IF EXISTS t CASCADE;
+                CREATE TABLE t (i int, x text);
+                INSERT INTO t
+                    SELECT generate_series, repeat('a', 100) FROM generate_series(1, 1000);
+                CREATE MATERIALIZED VIEW mv IN CLUSTER test AS
+                    SELECT t1.i i1, t1.x x1, t2.i i2, t2.x x2 FROM t t1, t t2;
+                """
+            )
+
+        # Test 1: The MV should be able to hydrate with a memory limit of 2 GiB.
+        c.sql(
+            """
+            ALTER SYSTEM SET memory_limiter_usage_factor = 2;
+            ALTER SYSTEM SET memory_limiter_burst_factor = 0;
+            """,
+            port=6877,
+            user="mz_system",
+        )
+        setup_workload()
+        c.up("clusterd1")
+
+        c.testdrive("> SELECT count(*) FROM mv\n1000000")
+
+        c.kill("clusterd1")
+
+        # Test 2: The MV should be unable to hydrate with a memory limit of 205 MiB.
+        c.sql(
+            """
+            ALTER SYSTEM SET memory_limiter_usage_factor = 0.20;
+            ALTER SYSTEM SET memory_limiter_burst_factor = 0;
+            """,
+            port=6877,
+            user="mz_system",
+        )
+        setup_workload()
+        c.up("clusterd1", wait=False)
+
+        for _ in range(100):
+            time.sleep(1)
+            ps = c.invoke("ps", "clusterd1", "-a", capture=True, silent=True).stdout
+            if "Exited (167)" in ps:
+                break
+        else:
+            raise RuntimeError("replica did not exit with code 167")
+
+        # Test 3: The MV should be able to hydrate with a memory limit of 1 GiB
+        # and a burst budget of 10 GiB-seconds.
+        c.sql(
+            """
+            ALTER SYSTEM SET memory_limiter_usage_factor = 1;
+            ALTER SYSTEM SET memory_limiter_burst_factor = 10;
+            """,
+            port=6877,
+            user="mz_system",
+        )
+        setup_workload()
+        c.up("clusterd1")
+
+        c.testdrive("> SELECT count(*) FROM mv\n1000000")
+
+        c.kill("clusterd1")
+
+
+def workflow_test_paused_cluster_readhold_downgrade(c: Composition):
+    """
+    Test that in a paused cluster the read frontiers of indexes keep
+    periodically advancing, instead of blocking compaction of the index inputs.
+    """
+
+    c.up("materialized")
+
+    # Create a pause-able cluster, with indexes with different kinds of inputs.
+    c.sql(
+        """
+        CREATE CLUSTER test SIZE 'scale=1,workers=1';
+        SET cluster = test;
+
+        -- index on a storage collection
+        CREATE TABLE t (a int);
+        CREATE INDEX idx1 ON t (a);
+
+        -- index on an index
+        CREATE INDEX idx2 ON t (a + 1);
+
+        -- index on a REFRESH MV
+        CREATE MATERIALIZED VIEW mv WITH (REFRESH EVERY '1d') AS SELECT a FROM t;
+        CREATE INDEX idx3 ON mv (a);
+
+        SELECT a FROM t;
+        SELECT a + 1 FROM t;
+        SELECT a FROM mv;
+        """
+    )
+
+    # Sanity check.
+    check_read_frontiers_not_stuck(c, ["idx1", "idx2", "idx3"])
+
+    # Pause the cluster; read frontiers should still advance.
+    c.sql("ALTER CLUSTER test SET (REPLICATION FACTOR 0)")
+    check_read_frontiers_not_stuck(c, ["idx1", "idx2", "idx3"])
+
+    # Unpause the cluster; indexes should still be queryable.
+    c.sql(
+        """
+        ALTER CLUSTER test SET (REPLICATION FACTOR 1);
+        SET cluster = test;
+
+        SELECT a FROM t;
+        SELECT a + 1 FROM t;
+        SELECT a FROM mv;
+        """
+    )
+
+
+def workflow_test_swap_disk_bytes(c: Composition):
+    """
+    Test that `mz_cluster_replica_sizes.disk_bytes` shows expected values for
+    swap replica.
+    """
+
+    with c.override(
+        Materialized(
+            cluster_replica_size={
+                "swap,nodisk": {
+                    "workers": 1,
+                    "scale": 1,
+                    "credits_per_hour": "1",
+                    "memory_limit": "1G",
+                    "disk_limit": "0",
+                    "swap_enabled": True,
+                },
+                "swap,lodisk": {
+                    "workers": 1,
+                    "scale": 1,
+                    "credits_per_hour": "1",
+                    "memory_limit": "1G",
+                    "disk_limit": "1G",
+                    "swap_enabled": True,
+                },
+                "swap,hidisk": {
+                    "workers": 1,
+                    "scale": 1,
+                    "credits_per_hour": "1",
+                    "memory_limit": "1G",
+                    "disk_limit": "10G",
+                    "swap_enabled": True,
+                },
+                "noswap": {
+                    "workers": 1,
+                    "scale": 1,
+                    "credits_per_hour": "1",
+                    "memory_limit": "1G",
+                    "disk_limit": "10G",
+                    "swap_enabled": False,
+                },
+            },
+            bootstrap_replica_size="swap,nodisk",
+        ),
+    ):
+        c.up("materialized")
+
+        # Without the memory limiter enabled, disk bytes should reflect
+        # verbatim.
+        c.sql(
+            "ALTER SYSTEM SET memory_limiter_interval = 0",
+            user="mz_system",
+            port=6877,
+        )
+        c.kill("materialized")
+        c.up("materialized")
+
+        c.testdrive(
+            dedent(
+                """
+                > SELECT size, disk_bytes FROM mz_cluster_replica_sizes
+                swap,nodisk 0
+                swap,lodisk 1000000000
+                swap,hidisk 10000000000
+                noswap      10000000000
+                """
+            )
+        )
+
+        # With the memory limiter enabled, disk bytes should reflect the memory
+        # limit, if it reduces the limit from the size definition and swap is
+        # enabled.
+        c.sql(
+            """
+            ALTER SYSTEM SET memory_limiter_interval = 10;
+            ALTER SYSTEM SET memory_limiter_usage_factor = 3;
+            """,
+            user="mz_system",
+            port=6877,
+        )
+        c.kill("materialized")
+        c.up("materialized")
+
+        c.testdrive(
+            dedent(
+                """
+                > SELECT size, disk_bytes FROM mz_cluster_replica_sizes
+                swap,nodisk 0
+                swap,lodisk 1000000000
+                swap,hidisk 2000000000
+                noswap      10000000000
+                """
+            )
+        )

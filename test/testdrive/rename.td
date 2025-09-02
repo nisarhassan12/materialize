@@ -7,7 +7,7 @@
 # the Business Source License, use of this software will be governed
 # by the Apache License, Version 2.0.
 
-$ set-arg-default default-replica-size=1
+$ set-arg-default default-replica-size=scale=1,workers=1
 $ set-arg-default single-replica-cluster=quickstart
 
 $ set-regex match=u\d+|cluster1|quickstart|testdrive_single_replica_cluster|testdrive-data-\d+ replacement=<VARIABLE_OUTPUT>
@@ -33,12 +33,14 @@ $ kafka-ingest topic=data format=avro schema=${writer-schema}
     URL '${testdrive.schema-registry-url}'
   );
 
+> BEGIN
 > CREATE SOURCE mz_data
   IN CLUSTER ${arg.single-replica-cluster}
   FROM KAFKA CONNECTION kafka_conn (TOPIC 'testdrive-data-${testdrive.seed}')
 
 > CREATE TABLE mz_data_tbl FROM SOURCE mz_data (REFERENCE "testdrive-data-${testdrive.seed}")
   FORMAT AVRO USING SCHEMA '${writer-schema}'
+> COMMIT
 
 > CREATE DEFAULT INDEX ON mz_data_tbl
 
@@ -861,12 +863,14 @@ renamed_mz_data_tbl
 
 > SET SCHEMA TO to_be_renamed;
 
+> BEGIN
 > CREATE SOURCE mz_data
   IN CLUSTER ${arg.single-replica-cluster}
   FROM KAFKA CONNECTION public.kafka_conn (TOPIC 'testdrive-data-${testdrive.seed}')
 
 > CREATE TABLE mz_data_tbl FROM SOURCE mz_data (REFERENCE "testdrive-data-${testdrive.seed}")
   FORMAT AVRO USING SCHEMA '${writer-schema}'
+> COMMIT
 
 > CREATE DEFAULT INDEX ON mz_data
 

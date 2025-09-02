@@ -263,7 +263,7 @@ impl MapFilterProject {
     }
 
     /// Determines if a scalar expression must be equal to a literal datum.
-    pub fn literal_constraint(&self, expr: &MirScalarExpr) -> Option<Datum> {
+    pub fn literal_constraint(&self, expr: &MirScalarExpr) -> Option<Datum<'_>> {
         for (_pos, predicate) in self.predicates.iter() {
             if let MirScalarExpr::CallBinary {
                 func: crate::BinaryFunc::Eq,
@@ -1490,6 +1490,17 @@ pub fn memoize_expr(
             if let MirScalarExpr::If { cond, .. } = e {
                 return Some(vec![cond]);
             }
+            // We should not eagerly memoize `COALESCE` expressions after the first,
+            // as they are only meant to be evaluated if the preceding expressions
+            // evaluate to NULL. We could memoize any preceding by expressions that
+            // are certain not to error.
+            if let MirScalarExpr::CallVariadic {
+                func: crate::VariadicFunc::Coalesce,
+                exprs,
+            } = e
+            {
+                return Some(exprs.iter_mut().take(1).collect());
+            }
             None
         },
         &mut |e| {
@@ -1502,8 +1513,8 @@ pub fn memoize_expr(
                     // updated if they reference a column reference themselves.
                     if *col > input_arity {
                         if let MirScalarExpr::Column(col2, _) = memoized_parts[*col - input_arity] {
-                            // We do _not_ propagate column names, since mis-associationg names and column
-                            // references will be very confusing (and possibly bug inducing).
+                            // We do _not_ propagate column names, since mis-associating names and column
+                            // references will be very confusing (and possibly bug-inducing).
                             *col = col2;
                         }
                     }

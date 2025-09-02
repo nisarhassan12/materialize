@@ -8,8 +8,8 @@
 # by the Apache License, Version 2.0.
 
 """
-Test that ingests large amounts of data from Kafka/Postgres/MySQL and verifies
-that Materialize can handle it correctly by comparing the results.
+Test that ingests large amounts of data from Kafka/Postgres/MySQL/SQL Server
+and verifies that Materialize can handle it correctly by comparing the results.
 """
 
 import random
@@ -24,7 +24,7 @@ from materialize.data_ingest.workload import *  # noqa: F401 F403
 from materialize.data_ingest.workload import WORKLOADS, execute_workload
 from materialize.mzcompose import get_default_system_parameters
 from materialize.mzcompose.composition import Composition, WorkflowArgumentParser
-from materialize.mzcompose.services.azure import Azurite
+from materialize.mzcompose.services.azurite import Azurite
 from materialize.mzcompose.services.clusterd import Clusterd
 from materialize.mzcompose.services.kafka import Kafka
 from materialize.mzcompose.services.materialized import Materialized
@@ -35,11 +35,17 @@ from materialize.mzcompose.services.postgres import (
     Postgres,
 )
 from materialize.mzcompose.services.schema_registry import SchemaRegistry
+from materialize.mzcompose.services.sql_server import (
+    SqlServer,
+    setup_sql_server_testing,
+)
+from materialize.mzcompose.services.testdrive import Testdrive
 from materialize.mzcompose.services.zookeeper import Zookeeper
 
 SERVICES = [
     Postgres(),
     MySql(),
+    SqlServer(),
     Zookeeper(),
     Kafka(
         auto_create_topics=False,
@@ -54,6 +60,7 @@ SERVICES = [
     CockroachOrPostgresMetadata(),
     Minio(setup_materialize=True),
     Azurite(),
+    Testdrive(no_reset=True),
     # Overridden below
     Materialized(),
     Materialized(name="materialized2"),
@@ -84,10 +91,13 @@ def workflow_default(c: Composition, parser: WorkflowArgumentParser) -> None:
     args = parser.parse_args()
 
     workloads = buildkite.shard_list(
-        (
-            [globals()[workload] for workload in args.workload]
-            if args.workload
-            else list(WORKLOADS)
+        sorted(
+            (
+                [globals()[workload] for workload in args.workload]
+                if args.workload
+                else list(WORKLOADS)
+            ),
+            key=lambda w: w.__name__,
         ),
         lambda w: w.__name__,
     )
@@ -104,10 +114,11 @@ def workflow_default(c: Composition, parser: WorkflowArgumentParser) -> None:
         "schema-registry",
         "postgres",
         "mysql",
+        "sql-server",
     )
 
-    # TODO: Reenable when database-issues#8657 is fixed
-    # executor_classes = [MySqlExecutor, KafkaRoundtripExecutor, KafkaExecutor]
+    # TODO: Reenable KafkaRoundtripExecutor when database-issues#8657 is fixed
+    # TODO: Reenable SqlServerExecutor when database-issues#9618 is fixed
     executor_classes = [MySqlExecutor, KafkaExecutor]
 
     with c.override(
@@ -120,6 +131,7 @@ def workflow_default(c: Composition, parser: WorkflowArgumentParser) -> None:
             system_parameter_defaults=get_default_system_parameters(zero_downtime=True),
             additional_system_parameter_defaults={"unsafe_enable_table_keys": "true"},
             sanity_restart=False,
+            support_external_clusterd=True,
         ),
         Materialized(
             name="materialized2",
@@ -130,9 +142,11 @@ def workflow_default(c: Composition, parser: WorkflowArgumentParser) -> None:
             system_parameter_defaults=get_default_system_parameters(zero_downtime=True),
             additional_system_parameter_defaults={"unsafe_enable_table_keys": "true"},
             sanity_restart=False,
+            support_external_clusterd=True,
         ),
     ):
         c.up(*services)
+        setup_sql_server_testing(c)
 
         if args.replicas > 1:
             c.sql(
@@ -143,7 +157,8 @@ def workflow_default(c: Composition, parser: WorkflowArgumentParser) -> None:
             c.sql("DROP CLUSTER quickstart CASCADE", user="mz_system", port=6877)
             replica_names = [f"r{replica_id}" for replica_id in range(0, args.replicas)]
             replica_string = ",".join(
-                f"{replica_name} (SIZE '4')" for replica_name in replica_names
+                f"{replica_name} (SIZE 'scale=1,workers=4')"
+                for replica_name in replica_names
             )
             c.sql(
                 f"CREATE CLUSTER quickstart REPLICAS ({replica_string})",
@@ -157,7 +172,7 @@ def workflow_default(c: Composition, parser: WorkflowArgumentParser) -> None:
             )
 
         c.sql(
-            "CREATE CLUSTER singlereplica SIZE = '4', REPLICATION FACTOR = 1",
+            "CREATE CLUSTER singlereplica SIZE = 'scale=1,workers=4', REPLICATION FACTOR = 1",
         )
 
         conn = c.sql_connection()
@@ -191,6 +206,7 @@ def workflow_default(c: Composition, parser: WorkflowArgumentParser) -> None:
                 ports,
                 args.runtime,
                 args.verbose,
+                c,
             )
             mz_service = workload.mz_service
             deploy_generation = workload.deploy_generation

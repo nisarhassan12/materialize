@@ -48,9 +48,12 @@ Parameter    | Description
 
 The privileges required to execute this statement are:
 
-- `USAGE` privileges on the schemas that all relations in the explainee are contained in.
+{{< include-md file="shared-content/sql-command-privileges/explain-analyze.md"
+>}}
 
 ## Examples
+
+`EXPLAIN ANALYZE` attributes runtime metrics to [`PHYSICAL PLAN` operators](/sql/explain-plan#reference-plan-operators).
 
 The attribution examples in this
 section reference the `wins_by_item` index (and the underlying `winning_bids`

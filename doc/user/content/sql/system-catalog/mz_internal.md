@@ -47,7 +47,7 @@ statement_logging_sample_rate TO 0`. Materialize may apply a lower
 sampling rate than the one set in this parameter.
 
 The view can be accessed by Materialize _superusers_ or users that have been
-granted the [`mz_monitor` role](/manage/access-control/manage-roles#builtin-roles).
+granted the [`mz_monitor` role](/manage/access-control/appendix-built-in-roles/#system-catalog-roles).
 
 <!-- RELATION_SPEC mz_internal.mz_recent_activity_log -->
 | Field                      | Type                         | Meaning                                                                                                                                                                                                                                                                       |
@@ -79,6 +79,7 @@ granted the [`mz_monitor` role](/manage/access-control/manage-roles#builtin-role
 | `prepared_at`              | [`timestamp with time zone`] | The time at which the statement was prepared.                                                                                                                                                                                                                                 |
 | `statement_type`           | [`text`]                     | The _type_ of the statement, e.g. `select` for a `SELECT` query, or `NULL` if the statement was empty.                                                                                                                                                                        |
 | `throttled_count`          | [`uint8`]                    | The number of statements that were dropped due to throttling before the current one was seen. If you have a very high volume of queries and need to log them without throttling, [contact our team](/support/).                                   |
+| `connected_at`       | [`timestamp with time zone`]                     | The time at which the session was established.                                                                                                                                                                                                                   |
 | `initial_application_name` | [`text`]                     | The initial value of `application_name` at the beginning of the session.                                                                                                                                                                                                      |
 | `authenticated_user`       | [`text`]                     | The name of the user for which the session was established.                                                                                                                                                                                                                   |
 | `sql`                      | [`text`]                     | The SQL text of the statement.                                                                                                                                                                                                                                                |
@@ -401,6 +402,20 @@ inputs.
 | `object_id`  | [`text`]    | The ID of a dataflow-powered object. Corresponds to [`mz_catalog.mz_indexes.id`](../mz_catalog#mz_indexes), [`mz_catalog.mz_materialized_views.id`](../mz_catalog#mz_materialized_views), [`mz_internal.mz_subscriptions`](#mz_subscriptions), [`mz_catalog.mz_sources.id`](../mz_catalog#mz_sources), or [`mz_catalog.mz_sinks.id`](../mz_catalog#mz_sinks). |
 | `replica_id` | [`text`]    | The ID of a cluster replica. |
 | `hydrated`   | [`boolean`] | Whether the object is hydrated on the replica. |
+
+## `mz_license_keys`
+
+The `mz_license_keys` table describes the license keys which are currently in
+use.
+
+<!-- RELATION_SPEC mz_internal.mz_license_keys -->
+| Field            | Type                         | Meaning  |
+| -----------      | -----------                  | -------- |
+| `id`             | [`text`]                     | The identifier of the license key. |
+| `organization`   | [`text`]                     | The name of the organization that this license key was issued to. |
+| `environment_id` | [`text`]                     | The environment ID that this license key was issued for. |
+| `expiration`     | [`timestamp with time zone`] | The date and time when this license key expires. |
+| `not_before`     | [`timestamp with time zone`] | The start of the validity period for this license key. |
 
 ## `mz_index_advice`
 
@@ -1240,8 +1255,9 @@ operations in the system.
 
 ## `mz_wallclock_global_lag`
 
-The `mz_wallclock_global_lag` view contains the most recently recorded wallclock lag
-for each table, source, index, materialized view, and sink in the system.
+The `mz_wallclock_global_lag` view contains the most recent wallclock lag for tables, sources, indexes, materialized views, and sinks.
+Wallclock lag measures how far behind real-world wall-clock time each
+  object's data is, indicating the [freshness](/concepts/reaction-time/#freshness) of results when querying that object.
 
 <!-- RELATION_SPEC mz_internal.mz_wallclock_global_lag -->
 | Field         | Type         | Meaning
@@ -1252,8 +1268,7 @@ for each table, source, index, materialized view, and sink in the system.
 ## `mz_wallclock_lag_history`
 
 The `mz_wallclock_lag_history` table records the historical wallclock lag,
-i.e., the difference between the write frontier and the current wallclock time,
-for each table, source, index, materialized view, and sink in the system.
+i.e., the [freshness](/concepts/reaction-time/#freshness), for each table, source, index, materialized view, and sink in the system.
 
 <!-- RELATION_SPEC mz_internal.mz_wallclock_lag_history -->
 | Field         | Type         | Meaning

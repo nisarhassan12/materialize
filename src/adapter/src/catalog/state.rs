@@ -41,6 +41,8 @@ use mz_controller::clusters::{
 };
 use mz_controller_types::{ClusterId, ReplicaId};
 use mz_expr::{CollectionPlan, OptimizedMirRelationExpr};
+use mz_license_keys::ValidatedLicenseKey;
+use mz_orchestrator::DiskLimit;
 use mz_ore::collections::CollectionExt;
 use mz_ore::now::NOW_ZERO;
 use mz_ore::soft_assert_no_log;
@@ -158,6 +160,10 @@ pub struct CatalogState {
     pub(super) aws_principal_context: Option<AwsPrincipalContext>,
     pub(super) aws_privatelink_availability_zones: Option<BTreeSet<String>>,
     pub(super) http_host_name: Option<String>,
+
+    // Read-only not derived from the durable catalog.
+    #[serde(skip)]
+    pub(super) license_key: ValidatedLicenseKey,
 }
 
 /// Keeps track of what expressions are cached or not during startup.
@@ -309,6 +315,7 @@ impl CatalogState {
             comments: Default::default(),
             source_references: Default::default(),
             storage_metadata: Default::default(),
+            license_key: ValidatedLicenseKey::for_tests(),
         }
     }
 
@@ -335,7 +342,7 @@ impl CatalogState {
         }
     }
 
-    pub fn for_sessionless_user(&self, role_id: RoleId) -> ConnCatalog {
+    pub fn for_sessionless_user(&self, role_id: RoleId) -> ConnCatalog<'_> {
         let (notices_tx, _notices_rx) = mpsc::unbounded_channel();
         let cluster = self.system_configuration.default_cluster();
 
@@ -357,7 +364,7 @@ impl CatalogState {
         }
     }
 
-    pub fn for_system_session(&self) -> ConnCatalog {
+    pub fn for_system_session(&self) -> ConnCatalog<'_> {
         self.for_sessionless_user(MZ_SYSTEM_ROLE_ID)
     }
 
@@ -829,7 +836,7 @@ impl CatalogState {
 
     /// Returns the [`RelationDesc`] for a [`GlobalId`], if the provided [`GlobalId`] refers to an
     /// object that returns rows.
-    pub fn try_get_desc_by_global_id(&self, id: &GlobalId) -> Option<Cow<RelationDesc>> {
+    pub fn try_get_desc_by_global_id(&self, id: &GlobalId) -> Option<Cow<'_, RelationDesc>> {
         let entry = self.try_get_entry_by_global_id(id)?;
         let desc = match entry.item() {
             CatalogItem::Table(table) => Cow::Owned(table.desc_for(id)),
@@ -2249,10 +2256,7 @@ impl CatalogState {
         let location = match location {
             mz_catalog::durable::ReplicaLocation::Unmanaged {
                 storagectl_addrs,
-                storage_addrs,
                 computectl_addrs,
-                compute_addrs,
-                workers,
             } => {
                 if allowed_availability_zones.is_some() {
                     return Err(Error {
@@ -2264,16 +2268,12 @@ impl CatalogState {
                 }
                 ReplicaLocation::Unmanaged(UnmanagedReplicaLocation {
                     storagectl_addrs,
-                    storage_addrs,
                     computectl_addrs,
-                    compute_addrs,
-                    workers,
                 })
             }
             mz_catalog::durable::ReplicaLocation::Managed {
                 size,
                 availability_zone,
-                disk,
                 billed_as,
                 internal,
                 pending,
@@ -2304,7 +2304,6 @@ impl CatalogState {
                         (None, None) => ManagedReplicaAvailabilityZones::FromReplica(None),
                     },
                     size,
-                    disk,
                     billed_as,
                     internal,
                     pending,
@@ -2312,6 +2311,16 @@ impl CatalogState {
             }
         };
         Ok(location)
+    }
+
+    /// Return whether the given replica size requests a disk.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the given size doesn't exist in `cluster_replica_sizes`.
+    pub(crate) fn cluster_replica_size_has_disk(&self, size: &str) -> bool {
+        let alloc = &self.cluster_replica_sizes.0[size];
+        alloc.disk_limit != Some(DiskLimit::ZERO)
     }
 
     pub(crate) fn ensure_valid_replica_size(
@@ -2489,17 +2498,14 @@ impl CatalogState {
         &self.storage_metadata
     }
 
-    /// For the Sources ids in `ids`, return the compaction windows for all `ids` and additional ids
-    /// that propagate from them. Specifically, if `ids` contains a source, it and all of its
-    /// source exports will be added to the result.
+    /// For the Sources ids in `ids`, return their compaction windows.
     pub fn source_compaction_windows(
         &self,
         ids: impl IntoIterator<Item = CatalogItemId>,
     ) -> BTreeMap<CompactionWindow, BTreeSet<CatalogItemId>> {
         let mut cws: BTreeMap<CompactionWindow, BTreeSet<CatalogItemId>> = BTreeMap::new();
-        let mut ids = VecDeque::from_iter(ids);
         let mut seen = BTreeSet::new();
-        while let Some(item_id) = ids.pop_front() {
+        for item_id in ids {
             if !seen.insert(item_id) {
                 continue;
             }
@@ -2509,21 +2515,10 @@ impl CatalogState {
                     let source_cw = source.custom_logical_compaction_window.unwrap_or_default();
                     match source.data_source {
                         DataSourceDesc::Ingestion { .. } => {
-                            // For sources, look up each dependent source export and propagate.
                             cws.entry(source_cw).or_default().insert(item_id);
-                            ids.extend(entry.used_by());
                         }
-                        DataSourceDesc::IngestionExport { ingestion_id, .. } => {
-                            // For subsources, look up the parent source and propagate the compaction
-                            // window.
-                            let ingestion = self
-                                .get_entry(&ingestion_id)
-                                .source()
-                                .expect("must be source");
-                            let cw = ingestion
-                                .custom_logical_compaction_window
-                                .unwrap_or(source_cw);
-                            cws.entry(cw).or_default().insert(item_id);
+                        DataSourceDesc::IngestionExport { .. } => {
+                            cws.entry(source_cw).or_default().insert(item_id);
                         }
                         DataSourceDesc::Introspection(_)
                         | DataSourceDesc::Progress
@@ -2532,23 +2527,18 @@ impl CatalogState {
                         }
                     }
                 }
-                CatalogItem::Table(table) => match &table.data_source {
-                    TableDataSource::DataSource {
-                        desc: DataSourceDesc::IngestionExport { ingestion_id, .. },
-                        timeline: _,
-                    } => {
-                        let table_cw = table.custom_logical_compaction_window.unwrap_or_default();
-                        let ingestion = self
-                            .get_entry(ingestion_id)
-                            .source()
-                            .expect("must be source");
-                        let cw = ingestion
-                            .custom_logical_compaction_window
-                            .unwrap_or(table_cw);
-                        cws.entry(cw).or_default().insert(item_id);
+                CatalogItem::Table(table) => {
+                    let table_cw = table.custom_logical_compaction_window.unwrap_or_default();
+                    match &table.data_source {
+                        TableDataSource::DataSource {
+                            desc: DataSourceDesc::IngestionExport { .. },
+                            timeline: _,
+                        } => {
+                            cws.entry(table_cw).or_default().insert(item_id);
+                        }
+                        _ => {}
                     }
-                    _ => {}
-                },
+                }
                 _ => {
                     // Views could depend on sources, so ignore them if added by used_by above.
                     continue;
@@ -2647,6 +2637,7 @@ impl ConnectionResolver for CatalogState {
             AwsPrivatelink(conn) => AwsPrivatelink(conn),
             MySql(conn) => MySql(conn.into_inline_connection(self)),
             SqlServer(conn) => SqlServer(conn.into_inline_connection(self)),
+            IcebergCatalog(conn) => IcebergCatalog(conn.into_inline_connection(self)),
         }
     }
 }

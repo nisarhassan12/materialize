@@ -6,52 +6,9 @@
 
 ### Supported types
 
-Materialize natively supports the following SQL Server types:
+{{< include-md file="shared-content/sql-server-supported-types.md" >}}
 
-<ul style="column-count: 3">
-<li><code>tinyint</code></li>
-<li><code>smallint</code></li>
-<li><code>int</code></li>
-<li><code>bigint</code></li>
-<li><code>real</code></li>
-<li><code>double</code></li>
-<li><code>bit</code></li>
-<li><code>decimal</code></li>
-<li><code>numeric</code></li>
-<li><code>money</code></li>
-<li><code>smallmoney</code></li>
-<li><code>char</code></li>
-<li><code>nchar</code></li>
-<li><code>varchar</code></li>
-<li><code>nvarchar</code></li>
-<li><code>sysname</code></li>
-<li><code>binary</code></li>
-<li><code>varbinary</code></li>
-<li><code>json</code></li>
-<li><code>date</code></li>
-<li><code>time</code></li>
-<li><code>smalldatetime</code></li>
-<li><code>datetime</code></li>
-<li><code>datetime2</code></li>
-<li><code>datetimeoffset</code></li>
-<li><code>uniqueidentifier</code></li>
-</ul>
-
-Replicating tables that contain **unsupported [data types](/sql/types/)** is possible via the [`EXCLUDE COLUMNS` option](/sql/create-source/sql-server/#handling-unsupported-types) for the
-following types:
-
-<ul style="column-count: 3">
-<li><code>text</code></li>
-<li><code>ntext</code></li>
-<li><code>image</code></li>
-<li><code>varchar(max)</code></li>
-<li><code>nvarchar(max)</code></li>
-<li><code>varbinary(max)</code></li>
-</ul>
-
-Columns with the specified types need to be excluded because [SQL Server does not provide
-the "before"](https://learn.microsoft.com/en-us/sql/relational-databases/system-tables/cdc-capture-instance-ct-transact-sql?view=sql-server-2017#large-object-data-types)
-value when said column is updated.
+{{< include-md file="shared-content/sql-server-unsupported-type-handling.md" >}}
 
 ### Timestamp Rounding
 
@@ -75,3 +32,25 @@ SELECT * FROM my_timestamps;
 '2000-12-31 23:59:59.999999'
 '2001-01-01 00:00:00'
 ```
+
+### Snapshot latency for inactive databases
+
+When a new Source is created, Materialize performs a snapshotting operation to sync
+the data. However, for a new SQL Server source, if none of the replicating tables
+are receiving write queries, snapshotting may take up to an additional 5 minutes
+to complete. The 5 minute interval is due to a hardcoded interval in the SQL Server
+Change Data Capture (CDC) implementation which only notifies CDC consumers every
+5 minutes when no changes are made to replicating tables.
+
+See [Monitoring freshness status](/ingest-data/monitoring-data-ingestion/#monitoring-hydrationdata-freshness-status)
+
+### Capture Instance Selection
+
+When a new source is created, Materialize selects a capture instance for each
+table. SQL Server permits at most two capture instances per table, which are
+listed in the
+[`sys.cdc_change_tables`](https://learn.microsoft.com/en-us/sql/relational-databases/system-tables/cdc-change-tables-transact-sql)
+system table. For each table, Materialize picks the capture instance with the
+most recent `create_date`.
+
+If two capture instances for a table share the same timestamp (unlikely given the millisecond resolution), Materialize selects the `capture_instance` with the lexicographically larger name.

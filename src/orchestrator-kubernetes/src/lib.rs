@@ -73,6 +73,8 @@ pub struct KubernetesOrchestratorConfig {
     pub context: String,
     /// The name of a non-default Kubernetes scheduler to use, if any.
     pub scheduler_name: Option<String>,
+    /// Annotations to install on every service created by the orchestrator.
+    pub service_annotations: BTreeMap<String, String>,
     /// Labels to install on every service created by the orchestrator.
     pub service_labels: BTreeMap<String, String>,
     /// Node selector to install on every service created by the orchestrator.
@@ -215,8 +217,6 @@ impl Orchestrator for KubernetesOrchestrator {
 #[derive(Clone, Copy)]
 struct ServiceInfo {
     scale: u16,
-    disk: bool,
-    disk_limit: Option<DiskLimit>,
 }
 
 struct NamespacedKubernetesOrchestrator {
@@ -379,7 +379,8 @@ impl NamespacedKubernetesOrchestrator {
             "environmentd.materialize.cloud/namespace={}",
             self.namespace
         );
-        watcher::Config::default().labels(&ns_selector)
+        // This watcher timeout must be shorter than the client read timeout.
+        watcher::Config::default().timeout(59).labels(&ns_selector)
     }
 
     /// Convert a higher-level label key to the actual one we
@@ -561,10 +562,10 @@ impl NamespacedOrchestrator for NamespacedKubernetesOrchestrator {
             cpu_limit,
             scale,
             labels: labels_in,
+            annotations: annotations_in,
             availability_zones,
             other_replicas_selector,
             replicas_selector,
-            disk: disk_in,
             disk_limit,
             node_selector,
         }: ServiceConfig,
@@ -573,25 +574,8 @@ impl NamespacedOrchestrator for NamespacedKubernetesOrchestrator {
         let scheduling_config: ServiceSchedulingConfig =
             self.scheduling_config.read().expect("poisoned").clone();
 
-        // Determining whether to enable disk is subtle because we need to
-        // support historical sizes in the managed service and custom sizes in
-        // self hosted deployments.
-        let disk = {
-            // Whether the user specified `DISK = TRUE` when creating the
-            // replica OR whether the feature flag to force disk is enabled.
-            let user_requested_disk = disk_in || scheduling_config.always_use_disk;
-            // Whether the cluster replica size map provided by the
-            // administrator explicitly indicates that the size does not support
-            // disk.
-            let size_disables_disk = disk_limit == Some(DiskLimit::ZERO);
-            // Enable disk if the user requested it and the size does not
-            // disable it.
-            //
-            // Arguably we should not allow the user to request disk with sizes
-            // that have a zero disk limit, but configuring disk on a replica by
-            // replica basis is a legacy option that we hope to remove someday.
-            user_requested_disk && !size_disables_disk
-        };
+        // Enable disk if the size does not disable it.
+        let disk = disk_limit != Some(DiskLimit::ZERO);
 
         let name = self.service_name(id);
         // The match labels should be the minimal set of labels that uniquely
@@ -833,6 +817,10 @@ impl NamespacedOrchestrator for NamespacedKubernetesOrchestrator {
             // It's called do-not-disrupt in newer versions of karpenter, so adding for forward/backward compatibility
             "karpenter.sh/do-not-disrupt".to_owned() => "true".to_string(),
         };
+        for (key, value) in annotations_in {
+            // We want to use the same prefix as our labels keys
+            pod_annotations.insert(self.make_label_key(&key), value);
+        }
         if self.config.enable_prometheus_scrape_annotations {
             if let Some(internal_http_port) = ports_in
                 .iter()
@@ -845,6 +833,9 @@ impl NamespacedOrchestrator for NamespacedKubernetesOrchestrator {
                 pod_annotations.insert("prometheus.io/path".to_owned(), "/metrics".to_string());
                 pod_annotations.insert("prometheus.io/scheme".to_owned(), "http".to_string());
             }
+        }
+        for (key, value) in &self.config.service_annotations {
+            pod_annotations.insert(key.clone(), value.clone());
         }
 
         let default_node_selector = if disk {
@@ -1207,7 +1198,7 @@ impl NamespacedOrchestrator for NamespacedKubernetesOrchestrator {
                     match_labels: Some(match_labels),
                     ..Default::default()
                 },
-                service_name: name.clone(),
+                service_name: Some(name.clone()),
                 replicas: Some(scale.into()),
                 template: pod_template_spec,
                 pod_management_policy: Some("Parallel".to_string()),
@@ -1227,14 +1218,10 @@ impl NamespacedOrchestrator for NamespacedKubernetesOrchestrator {
             },
         });
 
-        self.service_infos.lock().expect("poisoned lock").insert(
-            id.to_string(),
-            ServiceInfo {
-                scale,
-                disk,
-                disk_limit,
-            },
-        );
+        self.service_infos
+            .lock()
+            .expect("poisoned lock")
+            .insert(id.to_string(), ServiceInfo { scale });
 
         Ok(Box::new(KubernetesService { hosts, ports }))
     }
@@ -1289,9 +1276,9 @@ impl NamespacedOrchestrator for NamespacedKubernetesOrchestrator {
                         // The interesting exit codes are:
                         //  * 135 (SIGBUS): occurs when lgalloc runs out of disk
                         //  * 137 (SIGKILL): occurs when the OOM killer terminates the container
-                        //  * 167: occurs when the lgalloc limiter terminates the process
-                        // We treat the all of these as OOM conditions since lgalloc uses disk only
-                        // for spilling memory.
+                        //  * 167: occurs when the lgalloc or memory limiter terminates the process
+                        // We treat the all of these as OOM conditions since swap and lgalloc use
+                        // disk only for spilling memory.
                         let exit_code = termination_state.map(|s| s.exit_code);
                         exit_code.is_some_and(|e| [135, 137, 167].contains(&e))
                     })
@@ -1444,31 +1431,16 @@ impl OrchestratorWorker {
             self_: &OrchestratorWorker,
             service_name: &str,
             i: usize,
-            disk: bool,
-            disk_limit: Option<DiskLimit>,
         ) -> ServiceProcessMetrics {
             let name = format!("{service_name}-{i}");
 
-            let disk_usage_fut = async {
-                if disk {
-                    Some(get_disk_usage(self_, service_name, i).await)
-                } else {
-                    None
-                }
-            };
+            let disk_usage_fut = get_disk_usage(self_, service_name, i);
             let (metrics, disk_usage) =
                 match futures::future::join(self_.metrics_api.get(&name), disk_usage_fut).await {
-                    (Ok(metrics), disk_usage) => {
-                        let disk_usage = match disk_usage {
-                            Some(Ok(disk_usage)) => Some(disk_usage),
-                            Some(Err(e)) => {
-                                warn!("Failed to fetch disk usage for {name}: {e}");
-                                None
-                            }
-                            _ => None,
-                        };
-
-                        (metrics, disk_usage)
+                    (Ok(metrics), Ok(disk_usage)) => (metrics, disk_usage),
+                    (Ok(metrics), Err(e)) => {
+                        warn!("Failed to fetch disk usage for {name}: {e}");
+                        (metrics, None)
                     }
                     (Err(e), _) => {
                         warn!("Failed to get metrics for {name}: {e}");
@@ -1515,21 +1487,6 @@ impl OrchestratorWorker {
                 }
             };
 
-            // We only populate a `disk_usage` if we have both:
-            // - a disk limit (so it must be an actual managed cluster with a real limit)
-            // - a reported disk usage
-            //
-            // The disk limit can be more up-to-date (from `service_infos`) than the
-            // reported metric. In that case, we report the minimum of the usage
-            // and the limit, which means we can report 100% usage temporarily
-            // if a replica is sized down.
-            let disk_usage = match (disk_usage, disk_limit) {
-                (Some(disk_usage), Some(DiskLimit(disk_limit))) => {
-                    Some(std::cmp::min(disk_usage, disk_limit.0))
-                }
-                _ => None,
-            };
-
             ServiceProcessMetrics {
                 cpu_nano_cores: cpu,
                 memory_bytes: memory,
@@ -1546,10 +1503,11 @@ impl OrchestratorWorker {
             self_: &OrchestratorWorker,
             service_name: &str,
             i: usize,
-        ) -> anyhow::Result<u64> {
+        ) -> anyhow::Result<Option<u64>> {
             #[derive(Deserialize)]
             pub(crate) struct Usage {
                 disk_bytes: Option<u64>,
+                swap_bytes: Option<u64>,
             }
 
             let service = self_
@@ -1583,16 +1541,21 @@ impl OrchestratorWorker {
                 .build()
                 .context("error building HTTP client")?;
             let resp = http_client.get(metrics_url).send().await?;
-            let usage: Usage = resp.json().await?;
+            let Usage {
+                disk_bytes,
+                swap_bytes,
+            } = resp.json().await?;
 
-            usage
-                .disk_bytes
-                .ok_or_else(|| anyhow!("process did not provide disk usage"))
+            let bytes = if let (Some(disk), Some(swap)) = (disk_bytes, swap_bytes) {
+                Some(disk + swap)
+            } else {
+                disk_bytes.or(swap_bytes)
+            };
+            Ok(bytes)
         }
 
-        let ret = futures::future::join_all(
-            (0..info.scale).map(|i| get_metrics(self, name, i.into(), info.disk, info.disk_limit)),
-        );
+        let ret =
+            futures::future::join_all((0..info.scale).map(|i| get_metrics(self, name, i.into())));
 
         ret.await
     }

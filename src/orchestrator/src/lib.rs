@@ -215,6 +215,11 @@ pub struct ServiceConfig {
     ///
     /// The orchestrator backend may apply a prefix to the key if appropriate.
     pub labels: BTreeMap<String, String>,
+    /// Arbitrary key–value pairs to attach to the service as annotations in the
+    /// orchestrator backend.
+    ///
+    /// The orchestrator backend may apply a prefix to the key if appropriate.
+    pub annotations: BTreeMap<String, String>,
     /// The availability zones the service can be run in. If no availability
     /// zones are specified, the orchestrator is free to choose one.
     pub availability_zones: Option<Vec<String>>,
@@ -234,8 +239,6 @@ pub struct ServiceConfig {
     /// The orchestrator backend may or may not actually implement placement spread functionality.
     pub replicas_selector: Vec<LabelSelector>,
 
-    /// Whether scratch disk space should be allocated for the service.
-    pub disk: bool,
     /// The maximum amount of scratch disk space that the service is allowed to consume.
     pub disk_limit: Option<DiskLimit>,
     /// Node selector for this service.
@@ -476,11 +479,6 @@ pub mod scheduling_config {
         ///
         /// Defaults to `100`.
         pub soften_az_affinity_weight: i32,
-        /// Whether to always provision a replica with disk,
-        /// regardless of `DISK` DDL option.
-        ///
-        /// Defaults to `false`.
-        pub always_use_disk: bool,
         // Whether to enable security context for the service.
         pub security_context_enabled: bool,
     }
@@ -497,7 +495,6 @@ pub mod scheduling_config {
 
     pub const DEFAULT_SOFTEN_AZ_AFFINITY: bool = false;
     pub const DEFAULT_SOFTEN_AZ_AFFINITY_WEIGHT: i32 = 100;
-    pub const DEFAULT_ALWAYS_USE_DISK: bool = false;
     pub const DEFAULT_SECURITY_CONTEXT_ENABLED: bool = true;
 
     impl Default for ServiceSchedulingConfig {
@@ -516,7 +513,6 @@ pub mod scheduling_config {
                 },
                 soften_az_affinity: DEFAULT_SOFTEN_AZ_AFFINITY,
                 soften_az_affinity_weight: DEFAULT_SOFTEN_AZ_AFFINITY_WEIGHT,
-                always_use_disk: DEFAULT_ALWAYS_USE_DISK,
                 security_context_enabled: DEFAULT_SECURITY_CONTEXT_ENABLED,
             }
         }

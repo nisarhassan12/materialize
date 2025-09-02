@@ -7,11 +7,12 @@
 # the Business Source License, use of this software will be governed
 # by the Apache License, Version 2.0.
 
-$ set-arg-default default-storage-size=1
+$ set-arg-default default-storage-size=scale=1,workers=1
 
 > DROP CLUSTER IF EXISTS gh_6942_cluster CASCADE;
 > CREATE CLUSTER gh_6942_cluster SIZE '${arg.default-storage-size}', REPLICATION FACTOR 1;
 
+> BEGIN
 > CREATE SOURCE auction_house
   IN CLUSTER gh_6942_cluster
   FROM LOAD GENERATOR AUCTION
@@ -22,6 +23,7 @@ $ set-arg-default default-storage-size=1
 > CREATE TABLE bids FROM SOURCE auction_house (REFERENCE bids);
 > CREATE TABLE organizations FROM SOURCE auction_house (REFERENCE organizations);
 > CREATE TABLE users FROM SOURCE auction_house (REFERENCE users);
+> COMMIT
 
 > CREATE VIEW winning_bids AS
   SELECT DISTINCT ON (auctions.id) bids.*, auctions.item, auctions.seller

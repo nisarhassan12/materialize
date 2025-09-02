@@ -88,7 +88,7 @@
 // TODO(guswynn): merge at least the `append_batches` operator`
 
 use std::cmp::Ordering;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::fmt::Debug;
 use std::ops::AddAssign;
 use std::rc::Rc;
@@ -1109,15 +1109,39 @@ where
                 }
             });
 
-            // Reverse, as we'll pop batches off the end of the queue.
-            done_batches.reverse();
+            let validate_part_bounds_on_write = write.validate_part_bounds_on_write();
+            let mut todo = VecDeque::new();
 
-            while let Some(done_batch_metadata) = done_batches.pop() {
+            if !validate_part_bounds_on_write {
+                let mut combined_batch_metadata = None;
+                let mut combined_batch_set = BatchSet::default();
+                for done_batch_metadata in done_batches.drain(..) {
+                    in_flight_descriptions.remove(&done_batch_metadata);
+                    let mut batch_set = in_flight_batches
+                        .remove(&done_batch_metadata)
+                        .unwrap_or_default();
+                    match combined_batch_metadata.as_mut() {
+                        Some((_, upper)) => *upper = done_batch_metadata.1,
+                        None => combined_batch_metadata = Some(done_batch_metadata),
+                    }
+                    combined_batch_set.batch_metrics += &batch_set.batch_metrics;
+                    combined_batch_set.finished.append(&mut batch_set.finished);
+                }
+                if let Some(done_batch_metadata) = combined_batch_metadata {
+                    todo.push_back((done_batch_metadata, combined_batch_set))
+                }
+            } else {
+                for done_batch_metadata in done_batches.drain(..) {
+                    in_flight_descriptions.remove(&done_batch_metadata);
+                    let batch_set = in_flight_batches
+                        .remove(&done_batch_metadata)
+                        .unwrap_or_default();
+                    todo.push_back((done_batch_metadata, batch_set));
+                }
+            };
+
+            while let Some((done_batch_metadata, batch_set)) = todo.pop_front() {
                 in_flight_descriptions.remove(&done_batch_metadata);
-
-                let batch_set = in_flight_batches
-                    .remove(&done_batch_metadata)
-                    .unwrap_or_default();
 
                 let mut batches = batch_set.finished;
 
@@ -1235,7 +1259,7 @@ where
                                 &mut to_append[..],
                                 batch_lower.clone(),
                                 batch_upper.clone(),
-                                true,
+                                validate_part_bounds_on_write,
                             )
                             .await
                             .expect("Invalid usage")
@@ -1319,22 +1343,11 @@ where
                             let new_batch_lower = mismatch.current.clone();
                             let new_done_batch_metadata = (new_batch_lower.clone(), batch_upper.clone());
 
-                            // Re-add the new batch to the list of batches to
-                            // process.
-                            done_batches.push(new_done_batch_metadata.clone());
-
                             // Retain any batches that are still in advance of
                             // the new lower, and delete any batches that are
                             // not.
-                            //
-                            // Temporary measure: this bookkeeping is made
-                            // possible by the fact that each batch only
-                            // contains data at a single timestamp, even though
-                            // it might declare a larger lower or upper. In the
-                            // future, we'll want to use persist's `append` API
-                            // and let persist handle the truncation internally.
-                            let new_batch_set = in_flight_batches.entry(new_done_batch_metadata).or_default();
                             let mut batch_delete_futures = vec![];
+                            let mut new_batch_set = BatchSet::default();
                             for batch in batches {
                                 if new_batch_lower.less_equal(&batch.data_ts) {
                                     new_batch_set.finished.push(batch);
@@ -1342,6 +1355,9 @@ where
                                     batch_delete_futures.push(batch.batch.delete());
                                 }
                             }
+
+                            // Re-add the new batch to the list of batches to process.
+                            todo.push_front((new_done_batch_metadata, new_batch_set));
 
                             // Best-effort attempt to delete unneeded batches.
                             future::join_all(batch_delete_futures).await;

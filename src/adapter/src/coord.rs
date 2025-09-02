@@ -108,8 +108,8 @@ use mz_compute_client::controller::error::InstanceMissing;
 use mz_compute_types::ComputeInstanceId;
 use mz_compute_types::dataflows::DataflowDescription;
 use mz_compute_types::plan::Plan;
-use mz_controller::ControllerConfig;
 use mz_controller::clusters::{ClusterConfig, ClusterEvent, ClusterStatus, ProcessId};
+use mz_controller::{ControllerConfig, Readiness};
 use mz_controller_types::{ClusterId, ReplicaId, WatchSetId};
 use mz_expr::{MapFilterProject, OptimizedMirRelationExpr, RowSetFinishing};
 use mz_license_keys::ValidatedLicenseKey;
@@ -123,7 +123,6 @@ use mz_ore::task::{JoinHandle, spawn};
 use mz_ore::thread::JoinHandleExt;
 use mz_ore::tracing::{OpenTelemetryContext, TracingHandle};
 use mz_ore::url::SensitiveUrl;
-use mz_ore::vec::VecExt;
 use mz_ore::{
     assert_none, instrument, soft_assert_eq_or_log, soft_assert_or_log, soft_panic_or_log, stack,
 };
@@ -232,7 +231,9 @@ mod validity;
 #[derive(Debug)]
 pub enum Message {
     Command(OpenTelemetryContext, Command),
-    ControllerReady,
+    ControllerReady {
+        controller: ControllerReadiness,
+    },
     PurifiedStatementReady(PurifiedStatementReady),
     CreateConnectionValidationReady(CreateConnectionValidationReady),
     AlterConnectionValidationReady(AlterConnectionValidationReady),
@@ -356,7 +357,18 @@ impl Message {
                 Command::Dump { .. } => "command-dump",
                 Command::AuthenticatePassword { .. } => "command-auth_check",
             },
-            Message::ControllerReady => "controller_ready",
+            Message::ControllerReady {
+                controller: ControllerReadiness::Compute,
+            } => "controller_ready(compute)",
+            Message::ControllerReady {
+                controller: ControllerReadiness::Storage,
+            } => "controller_ready(storage)",
+            Message::ControllerReady {
+                controller: ControllerReadiness::Metrics,
+            } => "controller_ready(metrics)",
+            Message::ControllerReady {
+                controller: ControllerReadiness::Internal,
+            } => "controller_ready(internal)",
             Message::PurifiedStatementReady(_) => "purified_statement_ready",
             Message::CreateConnectionValidationReady(_) => "create_connection_validation_ready",
             Message::TryDeferred { .. } => "try_deferred",
@@ -395,6 +407,19 @@ impl Message {
             Message::DeferredStatementReady => "deferred_statement_ready",
         }
     }
+}
+
+/// The reason for why a controller needs processing on the main loop.
+#[derive(Debug)]
+pub enum ControllerReadiness {
+    /// The storage controller is ready.
+    Storage,
+    /// The compute controller is ready.
+    Compute,
+    /// A batch of metric data is ready.
+    Metrics,
+    /// An internally-generated message is ready to be returned.
+    Internal,
 }
 
 #[derive(Derivative)]
@@ -1864,6 +1889,8 @@ impl Coordinator {
                 self.controller.create_replica(
                     instance.id,
                     replica.replica_id,
+                    instance.name.clone(),
+                    replica.name.clone(),
                     role,
                     replica.config.clone(),
                     enable_worker_core_affinity,
@@ -2167,7 +2194,7 @@ impl Coordinator {
         let migrated_updates_fut = if self.controller.read_only() {
             let min_timestamp = Timestamp::minimum();
             let migrated_builtin_table_updates: Vec<_> = builtin_table_updates
-                .drain_filter_swapping(|update| {
+                .extract_if(.., |update| {
                     let gid = self.catalog().get_entry(&update.id).latest_global_id();
                     migrated_storage_collections_0dt.contains(&update.id)
                         && self
@@ -3329,7 +3356,17 @@ impl Coordinator {
                     // on why this is cancel-safe.
                     // Receive a single command.
                     () = self.controller.ready() => {
-                        messages.push(Message::ControllerReady);
+                        // NOTE: We don't get a `Readiness` back from `ready()`
+                        // because the controller wants to keep it and it's not
+                        // trivially `Clone` or `Copy`. Hence this accessor.
+                        let controller = match self.controller.get_readiness() {
+                            Readiness::Storage => ControllerReadiness::Storage,
+                            Readiness::Compute => ControllerReadiness::Compute,
+                            Readiness::Metrics(_) => ControllerReadiness::Metrics,
+                            Readiness::Internal(_) => ControllerReadiness::Internal,
+                            Readiness::NotReady => unreachable!("just signaled as ready"),
+                        };
+                        messages.push(Message::ControllerReady { controller });
                     }
                     // See [`appends::GroupCommitWaiter`] for notes on why this is cancel safe.
                     // Receive a single command.
@@ -3582,7 +3619,7 @@ impl Coordinator {
 
     /// Creates a new dataflow builder from the catalog and indexes in `self`.
     #[instrument(level = "debug")]
-    pub fn dataflow_builder(&self, instance: ComputeInstanceId) -> DataflowBuilder {
+    pub fn dataflow_builder(&self, instance: ComputeInstanceId) -> DataflowBuilder<'_> {
         let compute = self
             .instance_snapshot(instance)
             .expect("compute instance does not exist");
@@ -4068,6 +4105,7 @@ pub fn serve(
                 enable_0dt_deployment,
                 helm_chart_version,
                 external_login_password_mz_system,
+                license_key: license_key.clone(),
             },
         })
         .await?;
@@ -4480,13 +4518,13 @@ pub async fn load_remote_system_parameters(
 }
 
 #[derive(Debug)]
-pub(crate) enum WatchSetResponse {
+pub enum WatchSetResponse {
     StatementDependenciesReady(StatementLoggingId, StatementLifecycleEvent),
     AlterSinkReady(AlterSinkReadyContext),
 }
 
 #[derive(Debug)]
-pub(crate) struct AlterSinkReadyContext {
+pub struct AlterSinkReadyContext {
     ctx: Option<ExecuteContext>,
     otel_ctx: OpenTelemetryContext,
     plan: AlterSinkPlan,

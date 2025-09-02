@@ -79,7 +79,7 @@ a min max
 
 $ set-regex match=(.User.:\s\d+|\(u\d+\)) replacement=UID
 
-?[version>=14400] EXPLAIN PHYSICAL PLAN AS VERBOSE TEXT FOR SELECT * FROM v2
+?[version>=15400] EXPLAIN PHYSICAL PLAN AS VERBOSE TEXT FOR SELECT * FROM v2
 Explained Query:
   TopK::MonotonicTopK order_by=[#0 asc nulls_last] limit=3 must_consolidate
     ArrangeBy
@@ -88,22 +88,21 @@ Explained Query:
       Get::PassArrangements materialize.public.i1
         raw=false
         arrangements[0]={ key=[#0{b}], permutation=id, thinning=() }
-        types=[bigint]
 
 Used Indexes:
   - materialize.public.i1_primary_idx (*** full scan ***)
 
 Target cluster: quickstart
 
-?[version<14400] EXPLAIN PHYSICAL PLAN AS VERBOSE TEXT FOR SELECT * FROM v2
+?[version<15400] EXPLAIN PHYSICAL PLAN AS VERBOSE TEXT FOR SELECT * FROM v2
 Explained Query:
   TopK::MonotonicTopK order_by=[#0 asc nulls_last] limit=3 must_consolidate
     ArrangeBy
-      input_key=[#0]
+      input_key=[#0{b}]
       raw=true
       Get::PassArrangements materialize.public.i1
         raw=false
-        arrangements[0]={ key=[#0], permutation=id, thinning=() }
+        arrangements[0]={ key=[#0{b}], permutation=id, thinning=() }
         types=[bigint]
 
 Used Indexes:
@@ -123,7 +122,22 @@ Target cluster: quickstart
 
 > CREATE VIEW v3 AS SELECT * FROM non_dbz_data_indexed ORDER BY b LIMIT 3
 
-?[version>=14400] EXPLAIN PHYSICAL PLAN AS VERBOSE TEXT FOR SELECT * FROM v3
+?[version>=15400] EXPLAIN PHYSICAL PLAN AS VERBOSE TEXT FOR SELECT * FROM v3
+Explained Query:
+  TopK::MonotonicTopK order_by=[#1 asc nulls_last] limit=3 must_consolidate
+    ArrangeBy
+      input_key=[#0{a}, #1{b}]
+      raw=true
+      Get::PassArrangements materialize.public.non_dbz_data_indexed
+        raw=false
+        arrangements[0]={ key=[#0{a}, #1{b}], permutation=id, thinning=() }
+
+Used Indexes:
+  - materialize.public.non_dbz_data_indexed_primary_idx (*** full scan ***)
+
+Target cluster: quickstart
+
+?[version<15400] EXPLAIN PHYSICAL PLAN AS VERBOSE TEXT FOR SELECT * FROM v3
 Explained Query:
   TopK::MonotonicTopK order_by=[#1 asc nulls_last] limit=3 must_consolidate
     ArrangeBy
@@ -139,22 +153,6 @@ Used Indexes:
 
 Target cluster: quickstart
 
-?[version<14400] EXPLAIN PHYSICAL PLAN AS VERBOSE TEXT FOR SELECT * FROM v3
-Explained Query:
-  TopK::MonotonicTopK order_by=[#1 asc nulls_last] limit=3 must_consolidate
-    ArrangeBy
-      input_key=[#0, #1]
-      raw=true
-      Get::PassArrangements materialize.public.non_dbz_data_indexed
-        raw=false
-        arrangements[0]={ key=[#0, #1], permutation=id, thinning=() }
-        types=[bigint, bigint]
-
-Used Indexes:
-  - materialize.public.non_dbz_data_indexed_primary_idx (*** full scan ***)
-
-Target cluster: quickstart
-
 > CREATE VIEW i4 AS SELECT b+1 as c FROM i1;
 > CREATE DEFAULT INDEX ON i4;
 
@@ -162,7 +160,7 @@ Target cluster: quickstart
 
 > CREATE VIEW v5 AS SELECT * from i4 ORDER BY c LIMIT 2;
 
-?[version>=14400] EXPLAIN PHYSICAL PLAN AS VERBOSE TEXT FOR SELECT * FROM v5;
+?[version>=15400] EXPLAIN PHYSICAL PLAN AS VERBOSE TEXT FOR SELECT * FROM v5;
 Explained Query:
   TopK::MonotonicTopK order_by=[#0 asc nulls_last] limit=2 must_consolidate
     ArrangeBy
@@ -171,22 +169,21 @@ Explained Query:
       Get::PassArrangements materialize.public.i4
         raw=false
         arrangements[0]={ key=[#0{c}], permutation=id, thinning=() }
-        types=[bigint]
 
 Used Indexes:
   - materialize.public.i4_primary_idx (*** full scan ***)
 
 Target cluster: quickstart
 
-?[version<14400] EXPLAIN PHYSICAL PLAN AS VERBOSE TEXT FOR SELECT * FROM v5;
+?[version<15400] EXPLAIN PHYSICAL PLAN AS VERBOSE TEXT FOR SELECT * FROM v5;
 Explained Query:
   TopK::MonotonicTopK order_by=[#0 asc nulls_last] limit=2 must_consolidate
     ArrangeBy
-      input_key=[#0]
+      input_key=[#0{c}]
       raw=true
       Get::PassArrangements materialize.public.i4
         raw=false
-        arrangements[0]={ key=[#0], permutation=id, thinning=() }
+        arrangements[0]={ key=[#0{c}], permutation=id, thinning=() }
         types=[bigint]
 
 Used Indexes:
@@ -201,7 +198,7 @@ Target cluster: quickstart
 
 > CREATE VIEW v7 AS SELECT * from i6 ORDER BY c LIMIT 2;
 
-?[version>=14400] EXPLAIN PHYSICAL PLAN AS VERBOSE TEXT FOR SELECT * FROM v7;
+?[version>=15400] EXPLAIN PHYSICAL PLAN AS VERBOSE TEXT FOR SELECT * FROM v7;
 Explained Query:
   TopK::MonotonicTopK order_by=[#0 asc nulls_last] limit=2 must_consolidate
     ArrangeBy
@@ -210,22 +207,21 @@ Explained Query:
       Get::PassArrangements materialize.public.i6
         raw=false
         arrangements[0]={ key=[#0{c}], permutation=id, thinning=() }
-        types=[bigint]
 
 Used Indexes:
   - materialize.public.i6_primary_idx (*** full scan ***)
 
 Target cluster: quickstart
 
-?[version<14400] EXPLAIN PHYSICAL PLAN AS VERBOSE TEXT FOR SELECT * FROM v7;
+?[version<15400] EXPLAIN PHYSICAL PLAN AS VERBOSE TEXT FOR SELECT * FROM v7;
 Explained Query:
   TopK::MonotonicTopK order_by=[#0 asc nulls_last] limit=2 must_consolidate
     ArrangeBy
-      input_key=[#0]
+      input_key=[#0{c}]
       raw=true
       Get::PassArrangements materialize.public.i6
         raw=false
-        arrangements[0]={ key=[#0], permutation=id, thinning=() }
+        arrangements[0]={ key=[#0{c}], permutation=id, thinning=() }
         types=[bigint]
 
 Used Indexes:
@@ -243,7 +239,7 @@ Target cluster: quickstart
 
 # Propagating monotonicity analysis in a complex situation: (i1, i1) -> i8; (i1, i8) -> i9
 
-?[version>=14400] EXPLAIN PHYSICAL PLAN AS VERBOSE TEXT FOR SELECT * FROM v10;
+?[version>=15400] EXPLAIN PHYSICAL PLAN AS VERBOSE TEXT FOR SELECT * FROM v10;
 Explained Query:
   TopK::MonotonicTopK order_by=[#0 asc nulls_last] limit=2 must_consolidate
     ArrangeBy
@@ -252,22 +248,21 @@ Explained Query:
       Get::PassArrangements materialize.public.i9
         raw=false
         arrangements[0]={ key=[#0{b}], permutation=id, thinning=() }
-        types=[bigint]
 
 Used Indexes:
   - materialize.public.i9_primary_idx (*** full scan ***)
 
 Target cluster: quickstart
 
-?[version<14400] EXPLAIN PHYSICAL PLAN AS VERBOSE TEXT FOR SELECT * FROM v10;
+?[version<15400] EXPLAIN PHYSICAL PLAN AS VERBOSE TEXT FOR SELECT * FROM v10;
 Explained Query:
   TopK::MonotonicTopK order_by=[#0 asc nulls_last] limit=2 must_consolidate
     ArrangeBy
-      input_key=[#0]
+      input_key=[#0{b}]
       raw=true
       Get::PassArrangements materialize.public.i9
         raw=false
-        arrangements[0]={ key=[#0], permutation=id, thinning=() }
+        arrangements[0]={ key=[#0{b}], permutation=id, thinning=() }
         types=[bigint]
 
 Used Indexes:
@@ -295,54 +290,28 @@ Target cluster: quickstart
 # in memory consumptions and should be understood before adapting the values.
 > SET cluster_replica = r1
 
->[version>=13800] SELECT mdod.dataflow_name, mdod.name
+>[version>=15000] SELECT mdod.dataflow_name, mdod.name
   FROM mz_introspection.mz_arrangement_sharing mash
   JOIN mz_introspection.mz_dataflow_operator_dataflows mdod ON mash.operator_id = mdod.id
   JOIN mz_introspection.mz_compute_exports USING (dataflow_id)
   WHERE export_id LIKE 'u%'
-"Dataflow: materialize.public.i1_primary_idx" "ArrangeBy[[Column(0)]]"
-"Dataflow: materialize.public.i1_primary_idx" "ArrangeBy[[Column(0)]]-errors"
-"Dataflow: materialize.public.i4_primary_idx" "ArrangeBy[[Column(0)]]"
-"Dataflow: materialize.public.i4_primary_idx" "ArrangeBy[[Column(0)]]-errors"
-"Dataflow: materialize.public.i6_primary_idx" "ArrangeBy[[Column(0)]]"
-"Dataflow: materialize.public.i6_primary_idx" "ArrangeBy[[Column(0)]]-errors"
+"Dataflow: materialize.public.i1_primary_idx" "ArrangeBy[[Column(0, \"b\")]]"
+"Dataflow: materialize.public.i1_primary_idx" "ArrangeBy[[Column(0, \"b\")]]-errors"
+"Dataflow: materialize.public.i4_primary_idx" "ArrangeBy[[Column(0, \"c\")]]"
+"Dataflow: materialize.public.i4_primary_idx" "ArrangeBy[[Column(0, \"c\")]]-errors"
+"Dataflow: materialize.public.i6_primary_idx" "ArrangeBy[[Column(0, \"c\")]]"
+"Dataflow: materialize.public.i6_primary_idx" "ArrangeBy[[Column(0, \"c\")]]-errors"
 "Dataflow: materialize.public.i6_primary_idx" "Arranged TopK input"
 "Dataflow: materialize.public.i6_primary_idx" "Reduced TopK input"
-"Dataflow: materialize.public.i8_primary_idx" "ArrangeBy[[Column(0)]]"
-"Dataflow: materialize.public.i8_primary_idx" "ArrangeBy[[Column(0)]]-errors"
-"Dataflow: materialize.public.i9_primary_idx" "ArrangeBy[[Column(0)]]"
-"Dataflow: materialize.public.i9_primary_idx" "ArrangeBy[[Column(0)]]-errors"
+"Dataflow: materialize.public.i8_primary_idx" "ArrangeBy[[Column(0, \"b\")]]"
+"Dataflow: materialize.public.i8_primary_idx" "ArrangeBy[[Column(0, \"b\")]]-errors"
+"Dataflow: materialize.public.i9_primary_idx" "ArrangeBy[[Column(0, \"b\")]]"
+"Dataflow: materialize.public.i9_primary_idx" "ArrangeBy[[Column(0, \"b\")]]-errors"
 "Dataflow: materialize.public.monotonic_fused" "ArrangeMonotonic [val: empty]"
 "Dataflow: materialize.public.monotonic_fused" ReduceMonotonic
 "Dataflow: materialize.public.monotonic_max" "ArrangeMonotonic [val: empty]"
 "Dataflow: materialize.public.monotonic_max" ReduceMonotonic
 "Dataflow: materialize.public.monotonic_min" "ArrangeMonotonic [val: empty]"
 "Dataflow: materialize.public.monotonic_min" ReduceMonotonic
-"Dataflow: materialize.public.non_dbz_data_indexed_primary_idx" "ArrangeBy[[Column(0), Column(1)]]"
-"Dataflow: materialize.public.non_dbz_data_indexed_primary_idx" "ArrangeBy[[Column(0), Column(1)]]-errors"
-
->[version<13800] SELECT mdod.dataflow_name, mdod.name
-  FROM mz_introspection.mz_arrangement_sharing mash
-  JOIN mz_introspection.mz_dataflow_operator_dataflows mdod ON mash.operator_id = mdod.id
-  JOIN mz_introspection.mz_compute_exports USING (dataflow_id)
-  WHERE export_id LIKE 'u%'
-"Dataflow: materialize.public.i1_primary_idx" ArrangeBy[[Column(0)]]
-"Dataflow: materialize.public.i1_primary_idx" ArrangeBy[[Column(0)]]-errors
-"Dataflow: materialize.public.i4_primary_idx" ArrangeBy[[Column(0)]]
-"Dataflow: materialize.public.i4_primary_idx" ArrangeBy[[Column(0)]]-errors
-"Dataflow: materialize.public.i6_primary_idx" ArrangeBy[[Column(0)]]
-"Dataflow: materialize.public.i6_primary_idx" ArrangeBy[[Column(0)]]-errors
-"Dataflow: materialize.public.i6_primary_idx" "Arranged TopK input"
-"Dataflow: materialize.public.i6_primary_idx" "Reduced TopK input"
-"Dataflow: materialize.public.i8_primary_idx" ArrangeBy[[Column(0)]]
-"Dataflow: materialize.public.i8_primary_idx" ArrangeBy[[Column(0)]]-errors
-"Dataflow: materialize.public.i9_primary_idx" ArrangeBy[[Column(0)]]
-"Dataflow: materialize.public.i9_primary_idx" ArrangeBy[[Column(0)]]-errors
-"Dataflow: materialize.public.monotonic_fused" "ArrangeMonotonic [val: empty]"
-"Dataflow: materialize.public.monotonic_fused" ReduceMonotonic
-"Dataflow: materialize.public.monotonic_max" "ArrangeMonotonic [val: empty]"
-"Dataflow: materialize.public.monotonic_max" ReduceMonotonic
-"Dataflow: materialize.public.monotonic_min" "ArrangeMonotonic [val: empty]"
-"Dataflow: materialize.public.monotonic_min" ReduceMonotonic
-"Dataflow: materialize.public.non_dbz_data_indexed_primary_idx" "ArrangeBy[[Column(0), Column(1)]]"
-"Dataflow: materialize.public.non_dbz_data_indexed_primary_idx" "ArrangeBy[[Column(0), Column(1)]]-errors"
+"Dataflow: materialize.public.non_dbz_data_indexed_primary_idx" "ArrangeBy[[Column(0, \"a\"), Column(1, \"b\")]]"
+"Dataflow: materialize.public.non_dbz_data_indexed_primary_idx" "ArrangeBy[[Column(0, \"a\"), Column(1, \"b\")]]-errors"

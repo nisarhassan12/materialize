@@ -70,6 +70,7 @@ use thiserror::Error;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::oneshot::Receiver;
 use tokio::sync::{oneshot, watch};
+use tokio_metrics::TaskMetrics;
 use tower::limit::GlobalConcurrencyLimitLayer;
 use tower::{Service, ServiceBuilder};
 use tower_http::cors::{AllowOrigin, Any, CorsLayer};
@@ -427,7 +428,11 @@ impl HttpServer {
 impl Server for HttpServer {
     const NAME: &'static str = "http";
 
-    fn handle_connection(&self, conn: Connection) -> ConnectionHandler {
+    fn handle_connection(
+        &self,
+        conn: Connection,
+        _tokio_metrics_intervals: impl Iterator<Item = TaskMetrics> + Send + 'static,
+    ) -> ConnectionHandler {
         let router = self.router.clone();
         let tls_context = self.tls.clone();
         let mut conn = TokioIo::new(conn);
@@ -879,8 +884,8 @@ async fn init_ws(
     let authenticator = authenticator_rx.clone().await.expect("sender not dropped");
     // TODO: Add a timeout here to prevent resource leaks by clients that
     // connect then never send a message.
-    let init_msg = ws.recv().await.ok_or_else(|| anyhow::anyhow!("closed"))??;
     let ws_auth: WebSocketAuth = loop {
+        let init_msg = ws.recv().await.ok_or_else(|| anyhow::anyhow!("closed"))??;
         match init_msg {
             Message::Text(data) => break serde_json::from_str(&data)?,
             Message::Binary(data) => break serde_json::from_slice(&data)?,

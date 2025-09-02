@@ -194,7 +194,7 @@ impl<T: Message + Default> RustType<Bytes> for LazyProto<T> {
     }
 }
 
-pub(crate) fn parse_id(id_prefix: char, id_type: &str, encoded: &str) -> Result<[u8; 16], String> {
+pub(crate) fn parse_id(id_prefix: &str, id_type: &str, encoded: &str) -> Result<[u8; 16], String> {
     let uuid_encoded = match encoded.strip_prefix(id_prefix) {
         Some(x) => x,
         None => return Err(format!("invalid {} {}: incorrect prefix", id_type, encoded)),
@@ -1419,6 +1419,7 @@ impl RustType<ProtoRunMeta> for RunMeta {
             schema_id: self.schema.into_proto(),
             deprecated_schema_id: self.deprecated_schema.into_proto(),
             id: self.id.into_proto(),
+            len: self.len.into_proto(),
         }
     }
 
@@ -1434,6 +1435,7 @@ impl RustType<ProtoRunMeta> for RunMeta {
             schema: proto.schema_id.into_rust()?,
             deprecated_schema: proto.deprecated_schema_id.into_rust()?,
             id: proto.id.into_rust()?,
+            len: proto.len.into_rust()?,
         })
     }
 }

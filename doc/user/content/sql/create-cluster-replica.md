@@ -7,15 +7,14 @@ menu:
     parent: commands
 ---
 
-{{< warning >}}
-`CREATE CLUSTER REPLICA` is deprecated.
 
-We recommend migrating to a [managed
-cluster](/sql/alter-cluster/#converting-unmanaged-to-managed-clusters) instead
-of manually creating and dropping replicas.
-{{< /warning >}}
+`CREATE CLUSTER REPLICA` provisions a new replica for an [**unmanaged**
+cluster](/sql/create-cluster/#unmanaged-clusters).
 
-`CREATE CLUSTER REPLICA` provisions a new replica of a [cluster](/concepts/clusters/).
+{{< tip >}}
+When getting started with Materialize, we recommend starting with managed
+clusters.
+{{</ tip >}}
 
 ## Conceptual framework
 
@@ -100,7 +99,12 @@ CREATE CLUSTER REPLICA c1.r1 (SIZE = '400cc');
 
 The privileges required to execute this statement are:
 
-- Ownership of `cluster_name`.
+{{< include-md
+file="shared-content/sql-command-privileges/create-cluster-replica.md" >}}
+
+## See also
+
+- [`DROP CLUSTER REPLICA`]
 
 [AWS availability zone ID]: https://docs.aws.amazon.com/ram/latest/userguide/working-with-az-ids.html
 [`DROP CLUSTER REPLICA`]: /sql/drop-cluster-replica

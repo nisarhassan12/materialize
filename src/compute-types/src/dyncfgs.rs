@@ -21,6 +21,14 @@ pub const ENABLE_MZ_JOIN_CORE: Config<bool> = Config::new(
      linear joins.",
 );
 
+/// Whether rendering should use `mz_join_core_v2` rather than DD's `JoinCore::join_core`.
+pub const ENABLE_MZ_JOIN_CORE_V2: Config<bool> = Config::new(
+    "enable_mz_join_core_v2",
+    false,
+    "Whether compute should use `mz_join_core_v2` rather than DD's `JoinCore::join_core` to render \
+     linear joins.",
+);
+
 /// Whether rendering should use the new MV sink correction buffer implementation.
 pub const ENABLE_CORRECTION_V2: Config<bool> = Config::new(
     "enable_compute_correction_v2",
@@ -33,6 +41,20 @@ pub const ENABLE_MV_APPEND_SMEARING: Config<bool> = Config::new(
     "enable_compute_mv_append_smearing",
     true,
     "Whether the MV sink should distribute appends among workers.",
+);
+
+/// Whether to enable temporal bucketing in compute.
+pub const ENABLE_TEMPORAL_BUCKETING: Config<bool> = Config::new(
+    "enable_compute_temporal_bucketing",
+    false,
+    "Whether to enable temporal bucketing in compute.",
+);
+
+/// The summary to apply to the frontier in temporal bucketing in compute.
+pub const TEMPORAL_BUCKETING_SUMMARY: Config<Duration> = Config::new(
+    "compute_temporal_bucketing_summary",
+    Duration::from_secs(2),
+    "The summary to apply to frontiers in temporal bucketing in compute.",
 );
 
 /// The yielding behavior with which linear joins should be rendered.
@@ -81,6 +103,34 @@ pub const LGALLOC_SLOW_CLEAR_BYTES: Config<usize> = Config::new(
     "lgalloc_slow_clear_bytes",
     128 << 20,
     "Clear byte size per size class for every invocation",
+);
+
+/// Interval to run the memory limiter. A zero duration disables the limiter.
+pub const MEMORY_LIMITER_INTERVAL: Config<Duration> = Config::new(
+    "memory_limiter_interval",
+    Duration::from_secs(10),
+    "Interval to run the memory limiter. A zero duration disables the limiter.",
+);
+
+/// Factor of the memory limit that the process will be permitted to use before terminating the process.
+pub const MEMORY_LIMITER_USAGE_FACTOR: Config<f64> = Config::new(
+    "memory_limiter_usage_factor",
+    2.,
+    "Factor of the memory limit that the process will use before terminating the process.",
+);
+
+/// Bias to the memory limiter usage factor.
+pub const MEMORY_LIMITER_USAGE_BIAS: Config<f64> = Config::new(
+    "memory_limiter_usage_bias",
+    1.,
+    "Multiplicative bias to memory_limiter_usage_factor.",
+);
+
+/// Burst factor to memory limit.
+pub const MEMORY_LIMITER_BURST_FACTOR: Config<f64> = Config::new(
+    "memory_limiter_burst_factor",
+    0.,
+    "Multiplicative burst factor to memory limit.",
 );
 
 /// Interval to run the lgalloc limiter. A zero duration disables the limiter.
@@ -338,14 +388,21 @@ pub const PEEK_STASH_BATCH_SIZE: Config<usize> = Config::new(
 pub fn all_dyncfgs(configs: ConfigSet) -> ConfigSet {
     configs
         .add(&ENABLE_MZ_JOIN_CORE)
+        .add(&ENABLE_MZ_JOIN_CORE_V2)
         .add(&ENABLE_CORRECTION_V2)
         .add(&ENABLE_MV_APPEND_SMEARING)
+        .add(&ENABLE_TEMPORAL_BUCKETING)
+        .add(&TEMPORAL_BUCKETING_SUMMARY)
         .add(&LINEAR_JOIN_YIELDING)
         .add(&ENABLE_LGALLOC)
         .add(&LGALLOC_BACKGROUND_INTERVAL)
         .add(&LGALLOC_FILE_GROWTH_DAMPENER)
         .add(&LGALLOC_LOCAL_BUFFER_BYTES)
         .add(&LGALLOC_SLOW_CLEAR_BYTES)
+        .add(&MEMORY_LIMITER_INTERVAL)
+        .add(&MEMORY_LIMITER_USAGE_FACTOR)
+        .add(&MEMORY_LIMITER_USAGE_BIAS)
+        .add(&MEMORY_LIMITER_BURST_FACTOR)
         .add(&LGALLOC_LIMITER_INTERVAL)
         .add(&LGALLOC_LIMITER_USAGE_FACTOR)
         .add(&LGALLOC_LIMITER_USAGE_BIAS)

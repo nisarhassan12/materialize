@@ -11,6 +11,7 @@ use anyhow::ensure;
 use async_stream::{stream, try_stream};
 use differential_dataflow::difference::Semigroup;
 use mz_persist::metrics::ColumnarMetrics;
+use proptest::prelude::{Arbitrary, Strategy};
 use std::borrow::Cow;
 use std::cmp::Ordering;
 use std::collections::BTreeMap;
@@ -114,6 +115,20 @@ pub(crate) const GC_FALLBACK_THRESHOLD_MS: Config<usize> = Config::new(
     "The number of milliseconds before a worker claims an already claimed GC.",
 );
 
+/// See the config description string.
+pub(crate) const GC_MIN_VERSIONS: Config<usize> = Config::new(
+    "persist_gc_min_versions",
+    32,
+    "The number of un-GCd versions that may exist in state before we'll trigger a GC.",
+);
+
+/// See the config description string.
+pub(crate) const GC_MAX_VERSIONS: Config<usize> = Config::new(
+    "persist_gc_max_versions",
+    128_000,
+    "The maximum number of versions to GC in a single GC run.",
+);
+
 /// Feature flag the new active GC tracking mechanism.
 /// We musn't enable this until we are fully deployed on the new version.
 pub(crate) const GC_USE_ACTIVE_GC: Config<bool> = Config::new(
@@ -150,7 +165,7 @@ impl std::str::FromStr for IdempotencyToken {
     type Err = String;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        parse_id('i', "IdempotencyToken", s).map(IdempotencyToken)
+        parse_id("i", "IdempotencyToken", s).map(IdempotencyToken)
     }
 }
 
@@ -738,7 +753,7 @@ pub(crate) enum RunOrder {
     Structured,
 }
 
-#[derive(Clone, PartialEq, Eq, Ord, PartialOrd, Serialize)]
+#[derive(Clone, PartialEq, Eq, Ord, PartialOrd, Serialize, Copy, Hash)]
 pub struct RunId(pub(crate) [u8; 16]);
 
 impl std::fmt::Display for RunId {
@@ -757,7 +772,7 @@ impl std::str::FromStr for RunId {
     type Err = String;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        parse_id('r', "RunId", s).map(RunId)
+        parse_id("ri", "RunId", s).map(RunId)
     }
 }
 
@@ -770,6 +785,17 @@ impl From<RunId> for String {
 impl RunId {
     pub(crate) fn new() -> Self {
         RunId(*Uuid::new_v4().as_bytes())
+    }
+}
+
+impl Arbitrary for RunId {
+    type Parameters = ();
+    type Strategy = proptest::strategy::BoxedStrategy<Self>;
+    fn arbitrary_with(_args: Self::Parameters) -> Self::Strategy {
+        Strategy::prop_map(proptest::prelude::any::<u128>(), |n| {
+            RunId(*Uuid::from_u128(n).as_bytes())
+        })
+        .boxed()
     }
 }
 
@@ -786,6 +812,9 @@ pub struct RunMeta {
 
     /// If set, a UUID that uniquely identifies this run.
     pub(crate) id: Option<RunId>,
+
+    /// The number of updates in this run, or `None` if the number is unknown.
+    pub(crate) len: Option<usize>,
 }
 
 /// A subset of a [HollowBatch] corresponding 1:1 to a blob.
@@ -1014,6 +1043,29 @@ impl<T> HollowBatch<T> {
             vec![]
         } else {
             vec![RunMeta::default()]
+        };
+        Self {
+            desc,
+            len,
+            parts,
+            run_splits: vec![],
+            run_meta,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_run_for_test(
+        desc: Description<T>,
+        parts: Vec<RunPart<T>>,
+        len: usize,
+        run_id: RunId,
+    ) -> Self {
+        let run_meta = if parts.is_empty() {
+            vec![]
+        } else {
+            let mut meta = RunMeta::default();
+            meta.id = Some(run_id);
+            vec![meta]
         };
         Self {
             desc,
@@ -1785,6 +1837,25 @@ where
         Continue(apply_merge_result)
     }
 
+    pub fn apply_merge_res_classic<D: Codec64 + Semigroup + PartialEq>(
+        &mut self,
+        res: &FueledMergeRes<T>,
+        metrics: &ColumnarMetrics,
+    ) -> ControlFlow<NoOpStateTransition<ApplyMergeResult>, ApplyMergeResult> {
+        // We expire all writers if the upper and since both advance to the
+        // empty antichain. Gracefully handle this. At the same time,
+        // short-circuit the cmd application so we don't needlessly create new
+        // SeqNos.
+        if self.is_tombstone() {
+            return Break(NoOpStateTransition(ApplyMergeResult::NotAppliedNoMatch));
+        }
+
+        let apply_merge_result = self
+            .trace
+            .apply_merge_res_checked_classic::<D>(res, metrics);
+        Continue(apply_merge_result)
+    }
+
     pub fn spine_exert(
         &mut self,
         fuel: usize,
@@ -2133,10 +2204,7 @@ where
             // We have a nonempty batch: replace it with an empty batch and return.
             // This should not produce an excessively large diff: if it did, we wouldn't have been
             // able to append that batch in the first place.
-            let fake_merge = FueledMergeRes {
-                output: HollowBatch::empty(desc),
-            };
-            let result = self.trace.apply_tombstone_merge(&fake_merge);
+            let result = self.trace.apply_tombstone_merge(&desc);
             assert!(
                 result.matched(),
                 "merge with a matching desc should always match"
@@ -2342,6 +2410,14 @@ where
     }
 }
 
+#[derive(Copy, Clone, Debug)]
+pub struct GcConfig {
+    pub use_active_gc: bool,
+    pub fallback_threshold_ms: u64,
+    pub min_versions: usize,
+    pub max_versions: usize,
+}
+
 impl<T> State<T>
 where
     T: Timestamp + Lattice + Codec64,
@@ -2421,21 +2497,33 @@ where
     // them being executed in the order they are given. But it is expected that
     // gc assignments are best-effort respected. In practice, cmds like
     // register_foo or expire_foo, where it would be awkward, ignore gc.
-    pub fn maybe_gc(
-        &mut self,
-        is_write: bool,
-        use_active_gc: bool,
-        fallback_threshold_ms: u64,
-        now: u64,
-    ) -> Option<GcReq> {
+    pub fn maybe_gc(&mut self, is_write: bool, now: u64, cfg: GcConfig) -> Option<GcReq> {
+        let GcConfig {
+            use_active_gc,
+            fallback_threshold_ms,
+            min_versions,
+            max_versions,
+        } = cfg;
         // This is an arbitrary-ish threshold that scales with seqno, but never
         // gets particularly big. It probably could be much bigger and certainly
         // could use a tuning pass at some point.
-        let gc_threshold = std::cmp::max(
-            1,
-            u64::from(self.seqno.0.next_power_of_two().trailing_zeros()),
-        );
+        let gc_threshold = if use_active_gc {
+            u64::cast_from(min_versions)
+        } else {
+            std::cmp::max(
+                1,
+                u64::cast_from(self.seqno.0.next_power_of_two().trailing_zeros()),
+            )
+        };
         let new_seqno_since = self.seqno_since();
+        // Collect until the new seqno since... or the old since plus the max number of versions,
+        // whatever is less.
+        let gc_until_seqno = new_seqno_since.min(SeqNo(
+            self.collections
+                .last_gc_req
+                .0
+                .saturating_add(u64::cast_from(max_versions)),
+        ));
         let should_gc = new_seqno_since
             .0
             .saturating_sub(self.collections.last_gc_req.0)
@@ -2473,10 +2561,10 @@ where
             should_gc
         };
         if should_gc {
-            self.collections.last_gc_req = new_seqno_since;
+            self.collections.last_gc_req = gc_until_seqno;
             Some(GcReq {
                 shard_id: self.shard_id,
-                new_seqno_since,
+                new_seqno_since: gc_until_seqno,
             })
         } else {
             None
@@ -2547,15 +2635,11 @@ where
     }
 
     // NB: Unlike the other methods here, this one is read-only.
-    pub fn verify_listen(&self, as_of: &Antichain<T>) -> Result<Result<(), Upper<T>>, Since<T>> {
+    pub fn verify_listen(&self, as_of: &Antichain<T>) -> Result<(), Since<T>> {
         if PartialOrder::less_than(as_of, self.collections.trace.since()) {
             return Err(Since(self.collections.trace.since().clone()));
         }
-        let upper = self.collections.trace.upper();
-        if PartialOrder::less_equal(upper, as_of) {
-            return Ok(Err(Upper(upper.clone())));
-        }
-        Ok(Ok(()))
+        Ok(())
     }
 
     pub fn next_listen_batch(&self, frontier: &Antichain<T>) -> Result<HollowBatch<T>, SeqNo> {
@@ -2638,7 +2722,7 @@ where
         None
     }
 
-    pub(crate) fn blobs(&self) -> impl Iterator<Item = HollowBlobRef<T>> {
+    pub(crate) fn blobs(&self) -> impl Iterator<Item = HollowBlobRef<'_, T>> {
         let batches = self.collections.trace.batches().map(HollowBlobRef::Batch);
         let rollups = self.collections.rollups.values().map(HollowBlobRef::Rollup);
         batches.chain(rollups)
@@ -2755,6 +2839,7 @@ pub struct Upper<T>(pub Antichain<T>);
 #[cfg(test)]
 pub(crate) mod tests {
     use std::ops::Range;
+    use std::str::FromStr;
 
     use bytes::Bytes;
     use mz_build_info::DUMMY_BUILD_INFO;
@@ -2783,34 +2868,92 @@ pub(crate) mod tests {
         }
     }
 
-    pub fn any_hollow_batch<T: Arbitrary + Timestamp>() -> impl Strategy<Value = HollowBatch<T>> {
-        Strategy::prop_map(
-            (
-                any::<T>(),
-                any::<T>(),
-                any::<T>(),
-                proptest::collection::vec(any_run_part::<T>(), 0..3),
-                any::<usize>(),
-                any::<bool>(),
-            ),
-            |(t0, t1, since, parts, len, runs)| {
+    pub fn any_hollow_batch_with_exact_runs<T: Arbitrary + Timestamp>(
+        num_runs: usize,
+    ) -> impl Strategy<Value = HollowBatch<T>> {
+        (
+            any::<T>(),
+            any::<T>(),
+            any::<T>(),
+            proptest::collection::vec(any_run_part::<T>(), num_runs + 1..20),
+            any::<usize>(),
+        )
+            .prop_map(move |(t0, t1, since, parts, len)| {
                 let (lower, upper) = if t0 <= t1 {
                     (Antichain::from_elem(t0), Antichain::from_elem(t1))
                 } else {
                     (Antichain::from_elem(t1), Antichain::from_elem(t0))
                 };
                 let since = Antichain::from_elem(since);
-                if runs && parts.len() > 2 {
-                    let split_at = parts.len() / 2;
+
+                let run_splits = (1..num_runs)
+                    .map(|i| i * parts.len() / num_runs)
+                    .collect::<Vec<_>>();
+
+                let run_meta = (0..num_runs)
+                    .map(|_| {
+                        let mut meta = RunMeta::default();
+                        meta.id = Some(RunId::new());
+                        meta
+                    })
+                    .collect::<Vec<_>>();
+
+                HollowBatch::new(
+                    Description::new(lower, upper, since),
+                    parts,
+                    len % 10,
+                    run_meta,
+                    run_splits,
+                )
+            })
+    }
+
+    pub fn any_hollow_batch<T: Arbitrary + Timestamp>() -> impl Strategy<Value = HollowBatch<T>> {
+        Strategy::prop_map(
+            (
+                any::<T>(),
+                any::<T>(),
+                any::<T>(),
+                proptest::collection::vec(any_run_part::<T>(), 0..20),
+                any::<usize>(),
+                0..=10usize,
+                proptest::collection::vec(any::<RunId>(), 10),
+            ),
+            |(t0, t1, since, parts, len, num_runs, run_ids)| {
+                let (lower, upper) = if t0 <= t1 {
+                    (Antichain::from_elem(t0), Antichain::from_elem(t1))
+                } else {
+                    (Antichain::from_elem(t1), Antichain::from_elem(t0))
+                };
+                let since = Antichain::from_elem(since);
+                if num_runs > 0 && parts.len() > 2 && num_runs < parts.len() {
+                    let run_splits = (1..num_runs)
+                        .map(|i| i * parts.len() / num_runs)
+                        .collect::<Vec<_>>();
+
+                    let run_meta = (0..num_runs)
+                        .enumerate()
+                        .map(|(i, _)| {
+                            let mut meta = RunMeta::default();
+                            meta.id = Some(run_ids[i]);
+                            meta
+                        })
+                        .collect::<Vec<_>>();
+
                     HollowBatch::new(
                         Description::new(lower, upper, since),
                         parts,
                         len % 10,
-                        vec![RunMeta::default(), RunMeta::default()],
-                        vec![split_at],
+                        run_meta,
+                        run_splits,
                     )
                 } else {
-                    HollowBatch::new_run(Description::new(lower, upper, since), parts, len % 10)
+                    HollowBatch::new_run_for_test(
+                        Description::new(lower, upper, since),
+                        parts,
+                        len % 10,
+                        run_ids[0],
+                    )
                 }
             },
         )
@@ -3718,8 +3861,12 @@ pub(crate) mod tests {
 
     #[mz_ore::test]
     fn maybe_gc_active_gc() {
-        const GC_USE_ACTIVE_GC: bool = true;
-        const GC_FALLBACK_THRESHOLD_MS: u64 = 5000;
+        const GC_CONFIG: GcConfig = GcConfig {
+            use_active_gc: true,
+            fallback_threshold_ms: 5000,
+            min_versions: 99,
+            max_versions: 500,
+        };
         let now_fn = SYSTEM_TIME.clone();
 
         let mut state = TypedState::<String, String, u64, i64>::new(
@@ -3731,14 +3878,8 @@ pub(crate) mod tests {
 
         let now = now_fn();
         // Empty state doesn't need gc, regardless of is_write.
-        assert_eq!(
-            state.maybe_gc(true, GC_USE_ACTIVE_GC, GC_FALLBACK_THRESHOLD_MS, now),
-            None
-        );
-        assert_eq!(
-            state.maybe_gc(false, GC_USE_ACTIVE_GC, GC_FALLBACK_THRESHOLD_MS, now),
-            None
-        );
+        assert_eq!(state.maybe_gc(true, now, GC_CONFIG), None);
+        assert_eq!(state.maybe_gc(false, now, GC_CONFIG), None);
 
         // Artificially advance the seqno so the seqno_since advances past our
         // internal gc_threshold.
@@ -3758,14 +3899,11 @@ pub(crate) mod tests {
             100,
             None,
         );
-        assert_eq!(
-            state.maybe_gc(false, GC_USE_ACTIVE_GC, GC_FALLBACK_THRESHOLD_MS, now),
-            None
-        );
+        assert_eq!(state.maybe_gc(false, now, GC_CONFIG), None);
 
         // A write will gc though.
         assert_eq!(
-            state.maybe_gc(true, GC_USE_ACTIVE_GC, GC_FALLBACK_THRESHOLD_MS, now),
+            state.maybe_gc(true, now, GC_CONFIG),
             Some(GcReq {
                 shard_id: state.shard_id,
                 new_seqno_since: SeqNo(100)
@@ -3781,17 +3919,14 @@ pub(crate) mod tests {
         state.seqno = SeqNo(200);
         assert_eq!(state.seqno_since(), SeqNo(200));
 
-        assert_eq!(
-            state.maybe_gc(true, GC_USE_ACTIVE_GC, GC_FALLBACK_THRESHOLD_MS, now),
-            None
-        );
+        assert_eq!(state.maybe_gc(true, now, GC_CONFIG), None);
 
         state.seqno = SeqNo(300);
         assert_eq!(state.seqno_since(), SeqNo(300));
         // But if we advance the time past the threshold, we will gc.
-        let new_now = now + GC_FALLBACK_THRESHOLD_MS + 1;
+        let new_now = now + GC_CONFIG.fallback_threshold_ms + 1;
         assert_eq!(
-            state.maybe_gc(true, GC_USE_ACTIVE_GC, GC_FALLBACK_THRESHOLD_MS, new_now),
+            state.maybe_gc(true, new_now, GC_CONFIG),
             Some(GcReq {
                 shard_id: state.shard_id,
                 new_seqno_since: SeqNo(300)
@@ -3804,7 +3939,7 @@ pub(crate) mod tests {
         state.seqno = SeqNo(301);
         assert_eq!(state.seqno_since(), SeqNo(301));
         assert_eq!(
-            state.maybe_gc(true, GC_USE_ACTIVE_GC, GC_FALLBACK_THRESHOLD_MS, new_now),
+            state.maybe_gc(true, new_now, GC_CONFIG),
             Some(GcReq {
                 shard_id: state.shard_id,
                 new_seqno_since: SeqNo(301)
@@ -3823,18 +3958,36 @@ pub(crate) mod tests {
         // If there are no writers, even a non-write will gc.
         let _ = state.collections.expire_writer(&writer_id);
         assert_eq!(
-            state.maybe_gc(false, GC_USE_ACTIVE_GC, GC_FALLBACK_THRESHOLD_MS, now),
+            state.maybe_gc(false, now, GC_CONFIG),
             Some(GcReq {
                 shard_id: state.shard_id,
                 new_seqno_since: SeqNo(400)
+            })
+        );
+
+        // Upper-bound the number of seqnos we'll attempt to collect in one go.
+        let previous_seqno = state.seqno;
+        state.seqno = SeqNo(10_000);
+        assert_eq!(state.seqno_since(), SeqNo(10_000));
+
+        let now = now_fn();
+        assert_eq!(
+            state.maybe_gc(true, now, GC_CONFIG),
+            Some(GcReq {
+                shard_id: state.shard_id,
+                new_seqno_since: SeqNo(previous_seqno.0 + u64::cast_from(GC_CONFIG.max_versions))
             })
         );
     }
 
     #[mz_ore::test]
     fn maybe_gc_classic() {
-        const GC_USE_ACTIVE_GC: bool = false;
-        const GC_FALLBACK_THRESHOLD_MS: u64 = 5000;
+        const GC_CONFIG: GcConfig = GcConfig {
+            use_active_gc: false,
+            fallback_threshold_ms: 5000,
+            min_versions: 16,
+            max_versions: 128,
+        };
         const NOW_MS: u64 = 0;
 
         let mut state = TypedState::<String, String, u64, i64>::new(
@@ -3845,14 +3998,8 @@ pub(crate) mod tests {
         );
 
         // Empty state doesn't need gc, regardless of is_write.
-        assert_eq!(
-            state.maybe_gc(true, GC_USE_ACTIVE_GC, GC_FALLBACK_THRESHOLD_MS, NOW_MS),
-            None
-        );
-        assert_eq!(
-            state.maybe_gc(false, GC_USE_ACTIVE_GC, GC_FALLBACK_THRESHOLD_MS, NOW_MS),
-            None
-        );
+        assert_eq!(state.maybe_gc(true, NOW_MS, GC_CONFIG), None);
+        assert_eq!(state.maybe_gc(false, NOW_MS, GC_CONFIG), None);
 
         // Artificially advance the seqno so the seqno_since advances past our
         // internal gc_threshold.
@@ -3873,14 +4020,11 @@ pub(crate) mod tests {
             100,
             None,
         );
-        assert_eq!(
-            state.maybe_gc(false, GC_USE_ACTIVE_GC, GC_FALLBACK_THRESHOLD_MS, NOW_MS),
-            None
-        );
+        assert_eq!(state.maybe_gc(false, NOW_MS, GC_CONFIG), None);
 
         // A write will gc though.
         assert_eq!(
-            state.maybe_gc(true, GC_USE_ACTIVE_GC, GC_FALLBACK_THRESHOLD_MS, NOW_MS),
+            state.maybe_gc(true, NOW_MS, GC_CONFIG),
             Some(GcReq {
                 shard_id: state.shard_id,
                 new_seqno_since: SeqNo(100)
@@ -3895,7 +4039,7 @@ pub(crate) mod tests {
         // If there are no writers, even a non-write will gc.
         let _ = state.collections.expire_writer(&writer_id);
         assert_eq!(
-            state.maybe_gc(false, GC_USE_ACTIVE_GC, GC_FALLBACK_THRESHOLD_MS, NOW_MS),
+            state.maybe_gc(false, NOW_MS, GC_CONFIG),
             Some(GcReq {
                 shard_id: state.shard_id,
                 new_seqno_since: SeqNo(200)
@@ -4224,6 +4368,7 @@ pub(crate) mod tests {
     /// This golden will have to be updated each time we change State, but
     /// that's a feature, not a bug.
     #[mz_ore::test]
+    #[cfg_attr(miri, ignore)] // too slow
     fn state_inspect_serde_json() {
         const STATE_SERDE_JSON: &str = include_str!("state_serde.json");
         let mut runner = proptest::test_runner::TestRunner::deterministic();
@@ -4278,5 +4423,14 @@ pub(crate) mod tests {
         // Downgrade to v0.9.0 is _NOT_ allowed.
         let res = open_and_write(&mut clients, Version::new(0, 9, 0), shard_id).await;
         assert!(res.unwrap_err().is_panic());
+    }
+
+    #[mz_ore::test]
+    fn runid_roundtrip() {
+        proptest!(|(runid: RunId)| {
+            let runid_str = runid.to_string();
+            let parsed = RunId::from_str(&runid_str);
+            prop_assert_eq!(parsed, Ok(runid));
+        });
     }
 }

@@ -214,7 +214,7 @@ pub(crate) fn render<G: Scope<Timestamp = MzOffset>>(
     // feedback edge specifically having a default conncetion would result in a loop.
     let mut snapshot_input = builder.new_disconnected_input(&feedback_data, Pipeline);
 
-    // The export id must be sent to all workes, so we broadcast the feedback connection
+    // The export id must be sent to all workers, so we broadcast the feedback connection
     snapshot.broadcast().connect_loop(feedback_handle);
 
     let is_snapshot_leader = config.responsible_for("snapshot_leader");
@@ -554,7 +554,11 @@ pub(crate) fn render<G: Scope<Timestamp = MzOffset>>(
     let mut text_row = Row::default();
     let mut final_row = Row::default();
     let mut datum_vec = DatumVec::new();
-    let mut next_worker = (0..u64::cast_from(scope.peers())).cycle();
+    let mut next_worker = (0..u64::cast_from(scope.peers()))
+        // Round robin on 1000-records basis to avoid creating tiny containers when there are a
+        // small number of updates and a large number of workers.
+        .flat_map(|w| std::iter::repeat_n(w, 1000))
+        .cycle();
     let round_robin = Exchange::new(move |_| next_worker.next().unwrap());
     let snapshot_updates = raw_data
         .map::<Vec<_>, _, _>(Clone::clone)

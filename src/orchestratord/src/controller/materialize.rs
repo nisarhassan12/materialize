@@ -263,10 +263,6 @@ impl Context {
                 config.aws_info.aws_account_id.is_some(),
                 "--aws-account-id is required when using --cloud-provider=aws"
             );
-            assert!(
-                config.aws_info.environmentd_iam_role_arn.is_some(),
-                "--environmentd-iam-role-arn is required when using --cloud-provider=aws"
-            );
         }
 
         Self {
@@ -286,7 +282,7 @@ impl Context {
             needs_update_set.remove(&mz.name_unchecked());
         }
         self.metrics
-            .needs_update
+            .environmentd_needs_update
             .set(u64::cast_from(needs_update_set.len()));
     }
 

@@ -13,11 +13,11 @@ the expected-result/actual-result (aka golden testing) paradigm. A query is
 retried until it produces the desired result.
 """
 import glob
-from pathlib import Path
+import os
 
 from materialize import MZ_ROOT, ci_util, spawn
 from materialize.mzcompose.composition import Composition, WorkflowArgumentParser
-from materialize.mzcompose.services.azure import Azurite
+from materialize.mzcompose.services.azurite import Azurite
 from materialize.mzcompose.services.fivetran_destination import FivetranDestination
 from materialize.mzcompose.services.kafka import Kafka
 from materialize.mzcompose.services.materialized import Materialized
@@ -34,8 +34,6 @@ from materialize.mzcompose.services.schema_registry import SchemaRegistry
 from materialize.mzcompose.services.testdrive import Testdrive
 from materialize.mzcompose.services.zookeeper import Zookeeper
 from materialize.source_table_migration import (
-    get_new_image_for_source_table_migration_test,
-    get_old_image_for_source_table_migration_test,
     verify_sources_after_source_table_migration,
 )
 
@@ -77,7 +75,7 @@ def workflow_default(c: Composition, parser: WorkflowArgumentParser) -> None:
         "--default-size",
         type=int,
         default=Materialized.Size.DEFAULT_SIZE,
-        help="Use SIZE 'N-N' for replicas and SIZE 'N' for sources",
+        help="Use SIZE 'scale=N,workers=N' for replicas and SIZE 'scale=N,workers=1' for sources",
     )
     parser.add_argument(
         "--system-param",
@@ -216,31 +214,27 @@ def workflow_default(c: Composition, parser: WorkflowArgumentParser) -> None:
             )
 
         junit_report = ci_util.junit_report_filename(c.name)
+        print(f"Passing through arguments to testdrive {passthrough_args}\n")
 
-        try:
-            junit_report = ci_util.junit_report_filename(c.name)
-            print(f"Passing through arguments to testdrive {passthrough_args}\n")
-
-            # do not set default args, they should be set in the td file using set-arg-default to easen the execution
-            # without mzcompose
-            def process(file: str) -> None:
-                c.run_testdrive_files(
-                    (
-                        "--rewrite-results"
-                        if args.rewrite_results
-                        else f"--junit-report={junit_report}"
-                    ),
-                    *non_default_testdrive_vars,
-                    *passthrough_args,
-                    file,
-                )
-
-            c.test_parts(args.files, process)
-            c.sanity_restart_mz()
-        finally:
-            ci_util.upload_junit_report(
-                "testdrive", Path(__file__).parent / junit_report
+        # do not set default args, they should be set in the td file using set-arg-default to easen the execution
+        # without mzcompose
+        def process(file: str) -> None:
+            c.run_testdrive_files(
+                (
+                    "--rewrite-results"
+                    if args.rewrite_results
+                    else f"--junit-report={junit_report}"
+                ),
+                *non_default_testdrive_vars,
+                *passthrough_args,
+                file,
+                persistent=False,
             )
+            # Uploading successful junit files wastes time and contains no useful information
+            os.remove(f"test/testdrive-old-kafka-src-syntax/{junit_report}")
+
+        c.test_parts(args.files, process)
+        c.sanity_restart_mz()
 
 
 def workflow_migration(c: Composition, parser: WorkflowArgumentParser) -> None:
@@ -312,6 +306,7 @@ def workflow_migration(c: Composition, parser: WorkflowArgumentParser) -> None:
         for file in matching_files
         if file != "session.td" and file != "status-history.td"
     ]
+    matching_files: list[str] = sorted(matching_files)
 
     dependencies = [
         "fivetran-destination",
@@ -343,7 +338,6 @@ def workflow_migration(c: Composition, parser: WorkflowArgumentParser) -> None:
 
     mz_old = Materialized(
         default_size=Materialized.Size.DEFAULT_SIZE,
-        image=get_old_image_for_source_table_migration_test(),
         external_blob_store=True,
         blob_store_is_azure=args.azurite,
         additional_system_parameter_defaults=dict(additional_system_parameter_defaults),
@@ -369,7 +363,6 @@ def workflow_migration(c: Composition, parser: WorkflowArgumentParser) -> None:
 
     mz_new = Materialized(
         default_size=Materialized.Size.DEFAULT_SIZE,
-        image=get_new_image_for_source_table_migration_test(),
         external_blob_store=True,
         blob_store_is_azure=args.azurite,
         additional_system_parameter_defaults=additional_system_parameter_defaults,
@@ -377,6 +370,7 @@ def workflow_migration(c: Composition, parser: WorkflowArgumentParser) -> None:
 
     for file in matching_files:
         with c.override(testdrive, mz_old):
+            c.rm("testdrive")
             c.up(*dependencies)
 
             c.sql(
@@ -435,11 +429,13 @@ def workflow_migration(c: Composition, parser: WorkflowArgumentParser) -> None:
                 *non_default_testdrive_vars,
                 "--no-reset",
                 file,
+                persistent=False,
             )
 
             c.kill("materialized", wait=True)
 
-            with c.override(mz_new):
+            with c.override(testdrive, mz_new):
+                c.rm("testdrive")
                 c.up("materialized")
 
                 print("Running mz_new")
@@ -460,11 +456,9 @@ def workflow_migration(c: Composition, parser: WorkflowArgumentParser) -> None:
                 c.rm(METADATA_STORE)
                 c.rm("postgres")
                 c.rm("mysql")
-
                 # remove the testdrive container which uses the mzdata volume
                 testdrive_container_id = spawn.capture(
                     ["docker", "ps", "-a", "--filter", f"volume={c.name}_mzdata", "-q"]
                 ).strip()
                 spawn.runv(["docker", "rm", testdrive_container_id])
-
                 c.rm_volumes("mzdata", force=True)

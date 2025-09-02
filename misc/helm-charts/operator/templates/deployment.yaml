@@ -25,6 +25,10 @@ spec:
       labels:
         {{- include "materialize-operator.selectorLabels" . | nindent 8 }}
     spec:
+      securityContext:
+        fsGroup: 999
+        runAsGroup: 999
+        runAsUser: 999
       serviceAccountName: {{ include "materialize-operator.serviceAccountName" . }}
       {{- if .Values.operator.nodeSelector }}
       nodeSelector:
@@ -57,7 +61,9 @@ spec:
         {{- if .Values.operator.args.enableInternalStatementLogging }}
         - "--enable-internal-statement-logging"
         {{- end }}
+        {{- if not .Values.operator.args.enableLicenseKeyChecks }}
         - "--disable-license-key-checks"
+        {{- end }}
 
         {{/* AWS Configuration */}}
         {{- if eq .Values.operator.cloudProvider.type "aws" }}
@@ -220,5 +226,22 @@ spec:
         {{- if .Values.schedulerName }}
         - "--scheduler-name={{ .Values.schedulerName }}"
         {{- end }}
+
+        {{- if .Values.operator.additionalMaterializeCRDColumns }}
+        - >
+          --additional-crd-columns={{ toJson .Values.operator.additionalMaterializeCRDColumns }}
+        {{- end }}
+        ports:
+        - containerPort: 3100
+          name: metrics
         resources:
           {{- toYaml .Values.operator.resources | nindent 10 }}
+        securityContext:
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop:
+              - ALL
+          privileged: false
+          runAsNonRoot: true
+          seccompProfile:
+            type: RuntimeDefault

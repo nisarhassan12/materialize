@@ -405,6 +405,7 @@ pub trait StorageController: Debug {
         instance_id: StorageInstanceId,
         replica_id: ReplicaId,
         location: ClusterReplicaLocation,
+        enable_ctp: bool,
     );
 
     /// Disconnects the storage instance from the specified replica.
@@ -477,13 +478,6 @@ pub trait StorageController: Debug {
         &mut self,
         ingestion_id: GlobalId,
         source_desc: &SourceDesc,
-    ) -> Result<(), StorageError<Self::Timestamp>>;
-
-    /// Alters the identified collection to use the provided [`SourceDesc`].
-    async fn alter_ingestion_source_desc(
-        &mut self,
-        ingestion_id: GlobalId,
-        source_desc: SourceDesc,
     ) -> Result<(), StorageError<Self::Timestamp>>;
 
     /// Alters each identified collection to use the correlated [`GenericSourceConnection`].

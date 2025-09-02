@@ -428,6 +428,10 @@ impl AdapterError {
             AdapterError::AlterClusterTimeout => Some(
                 "Consider increasing the timeout duration in the alter cluster statement.".into(),
             ),
+            AdapterError::DDLTransactionRace => Some(
+                "Currently, DDL transactions fail when any other DDL happens concurrently, \
+                 even on unrelated schemas/clusters.".into()
+            ),
             _ => None,
         }
     }
@@ -528,9 +532,10 @@ impl AdapterError {
                 OptimizerError::TransformError(_) => SqlState::INTERNAL_ERROR,
                 OptimizerError::UnmaterializableFunction(_) => SqlState::FEATURE_NOT_SUPPORTED,
                 OptimizerError::UncallableFunction { .. } => SqlState::FEATURE_NOT_SUPPORTED,
+                OptimizerError::UnsupportedTemporalExpression(_) => SqlState::FEATURE_NOT_SUPPORTED,
                 // This should be handled by peek optimization, so it's an internal error if it
                 // reaches the user.
-                OptimizerError::UnsafeMfpPlan => SqlState::INTERNAL_ERROR,
+                OptimizerError::InternalUnsafeMfpPlan(_) => SqlState::INTERNAL_ERROR,
             },
             AdapterError::UnallowedOnCluster { .. } => {
                 SqlState::S_R_E_PROHIBITED_SQL_STATEMENT_ATTEMPTED
@@ -751,9 +756,9 @@ impl fmt::Display for AdapterError {
             AdapterError::DDLOnlyTransaction => f.write_str(
                 "transactions which modify objects are restricted to just modifying objects",
             ),
-            AdapterError::DDLTransactionRace => {
-                f.write_str("object state changed while transaction was in progress")
-            }
+            AdapterError::DDLTransactionRace => f.write_str(
+                "another session modified the catalog while this DDL transaction was open",
+            ),
             AdapterError::TransactionDryRun { .. } => f.write_str("transaction dry run"),
             AdapterError::Storage(e) => e.fmt(f),
             AdapterError::Compute(e) => e.fmt(f),
@@ -896,6 +901,7 @@ impl From<OptimizerError> for AdapterError {
             PlanError(e) => Self::PlanError(e),
             RecursionLimitError(e) => Self::RecursionLimit(e),
             EvalError(e) => Self::Eval(e),
+            InternalUnsafeMfpPlan(e) => Self::Internal(e),
             Internal(e) => Self::Internal(e),
             e => Self::Optimizer(e),
         }

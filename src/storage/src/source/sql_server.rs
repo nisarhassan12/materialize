@@ -56,6 +56,8 @@ struct SourceOutputInfo {
     resume_upper: Antichain<Lsn>,
     /// An index to split the timely stream.
     partition_index: u64,
+    /// The basis for the resumption LSN when snapshotting.
+    initial_lsn: Lsn,
 }
 
 #[derive(Debug, Clone, thiserror::Error)]
@@ -72,8 +74,6 @@ pub enum TransientError {
     ReplicationEOF,
     #[error(transparent)]
     SqlServer(#[from] SqlServerError),
-    #[error("programming error: {0}")]
-    ProgrammingError(String),
     #[error(transparent)]
     Generic(#[from] anyhow::Error),
 }
@@ -86,6 +86,8 @@ pub enum DefiniteError {
     Decoding(String),
     #[error("programming error: {0}")]
     ProgrammingError(String),
+    #[error("Restore history id changed from {0:?} to {1:?}")]
+    RestoreHistoryChanged(Option<i32>, Option<i32>),
 }
 
 impl From<DefiniteError> for DataflowError {
@@ -151,6 +153,7 @@ impl SourceRender for SqlServerSource {
                 decoder: Arc::new(decoder),
                 resume_upper: Antichain::from_iter(resume_upper),
                 partition_index: u64::cast_from(idx),
+                initial_lsn: details.initial_lsn,
             };
             source_outputs.insert(*id, output_info);
         }
@@ -162,12 +165,13 @@ impl SourceRender for SqlServerSource {
             self.clone(),
         );
 
-        let (progress_stats, progress_errs, progress_token) = progress::render(
+        let (progress_stats, progress_errs, progress_probes, progress_token) = progress::render(
             scope.clone(),
             config.clone(),
             self.connection.clone(),
             source_outputs.clone(),
             resume_uppers,
+            self.extras.clone(),
         );
 
         let partition_count = u64::cast_from(config.source_exports.len());
@@ -215,7 +219,7 @@ impl SourceRender for SqlServerSource {
             uppers,
             health,
             stats,
-            None,
+            Some(progress_probes),
             vec![repl_token, progress_token],
         )
     }

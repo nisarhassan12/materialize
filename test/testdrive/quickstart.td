@@ -10,13 +10,16 @@
 # This test verifies the Quickstart page works: https://materialize.com/docs/get-started/quickstart/
 # Uses shared compute+storage cluster
 
+$ set-sql-timeout duration=60s
+
 $ postgres-execute connection=postgres://mz_system:materialize@${testdrive.materialize-internal-sql-addr}
 ALTER SYSTEM SET enable_create_table_from_source = true
 
-> CREATE CLUSTER quickstart_tutorial REPLICAS (r1 (SIZE '4'));
+> CREATE CLUSTER quickstart_tutorial REPLICAS (r1 (SIZE 'scale=1,workers=4'));
 
 > SET CLUSTER = quickstart_tutorial
 
+> BEGIN
 > CREATE SOURCE auction_house
   IN CLUSTER quickstart_tutorial
   FROM LOAD GENERATOR AUCTION
@@ -27,6 +30,7 @@ ALTER SYSTEM SET enable_create_table_from_source = true
 > CREATE TABLE bids FROM SOURCE auction_house (REFERENCE bids);
 > CREATE TABLE organizations FROM SOURCE auction_house (REFERENCE organizations);
 > CREATE TABLE users FROM SOURCE auction_house (REFERENCE users);
+> COMMIT
 
 > SHOW SOURCES
 name                   type            cluster                comment

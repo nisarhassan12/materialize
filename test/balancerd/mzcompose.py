@@ -30,7 +30,7 @@ from psycopg import Cursor
 from psycopg.errors import OperationalError, ProgramLimitExceeded, ProgrammingError
 
 from materialize import MZ_ROOT
-from materialize.mzcompose.composition import Composition
+from materialize.mzcompose.composition import Composition, Service
 from materialize.mzcompose.services.balancerd import Balancerd
 from materialize.mzcompose.services.frontegg import FronteggMock
 from materialize.mzcompose.services.materialized import Materialized
@@ -643,8 +643,12 @@ def workflow_many_connections(c: Composition) -> None:
 
 
 def workflow_webhook(c: Composition) -> None:
-    c.up("balancerd", "frontegg-mock", "materialized")
-    c.up("testdrive", persistent=True)
+    c.up(
+        "balancerd",
+        "frontegg-mock",
+        "materialized",
+        Service("testdrive", idle=True),
+    )
 
     grant_all_admin_user(c)
 

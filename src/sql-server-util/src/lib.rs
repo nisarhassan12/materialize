@@ -17,6 +17,7 @@ use anyhow::Context;
 use derivative::Derivative;
 use futures::future::BoxFuture;
 use futures::{FutureExt, Stream, StreamExt, TryStreamExt};
+use mz_ore::netio::DUMMY_DNS_PORT;
 use mz_ore::result::ResultExt;
 use mz_repr::ScalarType;
 use smallvec::{SmallVec, smallvec};
@@ -34,6 +35,7 @@ pub mod inspect;
 pub use config::Config;
 pub use desc::{ProtoSqlServerColumnDesc, ProtoSqlServerTableDesc};
 
+use crate::cdc::Lsn;
 use crate::config::TunnelConfig;
 use crate::desc::SqlServerColumnDecodeType;
 
@@ -42,6 +44,8 @@ use crate::desc::SqlServerColumnDecodeType;
 #[derive(Debug)]
 pub struct Client {
     tx: UnboundedSender<Request>,
+    // The configuration used to create this client.
+    config: Config,
 }
 // While a Client could implement Clone, it's not obvious how multiple Clients
 // using the same SQL Server connection would interact, so ban it for now.
@@ -84,12 +88,28 @@ impl Client {
 
                 (tcp, Some(Box::new(tunnel)))
             }
-            TunnelConfig::AwsPrivatelink { connection_id: _ } => {
-                // TODO(sql_server2): Getting this right is tricky because
-                // there is some subtle logic with hostname validation.
-                return Err(SqlServerError::Generic(anyhow::anyhow!(
-                    "Support PrivateLink connections"
-                )));
+            TunnelConfig::AwsPrivatelink {
+                connection_id,
+                port,
+            } => {
+                let privatelink_host = mz_cloud_resources::vpc_endpoint_name(*connection_id);
+                let mut privatelink_addrs =
+                    tokio::net::lookup_host((privatelink_host.clone(), DUMMY_DNS_PORT)).await?;
+
+                let Some(mut addr) = privatelink_addrs.next() else {
+                    return Err(SqlServerError::InvariantViolated(format!(
+                        "aws privatelink: no addresses found for host {:?}",
+                        privatelink_host
+                    )));
+                };
+
+                addr.set_port(port.clone());
+
+                let tcp = TcpStream::connect(addr)
+                    .await
+                    .context(format!("aws privatelink {:?}", addr))?;
+
+                (tcp, None)
             }
         };
 
@@ -103,18 +123,24 @@ impl Client {
         Ok(client)
     }
 
+    /// Create a new Client instance with the same configuration that created
+    /// this configuration.
+    pub async fn new_connection(&self) -> Result<Self, SqlServerError> {
+        Self::connect(self.config.clone()).await
+    }
+
     pub async fn connect_raw(
         config: Config,
         tcp: tokio::net::TcpStream,
         resources: Option<Box<dyn Any + Send + Sync>>,
     ) -> Result<(Self, Connection), SqlServerError> {
-        let client = tiberius::Client::connect(config.inner, tcp.compat_write()).await?;
+        let client = tiberius::Client::connect(config.inner.clone(), tcp.compat_write()).await?;
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
 
         // TODO(sql_server2): Add a lot more logging here like the Postgres and MySQL clients have.
 
         Ok((
-            Client { tx },
+            Client { tx, config },
             Connection {
                 rx,
                 client,
@@ -356,6 +382,69 @@ impl<'a> Transaction<'a> {
         }
     }
 
+    /// Creates a savepoint via `SAVE TRANSACTION` with the provided name.
+    /// Creating a savepoint forces a write to the transaction log, which will associate an
+    /// [`Lsn`] with the current transaction.
+    ///
+    /// The savepoint name must follow rules for SQL Server identifiers
+    /// - starts with letter or underscore
+    /// - only contains letters, digits, and underscores
+    /// - no reserved words
+    /// - 32 char max
+    pub async fn create_savepoint(&mut self, savepoint_name: &str) -> Result<(), SqlServerError> {
+        // Limit the name checks to prevent sending a potentially dangerous string to the SQL Server.
+        // We prefer the server do the majority of the validation.
+        if savepoint_name.is_empty()
+            || !savepoint_name
+                .chars()
+                .all(|c| c.is_alphanumeric() || c == '_')
+        {
+            Err(SqlServerError::ProgrammingError(format!(
+                "Invalid savepoint name: '{savepoint_name}"
+            )))?;
+        }
+
+        let stmt = format!("SAVE TRANSACTION [{savepoint_name}]");
+        let _result = self.client.simple_query(stmt).await?;
+        Ok(())
+    }
+
+    /// Retrieve the [`Lsn`] associated with the current session.
+    ///
+    /// MS SQL Server will not assign an [`Lsn`] until a write is performed (e.g. via `SAVE TRANSACTION`).
+    pub async fn get_lsn(&mut self) -> Result<Lsn, SqlServerError> {
+        static CURRENT_LSN_QUERY: &str = "SELECT dt.database_transaction_most_recent_savepoint_lsn \
+            FROM sys.dm_tran_database_transactions dt \
+            JOIN sys.dm_tran_current_transaction ct \
+                ON ct.transaction_id = dt.transaction_id \
+            WHERE dt.database_transaction_most_recent_savepoint_lsn IS NOT NULL";
+        let result = self.client.simple_query(CURRENT_LSN_QUERY).await?;
+        crate::inspect::parse_numeric_lsn(&result)
+    }
+
+    /// Lock the provided table to prevent writes but allow reads, uses `(TABLOCK, HOLDLOCK)`.
+    ///
+    /// This will set the transaction isolation level to `READ COMMITTED` and then obtain the
+    /// lock using a `SELECT` statement that will not read any data from the table.
+    /// The lock is released after transaction commit or rollback.
+    pub async fn lock_table_shared(
+        &mut self,
+        schema: &str,
+        table: &str,
+    ) -> Result<(), SqlServerError> {
+        // Locks in MS SQL server do not behave the same way under all isolation levels. In testing,
+        // it has been observed that if the isolation level is SNAPSHOT, these locks are ineffective.
+        static SET_READ_COMMITTED: &str = "SET TRANSACTION ISOLATION LEVEL READ COMMITTED;";
+        // This query probably seems odd, but there is no LOCK command in MS SQL. Locks are specified
+        // in SELECT using the WITH keyword.  This query does not need to return any rows to lock the table,
+        // hence the 1=0, which is something short that always evaluates to false in this universe.
+        let query = format!(
+            "{SET_READ_COMMITTED}\nSELECT * FROM [{schema}].[{table}] WITH (TABLOCK, HOLDLOCK) WHERE 1=0;"
+        );
+        let _result = self.client.simple_query(query).await?;
+        Ok(())
+    }
+
     /// See [`Client::execute`].
     pub async fn execute<'q>(
         &mut self,
@@ -549,9 +638,6 @@ impl Connection {
                 let result = client.execute(query, &params[..]).await?;
 
                 match result.rows_affected() {
-                    [] => Err(SqlServerError::InvariantViolated(
-                        "got empty response".into(),
-                    )),
                     rows_affected => {
                         let response = Response::Execute {
                             rows_affected: rows_affected.into(),
@@ -765,6 +851,13 @@ pub enum SqlServerError {
     Generic(#[from] anyhow::Error),
     #[error("programming error! {0}")]
     ProgrammingError(String),
+    #[error(
+        "insufficient permissions for tables [{tables}] or capture instances [{capture_instances}]"
+    )]
+    AuthorizationError {
+        tables: String,
+        capture_instances: String,
+    },
 }
 
 /// Errors returned from decoding SQL Server rows.

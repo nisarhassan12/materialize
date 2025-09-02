@@ -8,7 +8,6 @@
 # by the Apache License, Version 2.0.
 
 $ set-sql-timeout duration=1s
-$ set-max-tries max-tries=5
 
 $ set-arg-default single-replica-cluster=quickstart
 
@@ -231,7 +230,7 @@ contains:cannot show indexes on materialize.public.foo_primary_idx because it is
 
 > SET CLUSTER TO quickstart
 
-> CREATE CLUSTER clstr REPLICAS (r1 (SIZE '1'))
+> CREATE CLUSTER clstr REPLICAS (r1 (SIZE 'scale=1,workers=1'))
 > CREATE DEFAULT INDEX IN CLUSTER clstr ON foo;
 > SET CLUSTER TO mz_catalog_server
 > SHOW INDEXES IN CLUSTER clstr WHERE on = 'foo'
@@ -379,7 +378,7 @@ pg_description_all_databases_ind                            pg_description_all_d
 pg_namespace_all_databases_ind                              pg_namespace_all_databases                   mz_catalog_server    {nspname}                                   ""
 pg_type_all_databases_ind                                   pg_type_all_databases                        mz_catalog_server    {oid}                                       ""
 
-?[13100<version<14800] SHOW INDEXES IN CLUSTER mz_catalog_server
+>[13100<version<14900] SHOW INDEXES IN CLUSTER mz_catalog_server
 mz_active_peeks_per_worker_s2_primary_idx                   mz_active_peeks_per_worker                   mz_catalog_server    {id,worker_id}                              ""
 mz_arrangement_batches_raw_s2_primary_idx                   mz_arrangement_batches_raw                   mz_catalog_server    {operator_id,worker_id}                     ""
 mz_arrangement_records_raw_s2_primary_idx                   mz_arrangement_records_raw                   mz_catalog_server    {operator_id,worker_id}                     ""
@@ -483,7 +482,7 @@ pg_description_all_databases_ind                            pg_description_all_d
 pg_namespace_all_databases_ind                              pg_namespace_all_databases                   mz_catalog_server    {nspname}                                   ""
 pg_type_all_databases_ind                                   pg_type_all_databases                        mz_catalog_server    {oid}                                       ""
 
->[version>=14800] SHOW INDEXES IN CLUSTER mz_catalog_server
+>[version>=14900] SHOW INDEXES IN CLUSTER mz_catalog_server
 mz_active_peeks_per_worker_s2_primary_idx                   mz_active_peeks_per_worker                   mz_catalog_server    {id,worker_id}                              ""
 mz_arrangement_batches_raw_s2_primary_idx                   mz_arrangement_batches_raw                   mz_catalog_server    {operator_id,worker_id}                     ""
 mz_arrangement_records_raw_s2_primary_idx                   mz_arrangement_records_raw                   mz_catalog_server    {operator_id,worker_id}                     ""

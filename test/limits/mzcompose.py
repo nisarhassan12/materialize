@@ -24,7 +24,11 @@ from textwrap import dedent
 from urllib.parse import quote
 
 from materialize import MZ_ROOT, buildkite
-from materialize.mzcompose.composition import Composition, WorkflowArgumentParser
+from materialize.mzcompose.composition import (
+    Composition,
+    Service,
+    WorkflowArgumentParser,
+)
 from materialize.mzcompose.services.balancerd import Balancerd
 from materialize.mzcompose.services.clusterd import Clusterd
 from materialize.mzcompose.services.cockroach import Cockroach
@@ -35,6 +39,10 @@ from materialize.mzcompose.services.mysql import MySql
 from materialize.mzcompose.services.mz import Mz
 from materialize.mzcompose.services.postgres import Postgres
 from materialize.mzcompose.services.schema_registry import SchemaRegistry
+from materialize.mzcompose.services.sql_server import (
+    SqlServer,
+    setup_sql_server_testing,
+)
 from materialize.mzcompose.services.test_certs import TestCerts
 from materialize.mzcompose.services.testdrive import Testdrive
 from materialize.mzcompose.services.zookeeper import Zookeeper
@@ -220,6 +228,26 @@ class Indexes(Generator):
         for i in cls.all():
             cls.store_explain_and_run(f"SELECT f{i} FROM t")
             print(f"{i}")
+
+
+class IndexedViews(Generator):
+    MAX_COUNT = 1000  # TODO: Bump when https://github.com/MaterializeInc/database-issues/issues/9307 is fixed
+
+    @classmethod
+    def body(cls) -> None:
+        print("$ postgres-execute connection=mz_system")
+        print(f"ALTER SYSTEM SET max_objects_per_schema = {cls.COUNT * 10};")
+        print(
+            "> CREATE TABLE t (f0 INTEGER, f1 INTEGER, f2 INTEGER, f3 INTEGER, f4 INTEGER, f5 INTEGER, f6 INTEGER, f7 INTEGER);"
+        )
+        print("> INSERT INTO t VALUES (0, 1, 2, 3, 4, 5, 6, 7);")
+
+        for i in cls.all():
+            print(f"> CREATE VIEW v{i} AS SELECT * FROM t;")
+            print(f"> CREATE DEFAULT INDEX i{i} ON v{i}")
+        for i in cls.all():
+            cls.store_explain_and_run(f"SELECT *, {i} FROM v{i}")
+            print(f"0 1 2 3 4 5 6 7 {i}")
 
 
 class KafkaTopics(Generator):
@@ -1507,7 +1535,7 @@ class RowsJoinOuter(Generator):
 
 
 class PostgresSources(Generator):
-    COUNT = 300  # high memory consumption, slower  with source tables
+    COUNT = 300  # high memory consumption, slower with source tables
     MAX_COUNT = 600  # Too long-running with count=1200
 
     @classmethod
@@ -1691,6 +1719,64 @@ class MySqlSources(Generator):
             print(f"{i}")
 
 
+class SqlServerSources(Generator):
+    COUNT = 300
+
+    MAX_COUNT = 400  # Too long-running with count=450
+
+    @classmethod
+    def body(cls) -> None:
+        print("$ set-sql-timeout duration=300s")
+        print("$ postgres-execute connection=mz_system")
+        print(f"ALTER SYSTEM SET max_sources = {cls.COUNT * 10};")
+        print("$ postgres-execute connection=mz_system")
+        print(f"ALTER SYSTEM SET max_objects_per_schema = {cls.COUNT * 10};")
+        print("$ postgres-execute connection=mz_system")
+        print(f"ALTER SYSTEM SET max_tables = {cls.COUNT * 10};")
+        print("$ sql-server-connect name=sql-server")
+        print(
+            f"server=tcp:sql-server,1433;IntegratedSecurity=true;TrustServerCertificate=true;User ID={SqlServer.DEFAULT_USER};Password={SqlServer.DEFAULT_SA_PASSWORD}"
+        )
+        print("$ sql-server-execute name=sql-server")
+        print("USE test;")
+        for i in cls.all():
+            print(
+                f"IF EXISTS (SELECT 1 FROM cdc.change_tables WHERE capture_instance = 'dbo_t{i}') BEGIN EXEC sys.sp_cdc_disable_table @source_schema = 'dbo', @source_name = 't{i}', @capture_instance = 'dbo_t{i}'; END"
+            )
+            print(f"DROP TABLE IF EXISTS t{i};")
+            print(f"CREATE TABLE t{i} (c int);")
+            print(
+                f"EXEC sys.sp_cdc_enable_table @source_schema = 'dbo', @source_name = 't{i}', @role_name = 'SA', @supports_net_changes = 0;"
+            )
+            print(f"INSERT INTO t{i} VALUES ({i});")
+        print(
+            f"> CREATE SECRET IF NOT EXISTS sqlserverpass AS '{SqlServer.DEFAULT_SA_PASSWORD}'"
+        )
+        print(
+            f"""> CREATE CONNECTION sqlserver TO SQL SERVER (
+                HOST 'sql-server',
+                DATABASE test,
+                USER {SqlServer.DEFAULT_USER},
+                PASSWORD SECRET sqlserverpass
+            )"""
+        )
+        for i in cls.all():
+            print(
+                f"""> CREATE SOURCE m{i}
+              IN CLUSTER single_replica_cluster
+              FROM SQL SERVER CONNECTION sqlserver
+              """
+            )
+            print(
+                f"""> CREATE TABLE t{i}
+              FROM SOURCE m{i} (REFERENCE t{i})
+              """
+            )
+        for i in cls.all():
+            cls.store_explain_and_run(f"SELECT * FROM t{i}")
+            print(f"{i}")
+
+
 class WebhookSources(Generator):
     COUNT = 100  # TODO: Remove when database-issues#8508 is fixed
 
@@ -1757,8 +1843,9 @@ SERVICES = [
         volumes=["sourcedata_512Mb:/var/lib/postgresql/data"],
     ),
     MySql(),
+    SqlServer(),
     SchemaRegistry(),
-    # We create all sources, sinks and dataflows by default with SIZE '1'
+    # We create all sources, sinks and dataflows by default with SIZE 'scale=1,workers=1'
     # The workflow_instance_size workflow is testing multi-process clusters
     Testdrive(
         default_timeout="60s",
@@ -1822,6 +1909,7 @@ SERVICES = [
         external_metadata_store=True,
         metadata_store="cockroach",
         listeners_config_path=f"{MZ_ROOT}/src/materialized/ci/listener_configs/no_auth_https.json",
+        support_external_clusterd=True,
     ),
     Mz(app_password=""),
 ]
@@ -1840,6 +1928,7 @@ service_names = [
     "schema-registry",
     "postgres",
     "mysql",
+    "sql-server",
     "materialized",
     "balancerd",
     "frontegg-mock",
@@ -1856,6 +1945,7 @@ service_names = [
 
 def setup(c: Composition, workers: int) -> None:
     c.up(*service_names)
+    setup_sql_server_testing(c)
 
     c.sql(
         "ALTER SYSTEM SET unsafe_enable_unorchestrated_cluster_replicas = true;",
@@ -1991,10 +2081,13 @@ def workflow_main(c: Composition, parser: WorkflowArgumentParser) -> None:
     args = parser.parse_args()
 
     scenarios = buildkite.shard_list(
-        (
-            [globals()[args.scenario]]
-            if args.scenario
-            else list(all_subclasses(Generator))
+        sorted(
+            (
+                [globals()[args.scenario]]
+                if args.scenario
+                else list(all_subclasses(Generator))
+            ),
+            key=lambda w: w.__name__,
         ),
         lambda s: s.__name__,
     )
@@ -2047,7 +2140,7 @@ def workflow_main(c: Composition, parser: WorkflowArgumentParser) -> None:
 def run_scenarios(
     c: Composition, scenarios: list[type[Generator]], find_limit: bool, workers: int
 ):
-    c.up("testdrive", persistent=True)
+    c.up(Service("testdrive", idle=True))
 
     setup(c, workers)
 
@@ -2208,7 +2301,6 @@ def workflow_instance_size(c: Composition, parser: WorkflowArgumentParser) -> No
     assert args.replicas <= MAX_REPLICAS, "SERVICES have to be static"
     assert args.nodes <= MAX_NODES, "SERVICES have to be static"
 
-    c.up("testdrive", persistent=True)
     c.up(
         "zookeeper",
         "kafka",
@@ -2216,6 +2308,7 @@ def workflow_instance_size(c: Composition, parser: WorkflowArgumentParser) -> No
         "materialized",
         "balancerd",
         "frontegg-mock",
+        Service("testdrive", idle=True),
     )
 
     # Construct the requied Clusterd instances and peer them into clusters
@@ -2256,7 +2349,7 @@ def workflow_instance_size(c: Composition, parser: WorkflowArgumentParser) -> No
                 ALTER SYSTEM SET max_clusters = {args.clusters * 10}
                 ALTER SYSTEM SET max_replicas_per_cluster = {args.replicas * 10}
 
-                CREATE CLUSTER single_replica_cluster SIZE = '4';
+                CREATE CLUSTER single_replica_cluster SIZE = 'scale=1,workers=4';
                 GRANT ALL ON CLUSTER single_replica_cluster TO materialize;
                 GRANT ALL ON CLUSTER single_replica_cluster TO "{ADMIN_USER}";
                 GRANT ALL PRIVILEGES ON SCHEMA public TO "{ADMIN_USER}";

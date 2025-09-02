@@ -26,8 +26,10 @@ import psycopg
 import yaml
 
 from materialize import MZ_ROOT, ci_util, git, spawn
+from materialize.mz_version import MzVersion
 from materialize.mzcompose.composition import (
     Composition,
+    Service,
     WorkflowArgumentParser,
 )
 from materialize.mzcompose.services.testdrive import Testdrive
@@ -176,6 +178,7 @@ def testdrive(no_reset: bool) -> Testdrive:
         network_mode="host",
         volume_workdir="../testdrive:/workdir",
         no_reset=no_reset,
+        default_timeout="360s",
         # For full testdrive support we'll need:
         # kafka_url=...
         # schema_registry_url=...
@@ -346,9 +349,14 @@ class State:
                     "requests": {"cpu": "100m", "memory": "256Mi"},
                 },
                 "backendSecretName": "materialize-backend",
-                "authenticatorKind": "None",
             },
         }
+
+        # Only supported since self-managed v25.2
+        if not tag.startswith("v") or MzVersion.parse_mz(tag) >= MzVersion.parse_mz(
+            "v0.147.0"
+        ):
+            self.materialize_environment["spec"]["authenticatorKind"] = "None"
 
         spawn.runv(
             ["kubectl", "apply", "-f", "-"],
@@ -525,7 +533,7 @@ class State:
 
         if run_testdrive_files:
             with c.override(testdrive(no_reset=False)):
-                c.up("testdrive", persistent=True)
+                c.up(Service("testdrive", idle=True))
                 c.run_testdrive_files(*TD_CMD, *files)
 
     def connect(self, c: Composition) -> None:
@@ -597,7 +605,7 @@ class State:
                 cur.execute("ALTER SYSTEM SET enable_create_table_from_source = true")
 
         with c.override(testdrive(no_reset=False)):
-            c.up("testdrive", persistent=True)
+            c.up(Service("testdrive", idle=True))
             c.testdrive(
                 dedent(
                     """
@@ -696,9 +704,13 @@ class AWS(State):
                     "requests": {"cpu": "100m", "memory": "256Mi"},
                 },
                 "backendSecretName": "materialize-backend",
-                "authenticatorKind": "None",
             },
         }
+        # Only supported since self-managed v25.2
+        if not tag.startswith("v") or MzVersion.parse_mz(tag) >= MzVersion.parse_mz(
+            "v0.147.0"
+        ):
+            self.materialize_environment["spec"]["authenticatorKind"] = "None"
 
         self.version += 1
         spawn.runv(
@@ -848,7 +860,7 @@ def workflow_aws_upgrade(c: Composition, parser: WorkflowArgumentParser) -> None
 
             if args.run_testdrive_files:
                 with c.override(testdrive(no_reset=False)):
-                    c.up("testdrive", persistent=True)
+                    c.up(Service("testdrive", idle=True))
                     c.run_testdrive_files(*TD_CMD, *args.files)
     finally:
         aws.cleanup()

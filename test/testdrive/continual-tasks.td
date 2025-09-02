@@ -7,7 +7,7 @@
 # the Business Source License, use of this software will be governed
 # by the Apache License, Version 2.0.
 
-$ set-arg-default default-storage-size=1
+$ set-arg-default default-storage-size=scale=1,workers=1
 
 $ kafka-create-topic topic=append_only partitions=1
 
@@ -15,6 +15,7 @@ $ kafka-create-topic topic=append_only partitions=1
   TO KAFKA (BROKER '${testdrive.kafka-addr}', SECURITY PROTOCOL PLAINTEXT);
 
 > CREATE CLUSTER ct_cluster SIZE '${arg.default-storage-size}';
+> BEGIN
 > CREATE SOURCE append_only
   IN CLUSTER ct_cluster
   FROM KAFKA CONNECTION kafka_conn (TOPIC 'testdrive-append_only-${testdrive.seed}')
@@ -24,6 +25,7 @@ $ kafka-create-topic topic=append_only partitions=1
   VALUE FORMAT TEXT
   INCLUDE KEY
   ENVELOPE NONE
+> COMMIT
 
 $ kafka-ingest topic=append_only format=bytes key-format=bytes key-terminator=:
 x:0

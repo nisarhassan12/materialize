@@ -14,11 +14,15 @@ retried until it produces the desired result.
 """
 
 import glob
-from pathlib import Path
+import os
 
 from materialize import MZ_ROOT, buildkite, ci_util
-from materialize.mzcompose.composition import Composition, WorkflowArgumentParser
-from materialize.mzcompose.services.azure import Azurite
+from materialize.mzcompose.composition import (
+    Composition,
+    Service,
+    WorkflowArgumentParser,
+)
+from materialize.mzcompose.services.azurite import Azurite
 from materialize.mzcompose.services.fivetran_destination import FivetranDestination
 from materialize.mzcompose.services.kafka import Kafka
 from materialize.mzcompose.services.materialized import Materialized
@@ -50,6 +54,11 @@ SERVICES = [
 def workflow_default(c: Composition, parser: WorkflowArgumentParser) -> None:
     """Run testdrive."""
     parser.add_argument(
+        "--slow",
+        action="store_true",
+        help="include slow tests (usually only in Nightly)",
+    )
+    parser.add_argument(
         "--redpanda",
         action="store_true",
         help="run against Redpanda instead of the Confluent Platform",
@@ -68,7 +77,7 @@ def workflow_default(c: Composition, parser: WorkflowArgumentParser) -> None:
         "--default-size",
         type=int,
         default=Materialized.Size.DEFAULT_SIZE,
-        help="Use SIZE 'N-N' for replicas and SIZE 'N' for sources",
+        help="Use SIZE 'scale=N,workers=N' for replicas and SIZE 'scale=N,workers=1' for sources",
     )
     parser.add_argument(
         "--system-param",
@@ -146,7 +155,7 @@ def workflow_default(c: Composition, parser: WorkflowArgumentParser) -> None:
     )
 
     with c.override(testdrive, materialized):
-        c.up(*dependencies)
+        c.up(*dependencies, Service("testdrive", idle=True))
 
         c.sql(
             "ALTER SYSTEM SET max_clusters = 50;",
@@ -204,29 +213,39 @@ def workflow_default(c: Composition, parser: WorkflowArgumentParser) -> None:
         # without mzcompose
 
         def process(file: str) -> None:
+            if not args.slow and file in (
+                "explain-pushdown.td",
+                "fivetran-destination.td",
+                "introspection-sources.td",
+                "kafka-upsert-sources.td",
+                "materialized-view-refresh-options.td",
+                "upsert-source-race.td",
+            ):
+                return
             junit_report = ci_util.junit_report_filename(f"{c.name}_{file}")
-            try:
-                c.run_testdrive_files(
-                    (
-                        "--rewrite-results"
-                        if args.rewrite_results
-                        else f"--junit-report={junit_report}"
-                    ),
-                    *non_default_testdrive_vars,
-                    *passthrough_args,
-                    file,
-                )
-            finally:
-                ci_util.upload_junit_report(
-                    "testdrive", Path(__file__).parent / junit_report
-                )
+            c.run_testdrive_files(
+                (
+                    "--rewrite-results"
+                    if args.rewrite_results
+                    else f"--junit-report={junit_report}"
+                ),
+                *non_default_testdrive_vars,
+                *passthrough_args,
+                file,
+            )
+            # Uploading successful junit files wastes time and contains no useful information
+            os.remove(f"test/testdrive/{junit_report}")
 
         files = buildkite.shard_list(
-            [
-                file
-                for pattern in args.files
-                for file in glob.glob(pattern, root_dir=MZ_ROOT / "test" / "testdrive")
-            ],
+            sorted(
+                [
+                    file
+                    for pattern in args.files
+                    for file in glob.glob(
+                        pattern, root_dir=MZ_ROOT / "test" / "testdrive"
+                    )
+                ]
+            ),
             lambda file: file,
         )
         c.test_parts(files, process)

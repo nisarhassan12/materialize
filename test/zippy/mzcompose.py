@@ -13,14 +13,19 @@ validation and other events and runs it sequentially. By keeping track of the
 expected state it can verify results for correctness.
 """
 
+import os
 import random
 import re
 import time
 from datetime import timedelta
 from enum import Enum
 
-from materialize.mzcompose.composition import Composition, WorkflowArgumentParser
-from materialize.mzcompose.services.azure import Azurite
+from materialize.mzcompose.composition import (
+    Composition,
+    Service,
+    WorkflowArgumentParser,
+)
+from materialize.mzcompose.services.azurite import Azurite
 from materialize.mzcompose.services.balancerd import Balancerd
 from materialize.mzcompose.services.clusterd import Clusterd
 from materialize.mzcompose.services.cockroach import Cockroach
@@ -33,6 +38,9 @@ from materialize.mzcompose.services.persistcli import Persistcli
 from materialize.mzcompose.services.postgres import Postgres
 from materialize.mzcompose.services.prometheus import Prometheus
 from materialize.mzcompose.services.redpanda import Redpanda
+from materialize.mzcompose.services.sql_server import (
+    SqlServer,
+)
 from materialize.mzcompose.services.ssh_bastion_host import (
     SshBastionHost,
     setup_default_ssh_test_connection,
@@ -59,6 +67,7 @@ def create_mzs(
             metadata_store="cockroach",
             additional_system_parameter_defaults=additional_system_parameter_defaults,
             default_replication_factor=2,
+            support_external_clusterd=True,
         )
         for mz_name in ["materialized", "materialized2"]
     ] + [
@@ -96,6 +105,7 @@ SERVICES = [
     SshBastionHost(),
     Persistcli(),
     MySql(),
+    SqlServer(),
 ]
 
 
@@ -173,39 +183,43 @@ def workflow_default(c: Composition, parser: WorkflowArgumentParser) -> None:
     )
 
     parser.add_argument(
-        "--system-param",
-        type=str,
-        action="append",
-        nargs="*",
-        help="System parameters to set in Materialize, i.e. what you would set with `ALTER SYSTEM SET`",
-    )
-
-    parser.add_argument(
         "--azurite", action="store_true", help="Use Azurite as blob store instead of S3"
     )
 
     args = parser.parse_args()
     scenario_class = globals()[args.scenario]
 
-    c.up("zookeeper", "redpanda", "ssh-bastion-host")
+    dependencies = [
+        "zookeeper",
+        "redpanda",
+        "ssh-bastion-host",
+        "minio",
+        Service("mc", idle=True),
+    ]
     if args.azurite:
-        c.up("azurite")
+        dependencies.append("azurite")
     else:
         del c.compose["services"]["azurite"]
-    # Required for backups, even with azurite
-    c.enable_minio_versioning()
 
     if args.observability:
-        c.up("prometheus", "grafana")
+        dependencies.extend(["prometheus", "grafana"])
+
+    c.up(*dependencies)
+    # Required for backups, even with azurite
+    c.enable_minio_versioning()
 
     print(f"Using seed {args.seed}")
     random.seed(args.seed)
 
     additional_system_parameter_defaults = {}
-    for val in args.system_param or []:
-        x = val[0].split("=", maxsplit=1)
-        assert len(x) == 2, f"--system-param '{val}' should be the format <key>=<val>"
-        additional_system_parameter_defaults[x[0]] = x[1]
+    system_parameter_default = os.getenv("CI_MZ_SYSTEM_PARAMETER_DEFAULT", "")
+    if system_parameter_default:
+        for val in system_parameter_default.split(";"):
+            x = val.split("=", maxsplit=1)
+            assert (
+                len(x) == 2
+            ), f"CI_MZ_SYSTEM_PARAMETER_DEFAULT '{val}' should be the format <key>=<val>"
+            additional_system_parameter_defaults[x[0]] = x[1]
 
     with c.override(
         Cockroach(
@@ -240,7 +254,7 @@ def workflow_default(c: Composition, parser: WorkflowArgumentParser) -> None:
         if Mz0dtDeploy in scenario.actions_with_weight():
             c.sql(
                 """
-                CREATE CLUSTER storage (SIZE = '2-2');
+                CREATE CLUSTER storage (SIZE = 'scale=2,workers=2');
             """
             )
         else:
@@ -260,7 +274,7 @@ def workflow_default(c: Composition, parser: WorkflowArgumentParser) -> None:
 
         c.rm("materialized")
 
-        c.up("testdrive", persistent=True)
+        c.up(Service("testdrive", idle=True))
 
         print("Generating test...")
         test = Test(

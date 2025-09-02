@@ -39,17 +39,28 @@ hosted offering we run these services scaled across many machines.
 ********************************* WARNING ********************************
 EOF
 
+if [ -z "${MZ_EAT_MY_DATA:-}" ]; then
+    unset LD_PRELOAD
+    echo > /etc/postgresql/16/main/environment
+else
+    export LD_PRELOAD="libeatmydata.so"
+    echo "LD_PRELOAD=libeatmydata.so" > /etc/postgresql/16/main/environment
+fi
+
 # Start PostgreSQL, unless suppressed.
 if [ -z "${MZ_NO_BUILTIN_POSTGRES:-}" ]; then
+  (trap 'pg_ctlcluster 16 main stop --mode=fast --force' SIGTERM SIGINT
+  rm -f /var/run/postgresql/.s.PGSQL.26257.lock
   pg_ctlcluster 16 main start
-  psql -U root -c "CREATE SCHEMA IF NOT EXISTS consensus"
-  psql -U root -c "CREATE SCHEMA IF NOT EXISTS storage"
-  psql -U root -c "CREATE SCHEMA IF NOT EXISTS adapter"
-  psql -U root -c "CREATE SCHEMA IF NOT EXISTS tsoracle"
+  psql -U postgres -c "CREATE ROLE root WITH LOGIN PASSWORD 'root'" || true
+  psql -U postgres -c "CREATE DATABASE root OWNER root" || true
+  psql -U root -c "CREATE SCHEMA IF NOT EXISTS consensus; CREATE SCHEMA IF NOT EXISTS storage; CREATE SCHEMA IF NOT EXISTS adapter; CREATE SCHEMA IF NOT EXISTS tsoracle") &
 fi
 
 # Start nginx to serve the console.
-nginx
+if [ -z "${MZ_NO_BUILTIN_CONSOLE:-}" ]; then
+  nginx &
+fi
 
 if [[ ! -f /mzdata/environment-id ]]; then
   echo "docker-container-$(cat /proc/sys/kernel/random/uuid)-0" > /mzdata/environment-id
@@ -66,9 +77,11 @@ export MZ_INTERNAL_SQL_LISTEN_ADDR=${MZ_INTERNAL_SQL_LISTEN_ADDR:-0.0.0.0:6877}
 export MZ_INTERNAL_HTTP_LISTEN_ADDR=${MZ_INTERNAL_HTTP_LISTEN_ADDR:-0.0.0.0:6878}
 export MZ_BALANCER_SQL_LISTEN_ADDR=${MZ_BALANCER_SQL_LISTEN_ADDR:-0.0.0.0:6880}
 export MZ_BALANCER_HTTP_LISTEN_ADDR=${MZ_BALANCER_HTTP_LISTEN_ADDR:-0.0.0.0:6881}
-# Ideally we'd want to use the local path, but this parameter is passed through to clusterd
-#export MZ_PERSIST_CONSENSUS_URL=${MZ_PERSIST_CONSENSUS_URL:-postgresql://root@%2Fvar%2Frun%2Fpostgresql:26257/?options=--search_path=consensus}
-export MZ_PERSIST_CONSENSUS_URL=${MZ_PERSIST_CONSENSUS_URL:-postgresql://root@$(hostname):26257/?options=--search_path=consensus}
+if [ -z "${MZ_NO_EXTERNAL_CLUSTERD:-}" ]; then
+  export MZ_PERSIST_CONSENSUS_URL=${MZ_PERSIST_CONSENSUS_URL:-postgresql://root@$(hostname):26257/?options=--search_path=consensus}
+else
+  export MZ_PERSIST_CONSENSUS_URL=${MZ_PERSIST_CONSENSUS_URL:-postgresql://root@%2Fvar%2Frun%2Fpostgresql:26257/?options=--search_path=consensus}
+fi
 export MZ_PERSIST_BLOB_URL=${MZ_PERSIST_BLOB_URL:-file:///mzdata/persist/blob}
 export MZ_ADAPTER_STASH_URL=${MZ_ADAPTER_STASH_URL:-postgresql://root@%2Fvar%2Frun%2Fpostgresql:26257/?options=--search_path=adapter}
 export MZ_TIMESTAMP_ORACLE_URL=${MZ_TIMESTAMP_ORACLE_URL:-postgresql://root@%2Fvar%2Frun%2Fpostgresql:26257/?options=--search_path=tsoracle}

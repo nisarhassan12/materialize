@@ -7,6 +7,8 @@
 # the Business Source License, use of this software will be governed
 # by the Apache License, Version 2.0.
 
+$ set-sql-timeout duration=60s
+
 $ postgres-execute connection=postgres://mz_system:materialize@${testdrive.materialize-internal-sql-addr}
 ALTER SYSTEM SET enable_yugabyte_connection = true;
 
@@ -476,7 +478,7 @@ true
 # Ensure we can start a source with more workers than the default max_wal_senders param (10)
 #
 
-> CREATE CLUSTER large_cluster SIZE '16';
+> CREATE CLUSTER large_cluster SIZE 'scale=1,workers=16';
 
 > CREATE SOURCE large_cluster_source
   IN CLUSTER large_cluster

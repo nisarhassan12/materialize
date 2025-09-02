@@ -323,12 +323,14 @@ $ kafka-ingest format=avro topic=data schema=${schema} timestamp=1
 > CREATE CONNECTION kafka_conn
   TO KAFKA (BROKER '${testdrive.kafka-addr}', SECURITY PROTOCOL PLAINTEXT);
 
+> BEGIN
 > CREATE SOURCE source_data
   IN CLUSTER ${arg.single-replica-cluster}
   FROM KAFKA CONNECTION kafka_conn (TOPIC 'testdrive-data-${testdrive.seed}');
 
 > CREATE TABLE source_data_tbl FROM SOURCE source_data (REFERENCE "testdrive-data-${testdrive.seed}")
   FORMAT AVRO USING CONFLUENT SCHEMA REGISTRY CONNECTION csr_conn;
+> COMMIT
 
 > CREATE SINK snk
   IN CLUSTER ${arg.single-replica-cluster}
@@ -604,6 +606,7 @@ mz_history_retention_strategies          ""
 mz_internal_cluster_replicas             ""
 mz_pending_cluster_replicas              ""
 mz_kafka_source_tables                   ""
+mz_license_keys                          ""
 mz_materialized_view_refresh_strategies  ""
 mz_mysql_source_tables                   ""
 mz_network_policies                      ""
@@ -801,7 +804,7 @@ test_table ""
 
 # `SHOW TABLES` and `mz_tables` should agree.
 > SELECT COUNT(*) FROM mz_tables WHERE id LIKE 's%'
-60
+61
 
 # There is one entry in mz_indexes for each field_number/expression of the index.
 > SELECT COUNT(id) FROM mz_indexes WHERE id LIKE 's%'

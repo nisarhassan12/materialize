@@ -20,11 +20,10 @@ use k8s_openapi::{
         apps::v1::{StatefulSet, StatefulSetSpec, StatefulSetUpdateStrategy},
         core::v1::{
             Capabilities, ConfigMap, ConfigMapVolumeSource, Container, ContainerPort, EnvVar,
-            EnvVarSource, EphemeralVolumeSource, KeyToPath, PersistentVolumeClaimSpec,
-            PersistentVolumeClaimTemplate, Pod, PodSecurityContext, PodSpec, PodTemplateSpec,
-            Probe, SeccompProfile, Secret, SecretKeySelector, SecretVolumeSource, SecurityContext,
+            EnvVarSource, KeyToPath, Pod, PodSecurityContext, PodSpec, PodTemplateSpec, Probe,
+            SeccompProfile, Secret, SecretKeySelector, SecretVolumeSource, SecurityContext,
             Service, ServiceAccount, ServicePort, ServiceSpec, TCPSocketAction, Toleration, Volume,
-            VolumeMount, VolumeResourceRequirements,
+            VolumeMount,
         },
         networking::v1::{
             IPBlock, NetworkPolicy, NetworkPolicyEgressRule, NetworkPolicyIngressRule,
@@ -45,7 +44,7 @@ use reqwest::StatusCode;
 use semver::{BuildMetadata, Prerelease, Version};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use tracing::trace;
+use tracing::{trace, warn};
 
 use super::matching_image_from_environmentd_image_ref;
 use crate::controller::materialize::tls::{create_certificate, issuer_ref_defined};
@@ -68,6 +67,14 @@ const V144: Version = Version::new(0, 144, 0);
 static V147_DEV0: LazyLock<Version> = LazyLock::new(|| Version {
     major: 0,
     minor: 147,
+    patch: 0,
+    pre: Prerelease::new("dev.0").expect("dev.0 is valid prerelease"),
+    build: BuildMetadata::new("").expect("empty string is valid buildmetadata"),
+});
+const V153: Version = Version::new(0, 153, 0);
+static V154_DEV0: LazyLock<Version> = LazyLock::new(|| Version {
+    major: 0,
+    minor: 154,
     patch: 0,
     pre: Prerelease::new("dev.0").expect("dev.0 is valid prerelease"),
     build: BuildMetadata::new("").expect("empty string is valid buildmetadata"),
@@ -108,7 +115,7 @@ pub struct ConnectionInfo {
 pub struct Resources {
     pub generation: u64,
     pub environmentd_network_policies: Vec<NetworkPolicy>,
-    pub service_account: Box<ServiceAccount>,
+    pub service_account: Box<Option<ServiceAccount>>,
     pub role: Box<Role>,
     pub role_binding: Box<RoleBinding>,
     pub public_service: Box<Service>,
@@ -183,8 +190,10 @@ impl Resources {
             apply_resource(&environmentd_network_policy_api, policy).await?;
         }
 
-        trace!("applying environmentd service account");
-        apply_resource(&service_account_api, &*self.service_account).await?;
+        if let Some(service_account) = &*self.service_account {
+            trace!("applying environmentd service account");
+            apply_resource(&service_account_api, service_account).await?;
+        }
 
         trace!("applying environmentd role");
         apply_resource(&role_api, &*self.role).await?;
@@ -424,6 +433,7 @@ impl Resources {
         mz: &Materialize,
         generation: u64,
     ) -> Result<(), anyhow::Error> {
+        let configmap_api: Api<ConfigMap> = Api::namespaced(client.clone(), &mz.namespace());
         let service_api: Api<Service> = Api::namespaced(client.clone(), &mz.namespace());
         let statefulset_api: Api<StatefulSet> = Api::namespaced(client.clone(), &mz.namespace());
 
@@ -443,6 +453,9 @@ impl Resources {
             &mz.environmentd_generation_service_name(generation),
         )
         .await?;
+
+        trace!("deleting listeners configmap for generation {generation}");
+        delete_resource(&configmap_api, &mz.listeners_configmap_name(generation)).await?;
 
         Ok(())
     }
@@ -638,27 +651,42 @@ fn create_environmentd_network_policies(
 fn create_service_account_object(
     config: &super::MaterializeControllerArgs,
     mz: &Materialize,
-) -> ServiceAccount {
-    let annotations = if config.cloud_provider == CloudProvider::Aws {
-        let role_arn = mz
+) -> Option<ServiceAccount> {
+    if mz.create_service_account() {
+        let mut annotations: BTreeMap<String, String> = mz
             .spec
-            .environmentd_iam_role_arn
-            .as_deref()
-            .or(config.aws_info.environmentd_iam_role_arn.as_deref())
-            .unwrap()
-            .to_string();
-        Some(btreemap! {
-            "eks.amazonaws.com/role-arn".to_string() => role_arn
+            .service_account_annotations
+            .clone()
+            .unwrap_or_default();
+        if let (CloudProvider::Aws, Some(role_arn)) = (
+            config.cloud_provider,
+            mz.spec
+                .environmentd_iam_role_arn
+                .as_deref()
+                .or(config.aws_info.environmentd_iam_role_arn.as_deref()),
+        ) {
+            warn!(
+                "Use of Materialize.spec.environmentd_iam_role_arn is deprecated. Please set \"eks.amazonaws.com/role-arn\" in Materialize.spec.service_account_annotations instead."
+            );
+            annotations.insert(
+                "eks.amazonaws.com/role-arn".to_string(),
+                role_arn.to_string(),
+            );
+        };
+
+        let mut labels = mz.default_labels();
+        labels.extend(mz.spec.service_account_labels.clone().unwrap_or_default());
+
+        Some(ServiceAccount {
+            metadata: ObjectMeta {
+                annotations: Some(annotations),
+                labels: Some(labels),
+                ..mz.managed_resource_meta(mz.service_account_name())
+            },
+            ..Default::default()
         })
     } else {
         None
-    };
-    ServiceAccount {
-        metadata: ObjectMeta {
-            annotations,
-            ..mz.managed_resource_meta(mz.service_account_name())
-        },
-        ..Default::default()
     }
 }
 
@@ -1107,11 +1135,30 @@ fn create_environmentd_statefulset_object(
             scheduler_name
         ));
     }
-    for (key, val) in mz.default_labels() {
-        args.push(format!(
-            "--orchestrator-kubernetes-service-label={key}={val}"
-        ));
+    if mz.meets_minimum_version(&V154_DEV0) {
+        args.extend(
+            mz.spec
+                .pod_annotations
+                .as_ref()
+                .map(|annotations| annotations.iter())
+                .unwrap_or_default()
+                .map(|(key, val)| {
+                    format!("--orchestrator-kubernetes-service-annotation={key}={val}")
+                }),
+        );
     }
+    args.extend(
+        mz.default_labels()
+            .iter()
+            .chain(
+                mz.spec
+                    .pod_labels
+                    .as_ref()
+                    .map(|labels| labels.iter())
+                    .unwrap_or_default(),
+            )
+            .map(|(key, val)| format!("--orchestrator-kubernetes-service-label={key}={val}")),
+    );
     if let Some(status) = &mz.status {
         args.push(format!(
             "--orchestrator-kubernetes-name-prefix=mz{}-",
@@ -1174,40 +1221,10 @@ fn create_environmentd_statefulset_object(
         args.push("--tls-mode=disable".to_string());
     }
     if let Some(ephemeral_volume_class) = &config.ephemeral_volume_class {
-        args.extend([
-            format!(
-                "--orchestrator-kubernetes-ephemeral-volume-class={}",
-                ephemeral_volume_class
-            ),
-            "--scratch-directory=/scratch".to_string(),
-        ]);
-        volumes.push(Volume {
-            name: "scratch".to_string(),
-            ephemeral: Some(EphemeralVolumeSource {
-                volume_claim_template: Some(PersistentVolumeClaimTemplate {
-                    spec: PersistentVolumeClaimSpec {
-                        access_modes: Some(vec!["ReadWriteOnce".to_string()]),
-                        storage_class_name: Some(ephemeral_volume_class.to_string()),
-                        resources: Some(VolumeResourceRequirements {
-                            requests: Some(BTreeMap::from([(
-                                "storage".to_string(),
-                                mz.environmentd_scratch_volume_storage_requirement(),
-                            )])),
-                            ..Default::default()
-                        }),
-                        ..Default::default()
-                    },
-                    ..Default::default()
-                }),
-                ..Default::default()
-            }),
-            ..Default::default()
-        });
-        volume_mounts.push(VolumeMount {
-            name: "scratch".to_string(),
-            mount_path: "/scratch".to_string(),
-            ..Default::default()
-        });
+        args.push(format!(
+            "--orchestrator-kubernetes-ephemeral-volume-class={}",
+            ephemeral_volume_class
+        ));
     }
     // The `materialize` user used by clusterd always has gid 999.
     args.push("--orchestrator-kubernetes-service-fs-group=999".to_string());
@@ -1247,8 +1264,10 @@ fn create_environmentd_statefulset_object(
         args.push("--orchestrator-kubernetes-enable-prometheus-scrape-annotations".into());
     }
 
-    if mz.meets_minimum_version(&V143) && config.disable_license_key_checks {
-        args.push("--disable-license-key-checks".into());
+    if config.disable_license_key_checks {
+        if mz.meets_minimum_version(&V143) && !mz.meets_minimum_version(&V153) {
+            args.push("--disable-license-key-checks".into());
+        }
     } else if mz.meets_minimum_version(&V140_DEV0) {
         volume_mounts.push(VolumeMount {
             name: "license-key".to_string(),
@@ -1421,6 +1440,14 @@ fn create_environmentd_statefulset_object(
         mz.environmentd_app_name(),
     );
     pod_template_labels.insert("app".to_owned(), "environmentd".to_string());
+    pod_template_labels.extend(
+        mz.spec
+            .pod_labels
+            .as_ref()
+            .map(|labels| labels.iter())
+            .unwrap_or_default()
+            .map(|(key, value)| (key.clone(), value.clone())),
+    );
 
     let mut pod_template_annotations = btreemap! {
         // We can re-enable eviction once we have HA
@@ -1456,6 +1483,14 @@ fn create_environmentd_statefulset_object(
             "/metrics/mz_storage".to_string(),
         );
     }
+    pod_template_annotations.extend(
+        mz.spec
+            .pod_annotations
+            .as_ref()
+            .map(|annotations| annotations.iter())
+            .unwrap_or_default()
+            .map(|(key, value)| (key.clone(), value.clone())),
+    );
 
     let mut tolerations = vec![
         // When the node becomes `NotReady` it indicates there is a problem with the node,
@@ -1547,7 +1582,7 @@ fn create_environmentd_statefulset_object(
             rolling_update: None,
             type_: Some("OnDelete".to_owned()),
         }),
-        service_name: mz.environmentd_service_name(),
+        service_name: Some(mz.environmentd_service_name()),
         selector: LabelSelector {
             match_expressions: None,
             match_labels: Some(match_labels),

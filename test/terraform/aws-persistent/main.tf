@@ -27,7 +27,7 @@ variable "orchestratord_version" {
 }
 
 module "materialize_infrastructure" {
-  source = "git::https://github.com/MaterializeInc/terraform-aws-materialize.git?ref=v0.4.8"
+  source = "git::https://github.com/MaterializeInc/terraform-aws-materialize.git?ref=v0.4.12"
 
   # Basic settings
   namespace    = "aws-persistent"
@@ -37,6 +37,23 @@ module "materialize_infrastructure" {
   helm_chart = "materialize-operator-v25.3.0-beta.1.tgz"
   operator_version = var.operator_version
   orchestratord_version = var.orchestratord_version
+
+  # TODO: This currently fails: https://github.com/MaterializeInc/terraform-aws-materialize/issues/71
+  helm_values = {
+      operator = {
+        args = {
+          enableLicenseKeyChecks = true
+        },
+      },
+      clusters = {
+        defaultReplicationFactor = {
+            system = 1
+            probe = 1
+            support = 1
+            analytics = 1
+        }
+      }
+  }
 
   # VPC Configuration
   vpc_cidr             = "10.0.0.0/16"

@@ -29,14 +29,14 @@ contains:CLUSTER "storage" has no replicas available to service request
 # Creating a source in an empty, zero-replica cluster should work.
 > CREATE SOURCE loadgen IN CLUSTER storage FROM LOAD GENERATOR COUNTER (UP TO 100)
 
-! ALTER SOURCE loadgen SET (SIZE = '1')
+! ALTER SOURCE loadgen SET (SIZE = 'scale=1,workers=1')
 contains:Expected one of TIMESTAMP or RETAIN, found SIZE
 
 # Create indexes and materialized views in a storage cluster is allowed.
 > CREATE INDEX t_idx IN CLUSTER storage ON t (a)
 > CREATE MATERIALIZED VIEW mv IN CLUSTER storage AS SELECT 1
 
-> CREATE CLUSTER REPLICA storage.r1 SIZE = '1'
+> CREATE CLUSTER REPLICA storage.r1 SIZE = 'scale=1,workers=1'
 
 # Executing queries on a storage cluster is allowed.
 > SELECT generate_series(1, 1)
@@ -55,7 +55,7 @@ contains:cannot drop cluster "storage" because other objects depend on it
 # Test that a cluster can contain multiple sources and sinks, and verify that
 # the sources and sinks produce the correct output.
 
-> CREATE CLUSTER storage REPLICAS (r1 (SIZE '1'))
+> CREATE CLUSTER storage REPLICAS (r1 (SIZE 'scale=1,workers=1'))
 
 $ kafka-create-topic topic=data1 partitions=1
 
@@ -72,19 +72,23 @@ bb
 > CREATE CONNECTION kafka
   TO KAFKA (BROKER '${testdrive.kafka-addr}', SECURITY PROTOCOL PLAINTEXT)
 
+> BEGIN
 > CREATE SOURCE data1
   IN CLUSTER storage
   FROM KAFKA CONNECTION kafka (TOPIC 'testdrive-data1-${testdrive.seed}')
 
 > CREATE TABLE data1_tbl FROM SOURCE data1 (REFERENCE "testdrive-data1-${testdrive.seed}")
   FORMAT TEXT
+> COMMIT
 
+> BEGIN
 > CREATE SOURCE data2
   IN CLUSTER storage
   FROM KAFKA CONNECTION kafka (TOPIC 'testdrive-data2-${testdrive.seed}')
 
 > CREATE TABLE data2_tbl FROM SOURCE data2 (REFERENCE "testdrive-data2-${testdrive.seed}")
   FORMAT TEXT
+> COMMIT
 
 > SELECT * FROM data1_tbl
 a
@@ -104,7 +108,7 @@ bb
   INTO KAFKA CONNECTION kafka (TOPIC 'sink1-${testdrive.seed}')
   FORMAT JSON ENVELOPE DEBEZIUM
 
-! ALTER SINK sink1 SET (SIZE = '1')
+! ALTER SINK sink1 SET (SIZE = 'scale=1,workers=1')
 contains:Expected one of PARTITION or SNAPSHOT or VERSION
 
 > CREATE SINK sink2
@@ -125,7 +129,7 @@ $ kafka-verify-data format=json sink=materialize.public.sink2 key=false sort-mes
 # restart.
 
 > DROP CLUSTER REPLICA storage.r1
-> CREATE CLUSTER REPLICA storage.r1 SIZE '2'
+> CREATE CLUSTER REPLICA storage.r1 SIZE 'scale=1,workers=2'
 
 $ kafka-ingest format=bytes topic=data1
 c

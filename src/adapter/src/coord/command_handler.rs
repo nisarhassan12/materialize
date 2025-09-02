@@ -72,7 +72,7 @@ use crate::util::{ClientTransmitter, ResultExt};
 use crate::webhook::{
     AppendWebhookResponse, AppendWebhookValidator, WebhookAppender, WebhookAppenderInvalidator,
 };
-use crate::{AppendWebhookError, ExecuteContext, TimestampProvider, catalog, metrics};
+use crate::{AppendWebhookError, ExecuteContext, catalog, metrics};
 
 use super::ExecuteContextExtra;
 
@@ -80,7 +80,7 @@ impl Coordinator {
     /// BOXED FUTURE: As of Nov 2023 the returned Future from this function was 58KB. This would
     /// get stored on the stack which is bad for runtime performance, and blow up our stack usage.
     /// Because of that we purposefully move this Future onto the heap (i.e. Box it).
-    pub(crate) fn handle_command(&mut self, mut cmd: Command) -> LocalBoxFuture<()> {
+    pub(crate) fn handle_command(&mut self, mut cmd: Command) -> LocalBoxFuture<'_, ()> {
         async move {
             if let Some(session) = cmd.session_mut() {
                 session.apply_external_metadata_updates();
@@ -732,7 +732,10 @@ impl Coordinator {
                     }
 
                     // These statements must be kept in-sync with `must_serialize_ddl()`.
-                    Statement::AlterObjectRename(_) | Statement::AlterObjectSwap(_) => {
+                    Statement::AlterObjectRename(_)
+                    | Statement::AlterObjectSwap(_)
+                    | Statement::CreateTableFromSource(_)
+                    | Statement::CreateSource(_) => {
                         let state = self.catalog().for_session(ctx.session()).state().clone();
                         let revision = self.catalog().transient_revision();
 
@@ -743,6 +746,7 @@ impl Coordinator {
                             ops: vec![],
                             state,
                             revision,
+                            side_effects: vec![],
                         }) {
                             return ctx.retire(Err(err));
                         }
@@ -776,10 +780,8 @@ impl Coordinator {
                     | Statement::CreateSchema(_)
                     | Statement::CreateSecret(_)
                     | Statement::CreateSink(_)
-                    | Statement::CreateSource(_)
                     | Statement::CreateSubsource(_)
                     | Statement::CreateTable(_)
-                    | Statement::CreateTableFromSource(_)
                     | Statement::CreateType(_)
                     | Statement::CreateView(_)
                     | Statement::CreateWebhookSource(_)
@@ -1189,8 +1191,9 @@ impl Coordinator {
                 .iter()
                 .any(materialized_view_option_contains_temporal)
             {
-                let timeline_context =
-                    self.validate_timeline_context(resolved_ids.collections().copied())?;
+                let timeline_context = self
+                    .catalog()
+                    .validate_timeline_context(resolved_ids.collections().copied())?;
 
                 // We default to EpochMilliseconds, similarly to `determine_timestamp_for`,
                 // but even in the TimestampIndependent case.
@@ -1219,7 +1222,7 @@ impl Coordinator {
                 // after its creation might see input changes that happened after the CRATE MATERIALIZED
                 // VIEW statement returned.
                 let oracle_timestamp = timestamp;
-                let least_valid_read = self.least_valid_read(&read_holds);
+                let least_valid_read = read_holds.least_valid_read();
                 timestamp.advance_by(least_valid_read.borrow());
 
                 if oracle_timestamp != timestamp {

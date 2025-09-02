@@ -15,13 +15,7 @@ $ sql-server-connect name=sql-server
 server=tcp:sql-server,1433;IntegratedSecurity=true;TrustServerCertificate=true;User ID=${arg.default-sql-server-user};Password=${arg.default-sql-server-password}
 
 $ sql-server-execute name=sql-server
-DROP DATABASE IF EXISTS test_30;
-CREATE DATABASE test_30;
-USE test_30;
-
-EXEC sys.sp_cdc_enable_db;
-ALTER DATABASE test_30 SET ALLOW_SNAPSHOT_ISOLATION ON;
-
+USE test;
 CREATE TABLE t1_add_subsource (val VARCHAR(1024));
 EXEC sys.sp_cdc_enable_table @source_schema = 'dbo', @source_name = 't1_add_subsource', @role_name = 'SA', @supports_net_changes = 0;
 
@@ -39,15 +33,12 @@ INSERT INTO t2_add_subsource VALUES ('100'), ('200'), (NULL), ('300');
 > CREATE SECRET IF NOT EXISTS sql_server_pass AS '${arg.default-sql-server-password}'
 
 $ postgres-execute connection=postgres://mz_system:materialize@${testdrive.materialize-internal-sql-addr}
-ALTER SYSTEM SET enable_sql_server_source = true;
-
-$ postgres-execute connection=postgres://mz_system:materialize@${testdrive.materialize-internal-sql-addr}
 ALTER SYSTEM SET log_filter = 'mz_sql=debug,info';
 
 > CREATE CONNECTION IF NOT EXISTS sql_server_test_add_subsource_conn TO SQL SERVER (
     HOST 'sql-server',
     PORT 1433,
-    DATABASE test_30,
+    DATABASE test,
     USER '${arg.default-sql-server-user}',
     PASSWORD = SECRET sql_server_pass
   );
@@ -58,6 +49,13 @@ ALTER SYSTEM SET log_filter = 'mz_sql=debug,info';
   FROM SQL SERVER CONNECTION sql_server_test_add_subsource_conn
   FOR TABLES (dbo.t1_add_subsource);
 
+# Wait until snapshot has emitted stats and then insert a new row
+# to force LSN in MS SQL to progress.
+> SELECT s.name, ss.snapshot_records_known = ss.snapshot_records_staged
+  FROM mz_internal.mz_source_statistics ss JOIN mz_sources s using (id)
+  WHERE s.name = 'my_source_add_subsources' AND ss.snapshot_records_staged > 0;
+my_source_add_subsources true
+
 
 > SELECT * FROM t1_add_subsource;
 a
@@ -66,6 +64,13 @@ c
 <null>
 
 > ALTER SOURCE my_source_add_subsources ADD SUBSOURCE dbo.t2_add_subsource;
+
+# Wait until snapshot has emitted stats and then insert a new row
+# to force LSN in MS SQL to progress.
+> SELECT s.name, ss.snapshot_records_known = ss.snapshot_records_staged
+  FROM mz_internal.mz_source_statistics ss JOIN mz_sources s using (id)
+  WHERE s.name = 'my_source_add_subsources' AND ss.snapshot_records_staged > 0;
+my_source_add_subsources true
 
 > SELECT * FROM t2_add_subsource;
 100
@@ -109,6 +114,13 @@ INSERT INTO t2_add_subsource VALUES ('500');
 
 > ALTER SOURCE my_source_add_subsources ADD SUBSOURCE dbo.t1_add_subsource;
 
+# Wait until snapshot has emitted stats and then insert a new row
+# to force LSN in MS SQL to progress.
+> SELECT s.name, ss.snapshot_records_known = ss.snapshot_records_staged
+  FROM mz_internal.mz_source_statistics ss JOIN mz_sources s using (id)
+  WHERE s.name = 'my_source_add_subsources' AND ss.snapshot_records_staged > 0;
+my_source_add_subsources true
+
 > SELECT * FROM t1_add_subsource;
 a
 b
@@ -128,3 +140,5 @@ d
 e
 f
 <null>
+
+> DROP SOURCE my_source_add_subsources CASCADE;

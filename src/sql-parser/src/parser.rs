@@ -114,7 +114,7 @@ impl<T> ParserStatementErrorMapper<T> for Result<T, ParserError> {
 #[mz_ore::instrument(target = "compiler", level = "trace", name = "sql_to_ast")]
 pub fn parse_statements_with_limit(
     sql: &str,
-) -> Result<Result<Vec<StatementParseResult>, ParserStatementError>, String> {
+) -> Result<Result<Vec<StatementParseResult<'_>>, ParserStatementError>, String> {
     if sql.bytes().count() > MAX_STATEMENT_BATCH_SIZE {
         return Err(format!(
             "statement batch size cannot exceed {}",
@@ -126,7 +126,7 @@ pub fn parse_statements_with_limit(
 
 /// Parses a SQL string containing zero or more SQL statements.
 #[mz_ore::instrument(target = "compiler", level = "trace", name = "sql_to_ast")]
-pub fn parse_statements(sql: &str) -> Result<Vec<StatementParseResult>, ParserStatementError> {
+pub fn parse_statements(sql: &str) -> Result<Vec<StatementParseResult<'_>>, ParserStatementError> {
     let tokens = lexer::lex(sql).map_err(|error| ParserStatementError {
         error: error.into(),
         statement: None,
@@ -2362,9 +2362,9 @@ impl<'a> Parser<'a> {
             TO => true,
             _ => unreachable!(),
         };
-        let connection_type = match self
-            .expect_one_of_keywords(&[AWS, KAFKA, CONFLUENT, POSTGRES, SSH, SQL, MYSQL, YUGABYTE])?
-        {
+        let connection_type = match self.expect_one_of_keywords(&[
+            AWS, KAFKA, CONFLUENT, POSTGRES, SSH, SQL, MYSQL, YUGABYTE, ICEBERG,
+        ])? {
             AWS => {
                 if self.parse_keyword(PRIVATELINK) {
                     CreateConnectionType::AwsPrivatelink
@@ -2388,6 +2388,10 @@ impl<'a> Parser<'a> {
             }
             MYSQL => CreateConnectionType::MySql,
             YUGABYTE => CreateConnectionType::Yugabyte,
+            ICEBERG => {
+                self.expect_keyword(CATALOG)?;
+                CreateConnectionType::IcebergCatalog
+            }
             _ => unreachable!(),
         };
         if expect_paren {
@@ -2616,6 +2620,8 @@ impl<'a> Parser<'a> {
                 AWS,
                 BROKER,
                 BROKERS,
+                CATALOG,
+                CREDENTIAL,
                 DATABASE,
                 ENDPOINT,
                 HOST,
@@ -2626,6 +2632,7 @@ impl<'a> Parser<'a> {
                 REGION,
                 ROLE,
                 SASL,
+                SCOPE,
                 SECRET,
                 SECURITY,
                 SERVICE,
@@ -2635,6 +2642,7 @@ impl<'a> Parser<'a> {
                 URL,
                 USER,
                 USERNAME,
+                WAREHOUSE,
             ])? {
                 ACCESS => {
                     self.expect_keywords(&[KEY, ID])?;
@@ -2662,6 +2670,11 @@ impl<'a> Parser<'a> {
                 },
                 BROKER => ConnectionOptionName::Broker,
                 BROKERS => ConnectionOptionName::Brokers,
+                CATALOG => {
+                    self.expect_keyword(TYPE)?;
+                    ConnectionOptionName::CatalogType
+                }
+                CREDENTIAL => ConnectionOptionName::Credential,
                 DATABASE => ConnectionOptionName::Database,
                 ENDPOINT => ConnectionOptionName::Endpoint,
                 HOST => ConnectionOptionName::Host,
@@ -2693,6 +2706,7 @@ impl<'a> Parser<'a> {
                     USERNAME => ConnectionOptionName::SaslUsername,
                     _ => unreachable!(),
                 },
+                SCOPE => ConnectionOptionName::Scope,
                 SECRET => {
                     self.expect_keywords(&[ACCESS, KEY])?;
                     ConnectionOptionName::SecretAccessKey
@@ -2722,6 +2736,8 @@ impl<'a> Parser<'a> {
                     _ => unreachable!(),
                 },
                 URL => ConnectionOptionName::Url,
+                // TYPE => ConnectionOptionName::CatalogType,
+                WAREHOUSE => ConnectionOptionName::Warehouse,
                 USER | USERNAME => ConnectionOptionName::User,
                 _ => unreachable!(),
             },
@@ -2811,7 +2827,7 @@ impl<'a> Parser<'a> {
 
     fn parse_create_subsource_option(&mut self) -> Result<CreateSubsourceOption<Raw>, ParserError> {
         let option = match self
-            .expect_one_of_keywords(&[EXTERNAL, PROGRESS, TEXT, EXCLUDE, IGNORE, DETAILS])?
+            .expect_one_of_keywords(&[EXTERNAL, PROGRESS, TEXT, EXCLUDE, IGNORE, DETAILS, RETAIN])?
         {
             EXTERNAL => {
                 self.expect_keyword(REFERENCE)?;
@@ -2851,6 +2867,13 @@ impl<'a> Parser<'a> {
                 name: CreateSubsourceOptionName::Details,
                 value: self.parse_optional_option_value()?,
             },
+            RETAIN => {
+                self.expect_keyword(HISTORY)?;
+                CreateSubsourceOption {
+                    name: CreateSubsourceOptionName::RetainHistory,
+                    value: self.parse_option_retain_history()?,
+                }
+            }
             _ => unreachable!(),
         };
         Ok(option)
@@ -3169,6 +3192,53 @@ impl<'a> Parser<'a> {
         })
     }
 
+    fn parse_create_kafka_sink(
+        &mut self,
+        name: Option<UnresolvedItemName>,
+        in_cluster: Option<RawClusterName>,
+        from: RawItemName,
+        if_not_exists: bool,
+        connection: CreateSinkConnection<Raw>,
+    ) -> Result<CreateSinkStatement<Raw>, ParserError> {
+        let format = match &self.parse_one_of_keywords(&[KEY, FORMAT]) {
+            Some(KEY) => {
+                self.expect_keyword(FORMAT)?;
+                let key = self.parse_format()?;
+                self.expect_keywords(&[VALUE, FORMAT])?;
+                let value = self.parse_format()?;
+                Some(FormatSpecifier::KeyValue { key, value })
+            }
+            Some(FORMAT) => Some(FormatSpecifier::Bare(self.parse_format()?)),
+            Some(_) => unreachable!("parse_one_of_keywords returns None for this"),
+            None => None,
+        };
+        let envelope = if self.parse_keyword(ENVELOPE) {
+            Some(self.parse_sink_envelope()?)
+        } else {
+            None
+        };
+
+        let with_options = if self.parse_keyword(WITH) {
+            self.expect_token(&Token::LParen)?;
+            let options = self.parse_comma_separated(Parser::parse_create_sink_option)?;
+            self.expect_token(&Token::RParen)?;
+            options
+        } else {
+            vec![]
+        };
+
+        Ok(CreateSinkStatement {
+            name,
+            in_cluster,
+            from,
+            connection,
+            format,
+            envelope,
+            if_not_exists,
+            with_options,
+        })
+    }
+
     fn parse_create_sink(&mut self) -> Result<Statement<Raw>, ParserError> {
         self.expect_keyword(SINK)?;
         let if_not_exists = self.parse_if_not_exists()?;
@@ -3196,43 +3266,13 @@ impl<'a> Parser<'a> {
         self.expect_keyword(INTO)?;
         let connection = self.parse_create_sink_connection()?;
 
-        let format = match self.parse_one_of_keywords(&[KEY, FORMAT]) {
-            Some(KEY) => {
-                self.expect_keyword(FORMAT)?;
-                let key = self.parse_format()?;
-                self.expect_keywords(&[VALUE, FORMAT])?;
-                let value = self.parse_format()?;
-                Some(FormatSpecifier::KeyValue { key, value })
+        let statement = match connection {
+            conn @ CreateSinkConnection::Kafka { .. } => {
+                self.parse_create_kafka_sink(name, in_cluster, from, if_not_exists, conn)
             }
-            Some(FORMAT) => Some(FormatSpecifier::Bare(self.parse_format()?)),
-            Some(_) => unreachable!("parse_one_of_keywords returns None for this"),
-            None => None,
-        };
-        let envelope = if self.parse_keyword(ENVELOPE) {
-            Some(self.parse_sink_envelope()?)
-        } else {
-            None
-        };
+        }?;
 
-        let with_options = if self.parse_keyword(WITH) {
-            self.expect_token(&Token::LParen)?;
-            let options = self.parse_comma_separated(Parser::parse_create_sink_option)?;
-            self.expect_token(&Token::RParen)?;
-            options
-        } else {
-            vec![]
-        };
-
-        Ok(Statement::CreateSink(CreateSinkStatement {
-            name,
-            in_cluster,
-            from,
-            connection,
-            format,
-            envelope,
-            if_not_exists,
-            with_options,
-        }))
+        Ok(Statement::CreateSink(statement))
     }
 
     /// Parse the name of a CREATE SINK optional parameter
@@ -3584,8 +3624,9 @@ impl<'a> Parser<'a> {
         })
     }
 
-    fn parse_create_sink_connection(&mut self) -> Result<CreateSinkConnection<Raw>, ParserError> {
-        self.expect_keyword(KAFKA)?;
+    fn parse_create_kafka_sink_connection(
+        &mut self,
+    ) -> Result<CreateSinkConnection<Raw>, ParserError> {
         self.expect_keyword(CONNECTION)?;
 
         let connection = self.parse_raw_name()?;
@@ -3632,6 +3673,17 @@ impl<'a> Parser<'a> {
             key,
             headers,
         })
+    }
+
+    fn parse_create_sink_connection(&mut self) -> Result<CreateSinkConnection<Raw>, ParserError> {
+        match self.expect_one_of_keywords(&[KAFKA, ICEBERG])? {
+            KAFKA => self.parse_create_kafka_sink_connection(),
+            ICEBERG => {
+                let pos = self.index;
+                Err(ParserError::new(pos, "ICEBERG sinks are not supported yet"))
+            }
+            _ => unreachable!(),
+        }
     }
 
     fn parse_create_view(&mut self) -> Result<Statement<Raw>, ParserError> {
@@ -4969,60 +5021,68 @@ impl<'a> Parser<'a> {
     fn parse_table_from_source_option(
         &mut self,
     ) -> Result<TableFromSourceOption<Raw>, ParserError> {
-        let option =
-            match self.expect_one_of_keywords(&[TEXT, EXCLUDE, IGNORE, DETAILS, PARTITION])? {
-                ref keyword @ (TEXT | EXCLUDE) => {
-                    self.expect_keyword(COLUMNS)?;
+        let option = match self
+            .expect_one_of_keywords(&[TEXT, EXCLUDE, IGNORE, DETAILS, PARTITION, RETAIN])?
+        {
+            ref keyword @ (TEXT | EXCLUDE) => {
+                self.expect_keyword(COLUMNS)?;
 
-                    let _ = self.consume_token(&Token::Eq);
+                let _ = self.consume_token(&Token::Eq);
 
-                    let value =
-                        self.parse_option_sequence(Parser::parse_identifier)?
-                            .map(|inner| {
-                                WithOptionValue::Sequence(
-                                    inner.into_iter().map(WithOptionValue::Ident).collect_vec(),
-                                )
-                            });
+                let value = self
+                    .parse_option_sequence(Parser::parse_identifier)?
+                    .map(|inner| {
+                        WithOptionValue::Sequence(
+                            inner.into_iter().map(WithOptionValue::Ident).collect_vec(),
+                        )
+                    });
 
-                    TableFromSourceOption {
-                        name: match *keyword {
-                            TEXT => TableFromSourceOptionName::TextColumns,
-                            EXCLUDE => TableFromSourceOptionName::ExcludeColumns,
-                            _ => unreachable!(),
-                        },
-                        value,
-                    }
+                TableFromSourceOption {
+                    name: match *keyword {
+                        TEXT => TableFromSourceOptionName::TextColumns,
+                        EXCLUDE => TableFromSourceOptionName::ExcludeColumns,
+                        _ => unreachable!(),
+                    },
+                    value,
                 }
-                DETAILS => TableFromSourceOption {
-                    name: TableFromSourceOptionName::Details,
+            }
+            DETAILS => TableFromSourceOption {
+                name: TableFromSourceOptionName::Details,
+                value: self.parse_optional_option_value()?,
+            },
+            IGNORE => {
+                self.expect_keyword(COLUMNS)?;
+                let _ = self.consume_token(&Token::Eq);
+
+                let value = self
+                    .parse_option_sequence(Parser::parse_identifier)?
+                    .map(|inner| {
+                        WithOptionValue::Sequence(
+                            inner.into_iter().map(WithOptionValue::Ident).collect_vec(),
+                        )
+                    });
+                TableFromSourceOption {
+                    // IGNORE is historical syntax for this option.
+                    name: TableFromSourceOptionName::ExcludeColumns,
+                    value,
+                }
+            }
+            PARTITION => {
+                self.expect_keyword(BY)?;
+                TableFromSourceOption {
+                    name: TableFromSourceOptionName::PartitionBy,
                     value: self.parse_optional_option_value()?,
-                },
-                IGNORE => {
-                    self.expect_keyword(COLUMNS)?;
-                    let _ = self.consume_token(&Token::Eq);
-
-                    let value =
-                        self.parse_option_sequence(Parser::parse_identifier)?
-                            .map(|inner| {
-                                WithOptionValue::Sequence(
-                                    inner.into_iter().map(WithOptionValue::Ident).collect_vec(),
-                                )
-                            });
-                    TableFromSourceOption {
-                        // IGNORE is historical syntax for this option.
-                        name: TableFromSourceOptionName::ExcludeColumns,
-                        value,
-                    }
                 }
-                PARTITION => {
-                    self.expect_keyword(BY)?;
-                    TableFromSourceOption {
-                        name: TableFromSourceOptionName::PartitionBy,
-                        value: self.parse_optional_option_value()?,
-                    }
+            }
+            RETAIN => {
+                self.expect_keyword(HISTORY)?;
+                TableFromSourceOption {
+                    name: TableFromSourceOptionName::RetainHistory,
+                    value: self.parse_option_retain_history()?,
                 }
-                _ => unreachable!(),
-            };
+            }
+            _ => unreachable!(),
+        };
         Ok(option)
     }
 
@@ -8125,8 +8185,7 @@ impl<'a> Parser<'a> {
                 let name = self.parse_raw_name()?;
                 self.expect_token(&Token::LParen)?;
                 let args = self.parse_optional_args(false)?;
-                let alias = self.parse_optional_table_alias()?;
-                let with_ordinality = self.parse_keywords(&[WITH, ORDINALITY]);
+                let (with_ordinality, alias) = self.parse_table_function_suffix()?;
                 return Ok(TableFactor::Function {
                     function: Function {
                         name,
@@ -8197,8 +8256,7 @@ impl<'a> Parser<'a> {
             let name = self.parse_raw_name()?;
             if self.consume_token(&Token::LParen) {
                 let args = self.parse_optional_args(false)?;
-                let alias = self.parse_optional_table_alias()?;
-                let with_ordinality = self.parse_keywords(&[WITH, ORDINALITY]);
+                let (with_ordinality, alias) = self.parse_table_function_suffix()?;
                 Ok(TableFactor::Function {
                     function: Function {
                         name,
@@ -8223,13 +8281,32 @@ impl<'a> Parser<'a> {
         self.expect_token(&Token::LParen)?;
         let functions = self.parse_comma_separated(Parser::parse_named_function)?;
         self.expect_token(&Token::RParen)?;
-        let alias = self.parse_optional_table_alias()?;
-        let with_ordinality = self.parse_keywords(&[WITH, ORDINALITY]);
+        let (with_ordinality, alias) = self.parse_table_function_suffix()?;
         Ok(TableFactor::RowsFrom {
             functions,
             alias,
             with_ordinality,
         })
+    }
+
+    /// Parses the things that can come after the argument list of a table function call. These are
+    /// - optional WITH ORDINALITY
+    /// - optional table alias
+    /// - optional WITH ORDINALITY again! This is allowed just to keep supporting our earlier buggy
+    ///   order where we allowed WITH ORDINALITY only after the table alias. (Postgres and other
+    ///   systems support it only before the table alias.)
+    fn parse_table_function_suffix(&mut self) -> Result<(bool, Option<TableAlias>), ParserError> {
+        let with_ordinality_1 = self.parse_keywords(&[WITH, ORDINALITY]);
+        let alias = self.parse_optional_table_alias()?;
+        let with_ordinality_2 = self.parse_keywords(&[WITH, ORDINALITY]);
+        if with_ordinality_1 && with_ordinality_2 {
+            return parser_err!(
+                self,
+                self.peek_prev_pos(),
+                "WITH ORDINALITY specified twice"
+            );
+        }
+        Ok((with_ordinality_1 || with_ordinality_2, alias))
     }
 
     fn parse_named_function(&mut self) -> Result<Function<Raw>, ParserError> {
@@ -8788,6 +8865,9 @@ impl<'a> Parser<'a> {
                 None => return Err(ParserError::new(self.index, "expected a format")),
                 _ => unreachable!(),
             }
+        } else if has_stage && stage == Some(ExplainStage::PhysicalPlan) {
+            // if EXPLAIN PHYSICAL PLAN is explicitly specified without AS, default to VERBOSE TEXT
+            Some(ExplainFormat::VerboseText)
         } else {
             None
         };
@@ -8834,13 +8914,13 @@ impl<'a> Parser<'a> {
 
     fn parse_explain_analyze(&mut self) -> Result<Statement<Raw>, ParserError> {
         // EXPLAIN ANALYZE ((MEMORY | CPU) [WITH SKEW] | HINTS) FOR (INDEX ... | MATERIALIZED VIEW ...) [AS SQL]
-        let mut computation_properties = vec![CPU, MEMORY];
 
         let properties = if self.parse_keyword(HINTS) {
             ExplainAnalyzeProperty::Hints
-        } else if let Ok((kw, property)) =
-            self.parse_explain_analyze_computation_property(&computation_properties)
-        {
+        } else {
+            let mut computation_properties = vec![CPU, MEMORY];
+            let (kw, property) =
+                self.parse_explain_analyze_computation_property(&computation_properties)?;
             let mut properties = vec![property];
             computation_properties.retain(|p| p != &kw);
 
@@ -8851,41 +8931,23 @@ impl<'a> Parser<'a> {
                 properties.push(property);
             }
 
-            let mut skew = false;
-            if self.peek_keyword(WITH) {
-                if !self.parse_keywords(&[WITH, SKEW]) {
-                    return Err(ParserError::new(self.index, "expected WITH SKEW"));
-                }
-                skew = true;
-            }
+            let skew = self.parse_keywords(&[WITH, SKEW]);
 
             ExplainAnalyzeProperty::Computation { properties, skew }
-        } else {
-            return Err(ParserError::new(
-                self.index,
-                "expected HINTS, MEMORY, or CPU",
-            ));
         };
 
         self.expect_keyword(FOR)?;
 
-        let explainee = if self.parse_keywords(&[MATERIALIZED, VIEW]) {
-            // Parse: `MATERIALIZED VIEW name`
-            Explainee::MaterializedView(self.parse_raw_name()?)
-        } else if self.parse_keyword(INDEX) {
-            // Parse: `INDEX name`
-            Explainee::Index(self.parse_raw_name()?)
-        } else {
-            return Err(ParserError::new(
-                self.index,
-                "expected INDEX or MATERIALIZED VIEW",
-            ));
+        let explainee = match self.expect_one_of_keywords(&[INDEX, MATERIALIZED])? {
+            INDEX => Explainee::Index(self.parse_raw_name()?),
+            MATERIALIZED => {
+                self.expect_keyword(VIEW)?;
+                Explainee::MaterializedView(self.parse_raw_name()?)
+            }
+            _ => unreachable!(),
         };
 
-        let mut as_sql = false;
-        if self.parse_keywords(&[AS, SQL]) {
-            as_sql = true;
-        }
+        let as_sql = self.parse_keywords(&[AS, SQL]);
 
         Ok(Statement::ExplainAnalyze(ExplainAnalyzeStatement {
             properties,
@@ -8900,21 +8962,15 @@ impl<'a> Parser<'a> {
     ) -> Result<(Keyword, ExplainAnalyzeComputationProperty), ParserError> {
         if properties.is_empty() {
             return Err(ParserError::new(
-                self.index,
+                self.peek_pos(),
                 "both CPU and MEMORY were specified, expected WITH SKEW or FOR",
             ));
         }
 
-        match self.parse_one_of_keywords(properties) {
-            Some(kw) if kw == CPU => Ok((kw, ExplainAnalyzeComputationProperty::Cpu)),
-            Some(kw) if kw == MEMORY => Ok((kw, ExplainAnalyzeComputationProperty::Memory)),
-            _ => Err(ParserError::new(
-                self.index,
-                format!(
-                    "expected one of {}",
-                    mz_ore::str::separated(", ", properties)
-                ),
-            )),
+        match self.expect_one_of_keywords(properties)? {
+            CPU => Ok((CPU, ExplainAnalyzeComputationProperty::Cpu)),
+            MEMORY => Ok((MEMORY, ExplainAnalyzeComputationProperty::Memory)),
+            _ => unreachable!(),
         }
     }
 
@@ -9280,7 +9336,7 @@ impl<'a> Parser<'a> {
                 "one of TABLES or TYPES or SECRETS or CONNECTIONS or SCHEMAS or DATABASES or CLUSTERS",
                 self.peek_token(),
             )
-            .unwrap_err()
+                .unwrap_err()
         })?;
         self.expect_grant_revoke_object_type_inner(statement_type, object_type)?;
         Ok(object_type)

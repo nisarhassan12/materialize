@@ -23,7 +23,7 @@
 //! to efficiently decode [`tiberius::Row`]s into [`mz_repr::Row`]s.
 
 use base64::Engine;
-use chrono::SubsecRound;
+use chrono::{NaiveDateTime, SubsecRound};
 use dec::OrderedDecimal;
 use mz_ore::cast::CastFrom;
 use mz_proto::{IntoRustIfSome, ProtoType, RustType};
@@ -158,9 +158,18 @@ pub struct SqlServerTableRaw {
     /// Name of the table.
     pub name: Arc<str>,
     /// The capture instance replicating changes.
-    pub capture_instance: Arc<str>,
+    pub capture_instance: Arc<SqlServerCaptureInstanceRaw>,
     /// Columns for the table.
     pub columns: Arc<[SqlServerColumnRaw]>,
+}
+
+/// Raw capture instance metadata.
+#[derive(Debug, Clone)]
+pub struct SqlServerCaptureInstanceRaw {
+    /// The capture instance replicating changes.
+    pub name: Arc<str>,
+    /// The creation date of the capture instance.
+    pub create_date: Arc<NaiveDateTime>,
 }
 
 /// Description of a column from a table in Microsoft SQL Server.
@@ -234,6 +243,11 @@ impl SqlServerColumnDesc {
     /// Exclude this [`SqlServerColumnDesc`] from being replicated into Materialize.
     pub fn exclude(&mut self) {
         self.column_type = None;
+    }
+
+    /// Check if this [`SqlServerColumnDesc`] is excluded from being replicated into Materialize.
+    pub fn is_excluded(&self) -> bool {
+        self.column_type.is_none()
     }
 }
 
@@ -882,13 +896,10 @@ impl RustType<proto_sql_server_column_desc::DecodeType> for SqlServerColumnDecod
 /// Numerics in SQL Server have a maximum precision of 38 digits, where [`Numeric`]s in
 /// Materialize have a maximum precision of 39 digits, so this conversion is infallible.
 fn tiberius_numeric_to_mz_numeric(val: tiberius::numeric::Numeric) -> Numeric {
-    let mut scale = Numeric::from(10);
-    let scale_pow = Numeric::from(val.scale());
-    mz_repr::adt::numeric::cx_datum().pow(&mut scale, &scale_pow);
-
     let mut numeric = mz_repr::adt::numeric::cx_datum().from_i128(val.value());
-    mz_repr::adt::numeric::cx_datum().div(&mut numeric, &scale);
-
+    // Use scaleb to adjust the exponent directly, avoiding precision loss from division
+    // scaleb(x, -n) computes x * 10^(-n)
+    mz_repr::adt::numeric::cx_datum().scaleb(&mut numeric, &Numeric::from(-i32::from(val.scale())));
     numeric
 }
 
@@ -981,11 +992,13 @@ impl SqlServerRowDecoder {
 
 #[cfg(test)]
 mod tests {
+    use chrono::NaiveDateTime;
     use std::collections::BTreeSet;
+    use std::sync::Arc;
 
     use crate::desc::{
-        SqlServerColumnDecodeType, SqlServerColumnDesc, SqlServerTableDesc, SqlServerTableRaw,
-        tiberius_numeric_to_mz_numeric,
+        SqlServerCaptureInstanceRaw, SqlServerColumnDecodeType, SqlServerColumnDesc,
+        SqlServerTableDesc, SqlServerTableRaw, tiberius_numeric_to_mz_numeric,
     };
 
     use super::SqlServerColumnRaw;
@@ -1087,7 +1100,15 @@ mod tests {
         let sql_server_desc = SqlServerTableRaw {
             schema_name: "my_schema".into(),
             name: "my_table".into(),
-            capture_instance: "my_table_CT".into(),
+            capture_instance: Arc::new(SqlServerCaptureInstanceRaw {
+                name: "my_table_CT".into(),
+                create_date: NaiveDateTime::parse_from_str(
+                    "2024-01-01 00:00:00",
+                    "%Y-%m-%d %H:%M:%S",
+                )
+                .unwrap()
+                .into(),
+            }),
             columns: sql_server_columns.into(),
         };
         let sql_server_desc = SqlServerTableDesc::new(sql_server_desc);
@@ -1159,7 +1180,15 @@ mod tests {
             let sql_server_desc = SqlServerTableRaw {
                 schema_name: "my_schema".into(),
                 name: "my_table".into(),
-                capture_instance: "my_table_CT".into(),
+                capture_instance: Arc::new(SqlServerCaptureInstanceRaw {
+                    name: "my_table_CT".into(),
+                    create_date: NaiveDateTime::parse_from_str(
+                        "2024-01-01 00:00:00",
+                        "%Y-%m-%d %H:%M:%S",
+                    )
+                    .unwrap()
+                    .into(),
+                }),
                 columns: columns.into(),
             };
             let mut sql_server_desc = SqlServerTableDesc::new(sql_server_desc);
@@ -1217,6 +1246,20 @@ mod tests {
         let a = tiberius::numeric::Numeric::new_with_scale(-99999, 5);
         let rnd = tiberius_numeric_to_mz_numeric(a);
         let og = mz_repr::adt::numeric::cx_datum().parse("-.99999").unwrap();
+        assert_eq!(og, rnd);
+
+        let a = tiberius::numeric::Numeric::new_with_scale(1, 29);
+        let rnd = tiberius_numeric_to_mz_numeric(a);
+        let og = mz_repr::adt::numeric::cx_datum()
+            .parse("0.00000000000000000000000000001")
+            .unwrap();
+        assert_eq!(og, rnd);
+
+        let a = tiberius::numeric::Numeric::new_with_scale(-111111111111111111, 0);
+        let rnd = tiberius_numeric_to_mz_numeric(a);
+        let og = mz_repr::adt::numeric::cx_datum()
+            .parse("-111111111111111111")
+            .unwrap();
         assert_eq!(og, rnd);
     }
 

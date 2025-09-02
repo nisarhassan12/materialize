@@ -16,7 +16,7 @@
 
 set -euo pipefail
 
-NIGHTLY_RUST_DATE=2025-06-28
+NIGHTLY_RUST_DATE=2025-08-11
 
 cd "$(dirname "$0")/.."
 
@@ -33,6 +33,7 @@ Commands:
     run         run a command in the ci-builder image
     build       build the ci-builder image locally
     exists      reports via the exit code whether the ci-builder image exists
+    tag         reports the tag for the ci-builder image
     root-shell  open a root shell to the most recently started ci-builder container
 
 For details, consult ci/builder/README.md."
@@ -75,6 +76,38 @@ else
     rust_components+=,clippy-preview,rustfmt-preview
 fi
 
+# Target a specific CPU to get better performance, i.e. use more modern instructions.
+#
+# All of the x86-64 and ARM hardware we run in production support the v3 and neoverse-n1 micro
+# architectures, respectively.
+#
+# Sync: This target-cpu should be kept in sync with the one in ci-builder and .cargo/config.
+x86_64_target_cpu="x86-64-v3"
+aarch64_target_cpu="neoverse-n1"
+
+rust_cpu_target=""
+case "$arch_gcc" in
+    x86_64) rust_cpu_target="$x86_64_target_cpu" ;;
+    aarch64) rust_cpu_target="$aarch64_target_cpu" ;;
+    *) die "unknown host architecture \"$arch\"" ;;
+esac
+
+# Enable specific CPU features that we know our cloud infra supports.
+#
+# Note: specifying a target_cpu enables many features, these are specific ones that target_cpu
+# might miss.
+#
+# Sync: This list of features should be kept in sync with the one in xcompile and .cargo/config.
+x86_64_target_features="+aes,+pclmulqdq"
+aaarch64_target_features="+aes,+sha2"
+
+rust_target_features=""
+case "$arch_gcc" in
+    x86_64) rust_target_features="$x86_64_target_features" ;;
+    aarch64) rust_target_features="$aaarch64_target_features" ;;
+    *) die "unknown host architecture \"$arch\"" ;;
+esac
+
 bazel_version=$(cat .bazelversion)
 
 uid=$(id -u)
@@ -91,6 +124,8 @@ build() {
         --build-arg "RUST_VERSION=$rust_version" \
         --build-arg "RUST_DATE=$rust_date" \
         --build-arg "RUST_COMPONENTS=$rust_components" \
+        --build-arg "RUST_CPU_TARGET=$rust_cpu_target" \
+        --build-arg "RUST_TARGET_FEATURES=$rust_target_features" \
         --build-arg "BAZEL_VERSION=$bazel_version" \
         --tag materialize/ci-builder:"$tag" \
         --tag materialize/ci-builder:"$cache_tag" \
@@ -141,6 +176,9 @@ case "$cmd" in
     exists)
         docker manifest inspect materialize/ci-builder:"$tag" &> /dev/null
         ;;
+    tag)
+        echo "$tag"
+        ;;
     push)
         build "$@"
         docker push materialize/ci-builder:"$tag"
@@ -178,6 +216,7 @@ case "$cmd" in
             --volume "$(pwd)/target-xcompile:/mnt/build"
             --volume "$(pwd):$(pwd)"
             --workdir "$(pwd)"
+            --env XDG_CACHE_HOME=/mnt/build/cache
             --env AWS_ACCESS_KEY_ID
             --env AWS_DEFAULT_REGION
             --env AWS_SECRET_ACCESS_KEY
@@ -214,7 +253,7 @@ case "$cmd" in
             --env SCHEMA_REGISTRY_URL
             --env STEP_START_TIMESTAMP_WITH_TZ
             --env POSTGRES_URL
-            --env COCKROACH_URL
+            --env METADATA_BACKEND_URL
             # For ci-closed-issues-detect
             --env GITHUB_CI_ISSUE_REFERENCE_CHECKER_TOKEN
             # For auto_cut_release
@@ -229,6 +268,9 @@ case "$cmd" in
             # For self managed docs
             --env BUILDKITE_BRANCH
             --env BUILDKITE_ORGANIZATION_SLUG
+            --env BUILDKITE_PULL_REQUEST
+            --env DOCKERHUB_USERNAME
+            --env DOCKERHUB_ACCESS_TOKEN
         )
 
         if [[ $detach_container == "true" ]]; then
@@ -331,10 +373,10 @@ case "$cmd" in
             args+=(--volume "$GIT_ROOT_DIR:$GIT_ROOT_DIR")
         fi
         rm -f "$cid_file"
-        docker run "${args[@]}" "materialize/ci-builder:$tag" "${docker_command[@]}"
+        docker run "${args[@]}" "materialize/ci-builder:$tag" eatmydata "${docker_command[@]}"
         ;;
     root-shell)
-        docker exec --interactive --tty --user 0:0 "$(<"$cid_file")" ci/builder/root-shell.sh
+        docker exec --interactive --tty --user 0:0 "$(<"$cid_file")" eatmydata ci/builder/root-shell.sh
         ;;
     *)
         printf "unknown command %q\n" "$cmd"

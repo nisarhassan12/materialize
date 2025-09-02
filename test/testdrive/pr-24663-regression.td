@@ -11,7 +11,7 @@
 # in `upsert` continued to be processed properly in pr materialize#24663. Its short,
 # so its copied here.
 
-$ set-arg-default default-storage-size=1
+$ set-arg-default default-storage-size=scale=1,workers=1
 
 $ postgres-execute connection=postgres://mz_system:materialize@${testdrive.materialize-internal-sql-addr}
 ALTER SYSTEM SET storage_statistics_collection_interval = 1000
@@ -104,6 +104,7 @@ $ kafka-ingest format=avro topic=dbz-no-before key-format=avro key-schema=${keys
 {"id": 1} {"after": null, "op": "c", "source": {"file": "binlog3", "pos": 1, "row": 1, "snapshot": {"boolean": false}}}
 
 > CREATE CLUSTER dbz_no_before_cluster SIZE '${arg.default-storage-size}';
+> BEGIN
 > CREATE SOURCE dbz_no_before
   IN CLUSTER dbz_no_before_cluster
   FROM KAFKA CONNECTION kafka_conn (TOPIC 'testdrive-dbz-no-before-${testdrive.seed}')
@@ -111,6 +112,7 @@ $ kafka-ingest format=avro topic=dbz-no-before key-format=avro key-schema=${keys
 > CREATE TABLE dbz_no_before_tbl FROM SOURCE dbz_no_before (REFERENCE "testdrive-dbz-no-before-${testdrive.seed}")
   FORMAT AVRO USING CONFLUENT SCHEMA REGISTRY CONNECTION csr_conn
   ENVELOPE DEBEZIUM
+> COMMIT
 
 > SELECT count(*) FROM dbz_no_before_tbl
 0

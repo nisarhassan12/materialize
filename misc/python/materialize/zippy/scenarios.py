@@ -33,6 +33,12 @@ from materialize.zippy.mysql_actions import (
     MySqlStart,
 )
 from materialize.zippy.mysql_cdc_actions import CreateMySqlCdcTable
+from materialize.zippy.sql_server_actions import (
+    CreateSqlServerTable,
+    SqlServerDML,
+    SqlServerStart,
+)
+from materialize.zippy.sql_server_cdc_actions import CreateSqlServerCdcTable
 from materialize.zippy.mz_actions import (
     KillClusterd,
     Mz0dtDeploy,
@@ -233,6 +239,27 @@ class MySqlCdc(Scenario):
         }
 
 
+class SqlServerCdc(Scenario):
+    """A Zippy test using SQL Server CDC exclusively."""
+
+    def bootstrap(self) -> list[ActionOrFactory]:
+        return super().bootstrap() + [SqlServerStart]
+
+    def actions_with_weight(self) -> dict[ActionOrFactory, float]:
+        return {
+            CreateSqlServerTable: 10,
+            CreateSqlServerCdcTable: 10,
+            KillClusterd: 5,
+            StoragedKill: 5,
+            StoragedStart: 5,
+            # TODO: Reenable when database-issues#9624 is fixed
+            # SqlServerRestart: 10,
+            CreateViewParameterized(): 10,
+            ValidateView: 20,
+            SqlServerDML: 100,
+        }
+
+
 class ClusterReplicas(Scenario):
     """A Zippy test that uses CREATE / DROP REPLICA and random killing."""
 
@@ -382,7 +409,10 @@ class BackupAndRestoreLarge(Scenario):
             CreateViewParameterized(
                 max_views=5, expensive_aggregates=True, max_inputs=5
             ): 10,
-            CreateSinkParameterized(max_sinks=10): 10,
+            # Sinks don't make sense in this test since we don't record the
+            # state of a sink after a backup&restore cycle, see for example
+            # https://github.com/MaterializeInc/database-issues/issues/9589
+            # CreateSinkParameterized(max_sinks=10): 10,
             ValidateView: 10,
             DML: 50,
             BackupAndRestore: 0.1,

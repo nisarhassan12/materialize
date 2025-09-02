@@ -9,6 +9,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
+use std::time::Duration;
 
 use mz_ore::collections::CollectionExt;
 use mz_proto::RustType;
@@ -51,12 +52,13 @@ pub(super) struct PurifiedSourceExports {
 #[allow(clippy::unused_async)]
 pub(super) async fn purify_source_exports(
     database: &str,
-    _client: &mut mz_sql_server_util::Client,
+    client: &mut mz_sql_server_util::Client,
     retrieved_references: &RetrievedSourceReferences,
     requested_references: &Option<ExternalReferences>,
     text_columns: &[UnresolvedItemName],
     excl_columns: &[UnresolvedItemName],
     unresolved_source_name: &UnresolvedItemName,
+    timeout: Duration,
     reference_policy: &SourceReferencePolicy,
 ) -> Result<PurifiedSourceExports, PlanError> {
     let requested_exports = match requested_references.as_ref() {
@@ -99,11 +101,6 @@ pub(super) async fn purify_source_exports(
         }
     };
 
-    // TODO(sql_server2): Should we check if these have overlapping columns?
-    // What do our other sources do?
-    let text_cols_map = map_column_refs(text_columns, SqlServerConfigOptionName::TextColumns)?;
-    let excl_cols_map = map_column_refs(excl_columns, SqlServerConfigOptionName::ExcludeColumns)?;
-
     if requested_exports.is_empty() {
         sql_bail!(
             "SQL Server source must ingest at least one table, but {} matched none",
@@ -113,6 +110,13 @@ pub(super) async fn purify_source_exports(
                 .to_ast_string_simple()
         )
     }
+
+    super::validate_source_export_names(&requested_exports)?;
+
+    // TODO(sql_server2): Should we check if these have overlapping columns?
+    // What do our other sources do?
+    let text_cols_map = map_column_refs(text_columns, SqlServerConfigOptionName::TextColumns)?;
+    let excl_cols_map = map_column_refs(excl_columns, SqlServerConfigOptionName::ExcludeColumns)?;
 
     // Ensure the columns we intend to include are supported.
     //
@@ -145,8 +149,6 @@ pub(super) async fn purify_source_exports(
         }
     }
 
-    // TODO(sql_server2): Validate permissions on upstream tables.
-
     let capture_instances: BTreeMap<_, _> = requested_exports
         .iter()
         .map(|requested| {
@@ -163,30 +165,57 @@ pub(super) async fn purify_source_exports(
         })
         .collect();
 
-    let tables: Vec<_> = requested_exports
-        .into_iter()
-        .map(|requested| {
-            let mut table = requested
-                .meta
-                .sql_server_table()
-                .expect("sql server source")
-                .clone();
+    mz_sql_server_util::inspect::validate_source_privileges(
+        client,
+        capture_instances.values().map(|instance| instance.as_ref()),
+    )
+    .await?;
 
-            let maybe_text_cols = text_cols_map.get(&table.qualified_name());
-            let maybe_excl_cols = excl_cols_map.get(&table.qualified_name());
+    // If CDC is freshly enabled for a table, it has been observed that
+    // the `start_lsn`` from `cdc.change_tables` can be ahead of the LSN
+    // returned by `sys.fn_cdc_get_max_lsn`.  Eventually, the LSN returned
+    // by `sys.fn_cdc_get_max_lsn` will surpass `start_lsn`. For this
+    // reason, we choose the initial_lsn to be
+    // `max(start_lsns, sys.fn_cdc_get_max_lsn())``.
+    let mut initial_lsns = mz_sql_server_util::inspect::get_min_lsns(
+        client,
+        capture_instances.values().map(|instance| instance.as_ref()),
+    )
+    .await?;
 
-            if let Some(text_cols) = maybe_text_cols {
-                table.apply_text_columns(text_cols);
-            }
-            // TODO(sql_server2): Should we prevent excluding all columns? What do our other
-            // sources do?
-            if let Some(excl_cols) = maybe_excl_cols {
-                table.apply_excl_columns(excl_cols);
-            }
+    let max_lsn = mz_sql_server_util::inspect::get_max_lsn_retry(client, timeout).await?;
+    tracing::debug!(?initial_lsns, %max_lsn, "retrieved start LSNs");
+    for lsn in initial_lsns.values_mut() {
+        *lsn = std::cmp::max(*lsn, max_lsn);
+    }
 
-            requested.change_meta(table)
-        })
-        .collect();
+    let mut tables = vec![];
+    for requested in requested_exports {
+        let mut table = requested
+            .meta
+            .sql_server_table()
+            .expect("sql server source")
+            .clone();
+
+        let maybe_text_cols = text_cols_map.get(&table.qualified_name());
+        let maybe_excl_cols = excl_cols_map.get(&table.qualified_name());
+
+        if let Some(text_cols) = maybe_text_cols {
+            table.apply_text_columns(text_cols);
+        }
+
+        if let Some(excl_cols) = maybe_excl_cols {
+            table.apply_excl_columns(excl_cols);
+        }
+
+        if table.columns.iter().all(|c| c.is_excluded()) {
+            Err(SqlServerSourcePurificationError::AllColumnsExcluded {
+                tbl_name: Arc::clone(&table.name),
+            })?
+        }
+
+        tables.push(requested.change_meta(table));
+    }
 
     if tables.is_empty() {
         Err(SqlServerSourcePurificationError::NoTables)?;
@@ -229,6 +258,10 @@ pub(super) async fn purify_source_exports(
                 .get(&reference.meta.qualified_name())
                 .expect("capture instance should exist");
 
+            let initial_lsn = *initial_lsns.get(capture_instance).ok_or_else(|| {
+                SqlServerSourcePurificationError::NoStartLsn(capture_instance.to_string())
+            })?;
+
             let export = PurifiedSourceExport {
                 external_reference: reference.external_reference,
                 details: PurifiedExportDetails::SqlServer {
@@ -236,12 +269,13 @@ pub(super) async fn purify_source_exports(
                     text_columns,
                     excl_columns,
                     capture_instance: Arc::clone(capture_instance),
+                    initial_lsn,
                 },
             };
 
-            (reference.name, export)
+            Ok::<_, SqlServerSourcePurificationError>((reference.name, export))
         })
-        .collect();
+        .collect::<Result<_, _>>()?;
 
     Ok(PurifiedSourceExports {
         source_exports: exports,
@@ -308,16 +342,16 @@ pub fn generate_create_subsource_statements(
     Ok(subsources)
 }
 
-struct SqlServerExportStatementValues {
-    pub columns: Vec<ColumnDef<Aug>>,
-    pub constraints: Vec<TableConstraint<Aug>>,
-    pub text_columns: Option<Vec<WithOptionValue<Aug>>>,
-    pub excl_columns: Option<Vec<WithOptionValue<Aug>>>,
-    pub details: SourceExportStatementDetails,
-    pub external_reference: UnresolvedItemName,
+pub(super) struct SqlServerExportStatementValues {
+    pub(super) columns: Vec<ColumnDef<Aug>>,
+    pub(super) constraints: Vec<TableConstraint<Aug>>,
+    pub(super) text_columns: Option<Vec<WithOptionValue<Aug>>>,
+    pub(super) excl_columns: Option<Vec<WithOptionValue<Aug>>>,
+    pub(super) details: SourceExportStatementDetails,
+    pub(super) external_reference: UnresolvedItemName,
 }
 
-fn generate_source_export_statement_values(
+pub(super) fn generate_source_export_statement_values(
     scx: &StatementContext,
     purified_export: PurifiedSourceExport,
 ) -> Result<SqlServerExportStatementValues, PlanError> {
@@ -326,6 +360,7 @@ fn generate_source_export_statement_values(
         text_columns,
         excl_columns,
         capture_instance,
+        initial_lsn,
     } = purified_export.details
     else {
         unreachable!("purified export details must be SQL Server")
@@ -391,6 +426,7 @@ fn generate_source_export_statement_values(
     let details = SourceExportStatementDetails::SqlServer {
         table,
         capture_instance,
+        initial_lsn,
     };
     let text_columns = text_columns.map(|mut columns| {
         columns.sort();

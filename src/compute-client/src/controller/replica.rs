@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::bail;
 use mz_build_info::BuildInfo;
-use mz_cluster_client::client::{ClusterReplicaLocation, TimelyConfig};
+use mz_cluster_client::client::ClusterReplicaLocation;
 use mz_compute_types::dyncfgs::ENABLE_COMPUTE_REPLICA_EXPIRATION;
 use mz_dyncfg::ConfigSet;
 use mz_ore::channel::InstrumentedUnboundedSender;
@@ -23,6 +23,7 @@ use mz_ore::retry::{Retry, RetryState};
 use mz_ore::task::AbortOnDropHandle;
 use mz_service::client::GenericClient;
 use mz_service::params::GrpcClientParameters;
+use mz_service::transport;
 use tokio::select;
 use tokio::sync::mpsc::error::SendError;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
@@ -49,10 +50,7 @@ pub(super) struct ReplicaConfig {
     pub grpc_client: GrpcClientParameters,
     /// The offset to use for replica expiration, if any.
     pub expiration_offset: Option<Duration>,
-    pub arrangement_exert_proportionality: u32,
-    pub enable_zero_copy: bool,
-    pub enable_zero_copy_lgalloc: bool,
-    pub zero_copy_limit: Option<usize>,
+    pub enable_ctp: bool,
 }
 
 /// A client for a replica task.
@@ -138,6 +136,8 @@ impl<T> ReplicaClient<T> {
     }
 }
 
+type ComputeCtpClient<T> = transport::Client<ComputeCommand<T>, ComputeResponse<T>>;
+
 /// Configuration for `replica_task`.
 struct ReplicaTask<T> {
     /// The ID of the replica.
@@ -183,36 +183,59 @@ where
     /// The connection is retried forever (with backoff) and this method returns only after
     /// a connection was successfully established.
     async fn connect(&self) -> Client<T> {
-        let try_connect = |retry: RetryState| {
-            let addrs = &self.config.location.ctl_addrs;
-            let dests = addrs
-                .iter()
-                .map(|addr| (addr.clone(), self.metrics.clone()))
-                .collect();
+        let try_connect = async |retry: RetryState| {
             let version = self.build_info.semver_version();
             let client_params = &self.config.grpc_client;
 
-            async move {
-                let connect_start = Instant::now();
-                let connect_result =
-                    ComputeGrpcClient::connect_partitioned(dests, version, client_params).await;
-                self.metrics.observe_connect_time(connect_start.elapsed());
+            let connect_start = Instant::now();
+            let connect_result = if self.config.enable_ctp {
+                let connect_timeout = client_params.connect_timeout.unwrap_or(Duration::MAX);
+                let keepalive_timeout = client_params
+                    .http2_keep_alive_timeout
+                    .unwrap_or(Duration::MAX);
 
-                connect_result.inspect_err(|error| {
-                    let next_backoff = retry.next_backoff.unwrap();
-                    if retry.i >= mz_service::retry::INFO_MIN_RETRIES {
-                        info!(
-                            replica_id = %self.replica_id, ?next_backoff,
-                            "error connecting to replica: {error:#}",
-                        );
-                    } else {
-                        debug!(
-                            replica_id = %self.replica_id, ?next_backoff,
-                            "error connecting to replica: {error:#}",
-                        );
-                    }
+                ComputeCtpClient::<T>::connect_partitioned(
+                    self.config.location.ctl_addrs.clone(),
+                    version,
+                    connect_timeout,
+                    keepalive_timeout,
+                    self.metrics.clone(),
+                )
+                .await
+                .map(|client| {
+                    let dyncfg = Arc::clone(&self.dyncfg);
+                    SequentialHydration::new(client, dyncfg, self.metrics.clone())
                 })
-            }
+            } else {
+                let addrs = &self.config.location.ctl_addrs;
+                let dests = addrs
+                    .iter()
+                    .map(|addr| (addr.clone(), self.metrics.clone()))
+                    .collect();
+                ComputeGrpcClient::connect_partitioned(dests, version, client_params)
+                    .await
+                    .map(|client| {
+                        let dyncfg = Arc::clone(&self.dyncfg);
+                        SequentialHydration::new(client, dyncfg, self.metrics.clone())
+                    })
+            };
+
+            self.metrics.observe_connect_time(connect_start.elapsed());
+
+            connect_result.inspect_err(|error| {
+                let next_backoff = retry.next_backoff.unwrap();
+                if retry.i >= mz_service::retry::INFO_MIN_RETRIES {
+                    info!(
+                        replica_id = %self.replica_id, ?next_backoff,
+                        "error connecting to replica: {error:#}",
+                    );
+                } else {
+                    debug!(
+                        replica_id = %self.replica_id, ?next_backoff,
+                        "error connecting to replica: {error:#}",
+                    );
+                }
+            })
         };
 
         let client = Retry::default()
@@ -224,9 +247,7 @@ where
         self.metrics.observe_connect();
         self.connected.store(true, atomic::Ordering::Relaxed);
 
-        let dyncfg = Arc::clone(&self.dyncfg);
-        let metrics = self.metrics.clone();
-        SequentialHydration::new(client, dyncfg, metrics)
+        client
     }
 
     /// Runs the message loop.
@@ -277,18 +298,7 @@ where
     /// contain replica-specific fields that must be adjusted before sending.
     fn specialize_command(&self, command: &mut ComputeCommand<T>) {
         match command {
-            ComputeCommand::CreateTimely { config, nonce } => {
-                **config = TimelyConfig {
-                    workers: self.config.location.workers,
-                    process: 0,
-                    addresses: self.config.location.dataflow_addrs.clone(),
-                    arrangement_exert_proportionality: self
-                        .config
-                        .arrangement_exert_proportionality,
-                    enable_zero_copy: self.config.enable_zero_copy,
-                    enable_zero_copy_lgalloc: self.config.enable_zero_copy_lgalloc,
-                    zero_copy_limit: self.config.zero_copy_limit,
-                };
+            ComputeCommand::Hello { nonce } => {
                 *nonce = Uuid::new_v4();
             }
             ComputeCommand::CreateInstance(config) => {

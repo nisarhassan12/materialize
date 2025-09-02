@@ -12,7 +12,7 @@ ALTER SYSTEM SET unsafe_enable_unorchestrated_cluster_replicas = true
 ALTER SYSTEM SET storage_statistics_collection_interval = 1000
 ALTER SYSTEM SET storage_statistics_interval = 2000
 
-> CREATE CLUSTER cluster1 (SIZE '2')
+> CREATE CLUSTER cluster1 (SIZE 'scale=1,workers=2')
 
 > CREATE CONNECTION kafka_conn
   TO KAFKA (BROKER '${testdrive.kafka-addr}', SECURITY PROTOCOL PLAINTEXT);
@@ -34,6 +34,7 @@ $ kafka-create-topic topic=upsert partitions=1
 $ kafka-ingest format=bytes topic=upsert key-format=bytes key-terminator=:
 one:two
 
+> BEGIN
 > CREATE SOURCE upsert1
   IN CLUSTER cluster1
   FROM KAFKA CONNECTION kafka_conn (TOPIC
@@ -44,6 +45,7 @@ one:two
   KEY FORMAT BYTES
   VALUE FORMAT BYTES
   ENVELOPE UPSERT
+> COMMIT
 
 > SELECT * FROM upsert1_tbl
 one two

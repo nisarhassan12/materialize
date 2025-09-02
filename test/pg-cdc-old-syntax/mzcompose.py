@@ -18,8 +18,13 @@ import pg8000
 from pg8000 import Connection
 
 from materialize import MZ_ROOT, buildkite
-from materialize.mzcompose.composition import Composition, WorkflowArgumentParser
-from materialize.mzcompose.service import Service, ServiceConfig
+from materialize.mzcompose.composition import (
+    Composition,
+    Service,
+    WorkflowArgumentParser,
+)
+from materialize.mzcompose.service import Service as MzComposeService
+from materialize.mzcompose.service import ServiceConfig
 from materialize.mzcompose.services.materialized import Materialized
 from materialize.mzcompose.services.minio import Minio
 from materialize.mzcompose.services.mz import Mz
@@ -32,8 +37,6 @@ from materialize.mzcompose.services.test_certs import TestCerts
 from materialize.mzcompose.services.testdrive import Testdrive
 from materialize.mzcompose.services.toxiproxy import Toxiproxy
 from materialize.source_table_migration import (
-    get_new_image_for_source_table_migration_test,
-    get_old_image_for_source_table_migration_test,
     verify_sources_after_source_table_migration,
 )
 
@@ -41,7 +44,7 @@ from materialize.source_table_migration import (
 DEFAULT_PG_EXTRA_COMMAND = ["-c", "max_slot_wal_keep_size=10"]
 
 
-class PostgresRecvlogical(Service):
+class PostgresRecvlogical(MzComposeService):
     """
     Command to start a replication.
     """
@@ -222,7 +225,7 @@ def workflow_silent_connection_drop(
 
         c.run_testdrive_files(
             "--no-reset",
-            f"--var=default-replica-size={Materialized.Size.DEFAULT_SIZE}-{Materialized.Size.DEFAULT_SIZE}",
+            f"--var=default-replica-size=scale={Materialized.Size.DEFAULT_SIZE},workers={Materialized.Size.DEFAULT_SIZE}",
             "override/silent-connection-drop-part-1.td",
         )
 
@@ -309,11 +312,12 @@ def workflow_cdc(c: Composition, parser: WorkflowArgumentParser) -> None:
         matching_files.extend(
             glob.glob(filter, root_dir=MZ_ROOT / "test" / "pg-cdc-old-syntax")
         )
-    sharded_files: list[str] = sorted(
-        buildkite.shard_list(matching_files, lambda file: file)
+    sharded_files: list[str] = buildkite.shard_list(
+        sorted(matching_files), lambda file: file
     )
     print(f"Files: {sharded_files}")
 
+    c.up(Service("test-certs", idle=True))
     ssl_ca = c.run("test-certs", "cat", "/secrets/ca.crt", capture=True).stdout
     ssl_cert = c.run("test-certs", "cat", "/secrets/certuser.crt", capture=True).stdout
     ssl_key = c.run("test-certs", "cat", "/secrets/certuser.key", capture=True).stdout
@@ -334,8 +338,8 @@ def workflow_cdc(c: Composition, parser: WorkflowArgumentParser) -> None:
                 f"--var=ssl-key={ssl_key}",
                 f"--var=ssl-wrong-cert={ssl_wrong_cert}",
                 f"--var=ssl-wrong-key={ssl_wrong_key}",
-                f"--var=default-replica-size={Materialized.Size.DEFAULT_SIZE}-{Materialized.Size.DEFAULT_SIZE}",
-                f"--var=default-storage-size={Materialized.Size.DEFAULT_SIZE}-1",
+                f"--var=default-replica-size=scale={Materialized.Size.DEFAULT_SIZE},workers={Materialized.Size.DEFAULT_SIZE}",
+                f"--var=default-storage-size=scale={Materialized.Size.DEFAULT_SIZE},workers=1",
                 file,
             ),
         )
@@ -344,10 +348,6 @@ def workflow_cdc(c: Composition, parser: WorkflowArgumentParser) -> None:
 def workflow_default(c: Composition, parser: WorkflowArgumentParser) -> None:
     def process(name: str) -> None:
         if name in ("default", "migration"):
-            return
-
-        # TODO: Flaky, reenable when database-issues#7611 is fixed
-        if name == "statuses":
             return
 
         # TODO: Flaky, reenable when database-issues#8447 is fixed
@@ -391,11 +391,12 @@ def workflow_migration(c: Composition, parser: WorkflowArgumentParser) -> None:
         matching_files.extend(
             glob.glob(filter, root_dir=MZ_ROOT / "test" / "pg-cdc-old-syntax")
         )
-    sharded_files: list[str] = sorted(
-        buildkite.shard_list(matching_files, lambda file: file)
+    sharded_files: list[str] = buildkite.shard_list(
+        sorted(matching_files), lambda file: file
     )
     print(f"Files: {sharded_files}")
 
+    c.up(Service("test-certs", idle=True))
     ssl_ca = c.run("test-certs", "cat", "/secrets/ca.crt", capture=True).stdout
     ssl_cert = c.run("test-certs", "cat", "/secrets/certuser.crt", capture=True).stdout
     ssl_key = c.run("test-certs", "cat", "/secrets/certuser.key", capture=True).stdout
@@ -411,7 +412,6 @@ def workflow_migration(c: Composition, parser: WorkflowArgumentParser) -> None:
     for file in sharded_files:
         mz_old = Materialized(
             name="materialized",
-            image=get_old_image_for_source_table_migration_test(),
             volumes_extra=["secrets:/share/secrets"],
             external_metadata_store=True,
             external_blob_store=True,
@@ -423,7 +423,6 @@ def workflow_migration(c: Composition, parser: WorkflowArgumentParser) -> None:
 
         mz_new = Materialized(
             name="materialized",
-            image=get_new_image_for_source_table_migration_test(),
             volumes_extra=["secrets:/share/secrets"],
             external_metadata_store=True,
             external_blob_store=True,
@@ -444,8 +443,8 @@ def workflow_migration(c: Composition, parser: WorkflowArgumentParser) -> None:
                 f"--var=ssl-key={ssl_key}",
                 f"--var=ssl-wrong-cert={ssl_wrong_cert}",
                 f"--var=ssl-wrong-key={ssl_wrong_key}",
-                f"--var=default-replica-size={Materialized.Size.DEFAULT_SIZE}-{Materialized.Size.DEFAULT_SIZE}",
-                f"--var=default-storage-size={Materialized.Size.DEFAULT_SIZE}-1",
+                f"--var=default-replica-size=scale={Materialized.Size.DEFAULT_SIZE},workers={Materialized.Size.DEFAULT_SIZE}",
+                f"--var=default-storage-size=scale={Materialized.Size.DEFAULT_SIZE},workers=1",
                 "--no-reset",
                 file,
             )

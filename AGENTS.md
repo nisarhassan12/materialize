@@ -10,6 +10,12 @@ Use the `mz-test` skill before running ANY tests, even mid-task — the canonica
 commands aren't the obvious ones (e.g. `bin/sqllogictest --optimized`, not
 `cargo build --bin sqllogictest`).
 
+Use the `mz-run` skill before building, running, formatting, or linting. `bin/fmt` and `bin/lint` are the canonical entry points, NOT `cargo fmt`, `rustfmt`, or a bare `cargo clippy`. `bin/environmentd`, not `cargo build --bin environmentd`.
+
+Use the `mz-commit` skill before `git commit`, `git push`, or `gh pr create`.
+
+Use the `mz-debug-ci` skill before the first `bk` or `gh pr checks` command, or when handed a Buildkite URL.
+
 ## Code navigation
 
 For operation flow tracing, read first:
@@ -93,14 +99,44 @@ Two files control license policy, **keep in sync**: `deny.toml` (`[licenses].all
   we need to record that knowledge. In general comments need to stand on their
   own and make sense from just looking at them and the code around it, not
   previous changes.
-* Avoid em-dashes and semicolons for structuring sentences, everywhere: code
-  comments, specs, design docs, all of it. Restructure with full stops and
-  commas instead. In most cases a sentence that wants an em-dash or semicolon
-  can just be split into two.
+* Avoid em-dashes for structuring sentences in any prose: code comments, specs,
+  design docs, all of it. Restructure with full stops and commas instead. The
+  same goes for semicolons, though one is fine where splitting would mangle the
+  sentence.
 * Our guidance applies both when writing new code or designs, or when we notice
   deviations in code or architecture that we are working on. At the same time,
   we want to keep our changes minimal so it's good to call out deviations and
   then we can decide together what to do about it.
+* Never put a side effect inside `debug_assert!` (or `debug_assert_eq!`, etc.).
+  The macro body compiles out whenever debug-assertions are off, which includes
+  `[profile.optimized]` (what `bin/environmentd` and mzcompose use) and
+  `[profile.release]`. Only `[profile.ci]` turns them on. A side effect written
+  there, for example `debug_assert!(map.insert(k, v).is_none())`, runs under
+  `cargo test` but silently vanishes in optimized and release builds, leaving
+  the logic it powered inert and profiler-blind. Bind the effect to a `let`
+  outside the assert, then assert on the bound value. Clippy's
+  `debug_assert_with_mut_call` catches `&mut self` receivers but not `&self` or
+  free-function side effects.
+* Never write vendor, customer, or account names into durable or user-facing
+  surfaces: committed code, comments, column comments, docs, specs, commit
+  messages, PR bodies, or test fixtures. Anything persisted to disk gets shared,
+  indexed, and outlives the context, so a name in it is a leak. Anonymize to the
+  technical pattern instead, for example "a wide unfiltered LEFT JOIN driving a
+  freshness incident" rather than who hit it. Names are fine in ephemeral chat,
+  not on disk.
+* Never use `std::collections::HashMap`/`HashSet` directly, `clippy.toml`'s
+  `disallowed-types` blocks it. Use `BTreeMap`/`BTreeSet` when iteration order
+  matters, or `mz_ore::collections::HashMap` for keyed-only access with no
+  iteration. Hash-order iteration is a real nondeterminism source, for example
+  an unstable order reaching plan output or persisted state, not a style nit.
+* A new feature flag should default off in production but default ON in the
+  test/CI configuration, so the new code path is exercised by sqllogictest,
+  testdrive, and optimizer goldens before it earns trust. Production safety and
+  test coverage are separate settings. Wire the override through
+  `system_parameter_default`: the `--system-parameter-default=NAME=VALUE` CLI
+  flag (env `SYSTEM_PARAMETER_DEFAULT`) for sqllogictest and environmentd
+  binaries, or `TestHarness::with_system_parameter_default` for Rust
+  integration tests.
 
 ## Code comments
 

@@ -206,6 +206,42 @@ pub const MYSQL_REPLICATION_HEARTBEAT_INTERVAL: Config<Duration> = Config::new(
     "Replication heartbeat interval requested from the MySQL server.",
 );
 
+/// Whether to split snapshot reads of tables with a supported single-column
+/// primary key into per-worker PK ranges. When disabled, each table is read
+/// whole by a single worker.
+pub static MYSQL_SOURCE_SNAPSHOT_PARALLELISM: Config<bool> = Config::new(
+    "mysql_source_snapshot_parallelism",
+    false,
+    "Whether to split MySQL snapshot reads across workers by primary-key ranges.",
+);
+
+/// Smallest estimated row count the MySQL snapshot partitioner attempts to subdivide.
+pub static MYSQL_SOURCE_SNAPSHOT_PARTITION_MIN_ROWS: Config<usize> = Config::new(
+    "mysql_source_snapshot_partition_min_rows",
+    50_000,
+    "Minimum estimated rows the MySQL snapshot partitioner attempts to split.",
+);
+
+/// Cap on string primary key prefixes visited when attempting to partition a table for
+/// parallel snapshotting in MySQL. This limits runtime on high-cardinality prefixes,
+/// and will return correct but likely more skewed boundaries on budget exhaustion.
+pub static MYSQL_SOURCE_SNAPSHOT_PARTITION_PROBED_PREFIXES_PER_BILLION_ROWS: Config<usize> =
+    Config::new(
+        "mysql_source_snapshot_partition_probed_prefixes_per_billion_rows",
+        1_000,
+        "Cap on MySQL snapshot PK-prefix partitioning probed prefixes per table, per billion \
+     estimated rows; when exhausted, splitting stops early with coarser partition boundaries.",
+    );
+
+/// If the optimizer estimates the table has fewer rows than this, compute the exact row count
+/// with `COUNT(*)`. Otherwise, report the `information_schema` estimate directly.
+pub static MYSQL_SOURCE_SNAPSHOT_EXACT_COUNT_MAX_ROWS: Config<usize> = Config::new(
+    "mysql_source_snapshot_exact_count_max_rows",
+    1_000_000,
+    "Maximum estimated table size for which MySQL snapshots compute an exact COUNT(*) \
+     for the size gauge; larger tables report the information_schema estimate.",
+);
+
 // Postgres
 
 /// Interval to poll `confirmed_flush_lsn` to get a resumption lsn.
@@ -242,6 +278,22 @@ pub static SQL_SERVER_SOURCE_VALIDATE_RESTORE_HISTORY: Config<bool> = Config::ne
     "sql_server_source_validate_restore_history",
     true,
     "Whether to treat a restore history change as a definite error",
+);
+
+// AWS
+
+/// The AWS SDK's connect timeout on the AssumeRole prefetcher's STS calls.
+/// Raise it if credential fetches time out on slow connections.
+///
+/// The default matches the SDK's own 3.1 second default, so behavior only
+/// changes when an operator raises it.
+///
+/// Read once when a connection is set up. Running sinks are unaffected by
+/// changes until their dataflow restarts.
+pub const AWS_PREFETCH_STS_CONNECT_TIMEOUT: Config<Duration> = Config::new(
+    "aws_prefetch_sts_connect_timeout",
+    Duration::from_millis(3100),
+    "Connect timeout for the AWS AssumeRole credentials prefetcher's STS calls.",
 );
 
 // Networking
@@ -294,18 +346,20 @@ pub const STORAGE_UPSERT_MAX_SNAPSHOT_BATCH_BUFFERING: Config<Option<usize>> = C
     "Limit snapshot buffering in upsert.",
 );
 
-/// Allow the upsert-v2 source stash's paged columnar merge batcher to spill
-/// cold chains out of RSS via the column pager. The stash draws from the same
-/// shared budget pool (and backend / codec) as the compute column-paged
-/// batcher — there is one budget — but this flag gates the stash's
-/// participation independently of the compute-side
-/// `enable_column_paged_batcher_spill`.
+/// Allow the upsert-v2 source stash's chunk batcher to spill cold chains out
+/// of RSS via the process buffer pool. The stash draws from the same shared
+/// pool budget as the compute chunk batchers — there is one budget — but
+/// this flag gates the stash's participation independently of the
+/// compute-side `enable_column_paged_batcher_spill`.
 ///
 /// Off by default; the stash keeps every chunk resident until enabled.
+/// Enabling it also installs the process buffer pool (via compute's config
+/// handler, which reads this flag from the aggregate dyncfg set), so
+/// storage-only spilling needs no compute-side gate.
 pub const ENABLE_UPSERT_PAGED_SPILL: Config<bool> = Config::new(
     "enable_upsert_paged_spill",
     false,
-    "Allow the upsert-v2 source stash to spill chunks via the shared column pager, gated \
+    "Allow the upsert-v2 source stash to spill chunks to the shared buffer pool, gated \
      independently of the compute `enable_column_paged_batcher_spill`.",
 );
 
@@ -383,6 +437,7 @@ pub const STATISTICS_RETENTION_DURATION: Config<Duration> = Config::new(
 /// Adds the full set of all storage `Config`s.
 pub fn all_dyncfgs(configs: ConfigSet) -> ConfigSet {
     configs
+        .add(&AWS_PREFETCH_STS_CONNECT_TIMEOUT)
         .add(&CLUSTER_SHUTDOWN_GRACE_PERIOD)
         .add(&DELAY_SOURCES_PAST_REHYDRATION)
         .add(&ENFORCE_EXTERNAL_ADDRESSES)
@@ -399,6 +454,10 @@ pub fn all_dyncfgs(configs: ConfigSet) -> ConfigSet {
         .add(&KAFKA_SINK_BATCH_SIZE)
         .add(&KAFKA_SINK_BATCH_NUM_MESSAGES)
         .add(&MYSQL_REPLICATION_HEARTBEAT_INTERVAL)
+        .add(&MYSQL_SOURCE_SNAPSHOT_EXACT_COUNT_MAX_ROWS)
+        .add(&MYSQL_SOURCE_SNAPSHOT_PARALLELISM)
+        .add(&MYSQL_SOURCE_SNAPSHOT_PARTITION_MIN_ROWS)
+        .add(&MYSQL_SOURCE_SNAPSHOT_PARTITION_PROBED_PREFIXES_PER_BILLION_ROWS)
         .add(&ORE_OVERFLOWING_BEHAVIOR)
         .add(&PG_FETCH_SLOT_RESUME_LSN_INTERVAL)
         .add(&PG_SCHEMA_VALIDATION_INTERVAL)

@@ -97,22 +97,39 @@ class Executor:
         if self.logging_exe is not None:
             self.logging_exe.log(query)
 
-        try:
-            (
-                cur.execute(query.encode())
-                if isinstance(cur, psycopg.Cursor)
-                else cur.execute(query)
-            )
-        except OperationalError:
-            # Can happen after Mz disruptions if we are running queries against Mz
-            print("Network error, retrying")
-            time.sleep(0.01)
-            self.reconnect()
-            with self.mz_conn.cursor() as cur:
-                self.execute(cur, query)
-        except Exception as e:
-            print(f"Query failed: {query} {e}")
-            raise QueryError(str(e), query)
+        # Bounded retries, endless retrying turns a permanent failure into a
+        # RecursionError/hang.
+        for _ in range(1000):
+            try:
+                (
+                    cur.execute(query.encode())
+                    if isinstance(cur, psycopg.Cursor)
+                    else cur.execute(query)
+                )
+                return
+            except OperationalError as e:
+                # Server-side operational errors (e.g. resource limits) carry
+                # a SQLSTATE and are permanent. Only connection-level failures
+                # (no SQLSTATE) are worth retrying, they happen after Mz
+                # disruptions.
+                if e.sqlstate is not None:
+                    print(f"Query failed: {query} {e}")
+                    raise QueryError(str(e), query)
+                # Only queries against Mz can be retried this way, an upstream
+                # connection must not be redirected to the Mz connection.
+                if (
+                    not isinstance(cur, psycopg.Cursor)
+                    or cur.connection is not self.mz_conn
+                ):
+                    raise
+                print("Network error, retrying")
+                time.sleep(0.01)
+                self.reconnect()
+                cur = self.mz_conn.cursor()
+            except Exception as e:
+                print(f"Query failed: {query} {e}")
+                raise QueryError(str(e), query)
+        raise QueryError("Persistent network errors", query)
 
     def execute_with_retry_on_error(
         self,
@@ -136,6 +153,12 @@ class Executor:
 
 
 class PrintExecutor(Executor):
+    def reconnect(self) -> None:
+        # Only prints transactions, needs no Materialize connection. The
+        # random service pick in the base implementation could also hit a
+        # service that is not running yet.
+        pass
+
     def create(self, logging_exe: Any | None = None) -> None:
         pass
 
@@ -523,7 +546,12 @@ class SqlServerExecutor(Executor):
             )
             self.execute(
                 cur,
-                f"""CREATE TABLE {identifier(self.table)}
+                # Qualified like the source above. Unqualified, the table lands
+                # in the connection's default schema (`public`) rather than
+                # `self.schema`, and a caller addressing it as
+                # `<database>.<schema>.<table>`, as parallel-workload does, never
+                # resolves it.
+                f"""CREATE TABLE {identifier(self.database)}.{identifier(self.schema)}.{identifier(self.table)}
                     FROM SOURCE {identifier(self.database)}.{identifier(self.schema)}.{identifier(self.source)}
                     (REFERENCE {identifier(self.table)})""",
             )
@@ -601,7 +629,7 @@ class MySqlExecutor(Executor):
         self.source = f"mysql_source{num}"
         self.num = num
 
-    def create(self, logging_exe: Any | None = None) -> None:
+    def create(self, logging_exe: Any | None = None, prepopulate_rows: int = 0) -> None:
         self.logging_exe = logging_exe
         self.mysql_conn = pymysql.connect(
             host="127.0.0.1",
@@ -629,6 +657,27 @@ class MySqlExecutor(Executor):
                 cur,
                 f"CREATE TABLE `{self.table}` ({', '.join(values)} {primary_key});",
             )
+            # Rows inserted before CREATE SOURCE are read by the initial
+            # snapshot instead of arriving through replication. Every key
+            # column receives the row's NEGATIVE sequence number: workload
+            # generators only ever emit non-negative keys for plain INSERTs
+            # (Definition.numeric_value), so negative keys cannot collide
+            # with them and trigger duplicate-key errors. Callers must keep
+            # prepopulate_rows within the smallest key column type's range.
+            if prepopulate_rows and keys:
+                key_names = ", ".join(f"`{key}`" for key in keys)
+                batch_size = 5000
+                for start in range(1, prepopulate_rows + 1, batch_size):
+                    batch = ", ".join(
+                        "(" + ", ".join([str(-j)] * len(keys)) + ")"
+                        for j in range(
+                            start, min(start + batch_size, prepopulate_rows + 1)
+                        )
+                    )
+                    self.execute(
+                        cur,
+                        f"INSERT INTO `{self.table}` ({key_names}) VALUES {batch};",
+                    )
         self.mysql_conn.autocommit(False)
 
         with self.mz_conn.cursor() as cur:
@@ -652,7 +701,8 @@ class MySqlExecutor(Executor):
             )
             self.execute(
                 cur,
-                f"""CREATE TABLE {identifier(self.table)}
+                # Qualified like the source above, see SqlServerExecutor.create.
+                f"""CREATE TABLE {identifier(self.database)}.{identifier(self.schema)}.{identifier(self.table)}
                     FROM SOURCE {identifier(self.database)}.{identifier(self.schema)}.{identifier(self.source)}
                     (REFERENCE mysql.{identifier(self.table)})""",
             )
@@ -782,7 +832,8 @@ class PgExecutor(Executor):
             )
             self.execute(
                 cur,
-                f"""CREATE TABLE {identifier(self.table)}
+                # Qualified like the source above, see SqlServerExecutor.create.
+                f"""CREATE TABLE {identifier(self.database)}.{identifier(self.schema)}.{identifier(self.table)}
                     FROM SOURCE {identifier(self.database)}.{identifier(self.schema)}.{identifier(self.source)}
                     (REFERENCE {identifier(self.table)})""",
             )

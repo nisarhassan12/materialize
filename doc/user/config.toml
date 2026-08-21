@@ -73,6 +73,16 @@ identifier = "sql"
 name = "SQL Reference"
 weight = 75
 
+#
+# Legacy Create Source
+#
+
+[[menu.main]]
+name = "Legacy Syntax"
+parent = 'create-source'
+identifier = 'create-source-legacy'
+weight = 90
+
 
 [[menu.main]]
 identifier = "reference"
@@ -139,6 +149,3 @@ include = "docs/**"
 #
 # include = "**.html" # would only include files with ".html" suffix
 # exclude = "**.{jpg, png}" # would exclude files with ".jpg" or ".png" suffix
-
-# Avoid deleting self-managed docs which are deployed from the self-managed-docs branches.
-exclude = "docs/{self-managed/v25.2}/**"

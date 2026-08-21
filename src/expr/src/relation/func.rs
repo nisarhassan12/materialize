@@ -18,7 +18,6 @@ use std::{fmt, iter};
 use chrono::{DateTime, NaiveDateTime, NaiveTime, Utc};
 use dec::OrderedDecimal;
 use itertools::{Either, Itertools};
-use mz_lowertest::MzReflect;
 use mz_ore::cast::CastFrom;
 
 use mz_ore::str::separated;
@@ -1855,8 +1854,7 @@ impl OneByOneAggr for NaiveOneByOneAggr {
     PartialOrd,
     Serialize,
     Deserialize,
-    Hash,
-    MzReflect
+    Hash
 )]
 pub enum LagLeadType {
     Lag,
@@ -1872,8 +1870,7 @@ pub enum LagLeadType {
     PartialOrd,
     Serialize,
     Deserialize,
-    Hash,
-    MzReflect
+    Hash
 )]
 pub enum AggregateFunc {
     MaxNumeric,
@@ -3355,8 +3352,7 @@ where
     PartialOrd,
     Serialize,
     Deserialize,
-    Hash,
-    MzReflect
+    Hash
 )]
 pub struct CaptureGroupDesc {
     pub index: u32,
@@ -3375,7 +3371,6 @@ pub struct CaptureGroupDesc {
     Serialize,
     Deserialize,
     Hash,
-    MzReflect,
     Default
 )]
 pub struct AnalyzedRegexOpts {
@@ -3408,8 +3403,7 @@ impl FromStr for AnalyzedRegexOpts {
     PartialOrd,
     Serialize,
     Deserialize,
-    Hash,
-    MzReflect
+    Hash
 )]
 pub struct AnalyzedRegex(ReprRegex, Vec<CaptureGroupDesc>, AnalyzedRegexOpts);
 
@@ -3557,8 +3551,7 @@ fn mz_acl_explode<'a>(
     PartialOrd,
     Serialize,
     Deserialize,
-    Hash,
-    MzReflect
+    Hash
 )]
 pub enum TableFunc {
     AclExplode,
@@ -3668,8 +3661,7 @@ pub enum TableFunc {
     PartialOrd,
     Serialize,
     Deserialize,
-    Hash,
-    MzReflect
+    Hash
 )]
 struct WithOrdinality {
     inner: Box<TableFunc>,
@@ -3784,11 +3776,17 @@ impl TableFunc {
                 generate_subscripts_array(datums[0], datums[1].unwrap_int32())
             }
             TableFunc::GuardSubquerySize { column_type: _ } => {
-                // A subquery used as an expression may return at most one row;
-                // for 0 or 1 we emit no rows and let the subquery's own output
-                // flow through. Zero is benign, not "can't happen": constant
-                // folding can prove the body empty and fold its count to a
-                // literal `0`, which decorrelates to NULL via the outer lookup.
+                // A subquery used as an expression may return at most one row.
+                // For 0 or 1 we emit no rows and let the subquery's own output
+                // flow through. Zero can't come directly from the count that
+                // lowering plants (an MIR `count(true)`, at least 1 per group),
+                // but over a provably empty subquery body the optimizer may
+                // vacuously rewrite the counted expression to `null`, and a
+                // count of `null` over a group is 0. Later simplifications can
+                // surface that 0 as a literal argument that is evaluated
+                // during optimization. Emitting no rows is also the correct
+                // semantics: the empty subquery decorrelates to NULL via the
+                // outer lookup.
                 let count = datums[0].unwrap_int64();
                 if count > 1 {
                     Err(EvalError::MultipleRowsFromSubquery)
@@ -4171,8 +4169,10 @@ mod tests {
 
     /// 0 and 1 are valid (no guard rows), >1 errors with
     /// `MultipleRowsFromSubquery`, <0 with `NegativeRowsFromSubquery`. Zero is
-    /// legitimate, not "can't happen": constant folding can fold an empty
-    /// subquery's count to `0`, which must not panic (regression for #37049).
+    /// legitimate, not "can't happen": the optimizer can turn an empty
+    /// subquery's count into a literal `0` that is evaluated during
+    /// optimization (see the comment in `eval`), so it must not panic (exposed
+    /// by #37049).
     #[mz_ore::test]
     fn guard_subquery_size_accepts_zero_and_one() {
         let func = TableFunc::GuardSubquerySize {

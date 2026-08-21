@@ -7,6 +7,8 @@ menu:
         parent: "ingest-data"
         identifier: "mysql"
         weight: 5
+aliases:
+  - /self-managed/v25.2/ingest-data/mysql/
 ---
 
 ## Change Data Capture (CDC)
@@ -50,4 +52,8 @@ To help you get started, the following integration guides are available:
 
 ## Considerations
 
-{{% include-headless "/headless/mysql-considerations" %}}
+{{% include-headless "/headless/mysql-considerations-body" %}}
+
+## Handling upstream operations
+
+{{% upstream-schema-change-behavior connector="mysql" %}}

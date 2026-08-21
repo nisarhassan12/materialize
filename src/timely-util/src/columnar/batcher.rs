@@ -238,7 +238,7 @@ where
             }
         }
 
-        if self.target.borrow().len() > 0 {
+        if !self.target.is_empty() {
             let chunk = std::mem::replace(&mut self.target, Column::Typed(Default::default()));
             self.ready.push_back(chunk);
         }
@@ -259,7 +259,7 @@ where
 /// Compared to a linear scan, this is `O(log K)` for a run of length `K`
 /// satisfying `cmp` — useful when one side of a sorted merge has long runs
 /// dominated by the other side.
-fn gallop(upper: usize, lower: &mut usize, mut cmp: impl FnMut(usize) -> bool) {
+pub(crate) fn gallop(upper: usize, lower: &mut usize, mut cmp: impl FnMut(usize) -> bool) {
     // If `cmp` is already false at `*lower`, the run is empty — nothing to do.
     if *lower < upper && cmp(*lower) {
         // Phase 1 (overshoot): advance by exponentially growing steps as long
@@ -774,16 +774,19 @@ where
         }
     }
 
-    fn account(chunk: &Self::Chunk) -> (usize, usize, usize, usize) {
+    fn len(chunk: &Self::Chunk) -> usize {
+        usize::try_from(chunk.record_count()).expect("record_count is non-negative")
+    }
+
+    fn allocation(chunk: &Self::Chunk) -> (usize, usize, usize) {
         use timely::dataflow::channels::ContainerBytes;
-        let records = usize::try_from(chunk.record_count()).expect("record_count is non-negative");
         // Serialized footprint stands in for both `size` and `capacity`: the
         // chunk owns one logical allocation worth of leaf storage, and we
         // ship/recycle the whole thing rather than tracking per-leaf
         // capacities. Treating `size == capacity` matches how the framework
         // accounts already-shipped chunks (no slack to absorb).
         let bytes = chunk.length_in_bytes();
-        (records, bytes, bytes, 1)
+        (bytes, bytes, 1)
     }
 }
 

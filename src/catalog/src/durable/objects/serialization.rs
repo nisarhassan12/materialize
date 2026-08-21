@@ -29,7 +29,7 @@ use crate::durable::objects::{
 };
 use crate::durable::{
     BurstState, ClusterConfig, ClusterVariant, ClusterVariantManaged, ReconfigurationState,
-    ReconfigurationTarget, ReplicaConfig, ReplicaLocation,
+    ReconfigurationStatus, ReconfigurationTarget, ReplicaConfig, ReplicaLocation,
 };
 
 use super::{RoleAuthKey, RoleAuthValue};
@@ -75,6 +75,7 @@ impl RustType<proto::ClusterVariant> for ClusterVariant {
                 size,
                 availability_zones,
                 logging,
+                arrangement_compression,
                 replication_factor,
                 optimizer_feature_overrides,
                 schedule,
@@ -85,6 +86,7 @@ impl RustType<proto::ClusterVariant> for ClusterVariant {
                 size: size.to_string(),
                 availability_zones: availability_zones.clone(),
                 logging: logging.into_proto(),
+                arrangement_compression: *arrangement_compression,
                 replication_factor: *replication_factor,
                 optimizer_feature_overrides: optimizer_feature_overrides.into_proto(),
                 schedule: schedule.into_proto(),
@@ -103,6 +105,7 @@ impl RustType<proto::ClusterVariant> for ClusterVariant {
                 size: managed.size,
                 availability_zones: managed.availability_zones,
                 logging: managed.logging.into_rust()?,
+                arrangement_compression: managed.arrangement_compression,
                 replication_factor: managed.replication_factor,
                 optimizer_feature_overrides: managed.optimizer_feature_overrides.into_rust()?,
                 schedule: managed.schedule.into_rust()?,
@@ -120,6 +123,7 @@ impl RustType<proto::ReconfigurationState> for ReconfigurationState {
             target: self.target.into_proto(),
             deadline: self.deadline.into(),
             on_timeout: self.on_timeout.into_proto(),
+            status: self.status.into_proto(),
         }
     }
 
@@ -128,6 +132,33 @@ impl RustType<proto::ReconfigurationState> for ReconfigurationState {
             target: proto.target.into_rust()?,
             deadline: mz_repr::Timestamp::new(proto.deadline),
             on_timeout: proto.on_timeout.into_rust()?,
+            status: proto.status.into_rust()?,
+        })
+    }
+}
+
+impl RustType<proto::ReconfigurationStatus> for ReconfigurationStatus {
+    fn into_proto(&self) -> proto::ReconfigurationStatus {
+        match self {
+            ReconfigurationStatus::InProgress => proto::ReconfigurationStatus::InProgress,
+            ReconfigurationStatus::Finalized => proto::ReconfigurationStatus::Finalized,
+            ReconfigurationStatus::TimedOut => proto::ReconfigurationStatus::TimedOut,
+            ReconfigurationStatus::Cancelled => proto::ReconfigurationStatus::Cancelled,
+            ReconfigurationStatus::ResourceExhausted => {
+                proto::ReconfigurationStatus::ResourceExhausted
+            }
+        }
+    }
+
+    fn from_proto(proto: proto::ReconfigurationStatus) -> Result<Self, TryFromProtoError> {
+        Ok(match proto {
+            proto::ReconfigurationStatus::InProgress => ReconfigurationStatus::InProgress,
+            proto::ReconfigurationStatus::Finalized => ReconfigurationStatus::Finalized,
+            proto::ReconfigurationStatus::TimedOut => ReconfigurationStatus::TimedOut,
+            proto::ReconfigurationStatus::Cancelled => ReconfigurationStatus::Cancelled,
+            proto::ReconfigurationStatus::ResourceExhausted => {
+                ReconfigurationStatus::ResourceExhausted
+            }
         })
     }
 }
@@ -139,6 +170,7 @@ impl RustType<proto::ReconfigurationTarget> for ReconfigurationTarget {
             replication_factor: self.replication_factor,
             availability_zones: self.availability_zones.clone(),
             logging: self.logging.into_proto(),
+            arrangement_compression: self.arrangement_compression,
         }
     }
 
@@ -148,6 +180,7 @@ impl RustType<proto::ReconfigurationTarget> for ReconfigurationTarget {
             replication_factor: proto.replication_factor,
             availability_zones: proto.availability_zones,
             logging: proto.logging.into_rust()?,
+            arrangement_compression: proto.arrangement_compression,
         })
     }
 }
@@ -175,6 +208,7 @@ impl RustType<proto::ReplicaConfig> for ReplicaConfig {
         proto::ReplicaConfig {
             logging: self.logging.into_proto(),
             location: self.location.into_proto(),
+            arrangement_compression: self.arrangement_compression,
         }
     }
 
@@ -182,6 +216,7 @@ impl RustType<proto::ReplicaConfig> for ReplicaConfig {
         Ok(ReplicaConfig {
             location: proto.location.into_rust()?,
             logging: proto.logging.into_rust()?,
+            arrangement_compression: proto.arrangement_compression,
         })
     }
 }
@@ -528,6 +563,7 @@ impl RustType<proto::ItemValue> for ItemValue {
                     version: version.into_proto(),
                 })
                 .collect(),
+            ephemeral_owner_session: self.ephemeral_owner_session,
         }
     }
 
@@ -553,6 +589,7 @@ impl RustType<proto::ItemValue> for ItemValue {
             oid: proto.oid,
             global_id: proto.global_id.into_rust()?,
             extra_versions,
+            ephemeral_owner_session: proto.ephemeral_owner_session,
         })
     }
 }

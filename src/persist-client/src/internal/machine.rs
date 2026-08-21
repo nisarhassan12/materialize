@@ -191,7 +191,14 @@ where
     pub async fn upgrade_version(&self) -> Result<RoutineMaintenance, Version> {
         let metrics = Arc::clone(&self.applier.metrics);
         let (_seqno, upgrade_result, maintenance) = self
-            .apply_unbatched_idempotent_cmd(&metrics.cmds.remove_rollups, |_, cfg, state| {
+            .apply_unbatched_idempotent_cmd(&metrics.cmds.upgrade_version, |_, cfg, state| {
+                // A tombstone is terminal and version-inert, so treat the
+                // upgrade as trivially satisfied instead of committing a new
+                // state that `compute_next_state_locked` would reject.
+                if state.is_tombstone() {
+                    return Break(NoOpStateTransition(Ok(())));
+                }
+
                 if state.version <= cfg.build_version {
                     // This would be the place to remove any deprecated items from state, now
                     // that we're dropping compatibility with any previous versions.
@@ -215,12 +222,12 @@ where
         }
     }
 
+    /// Registers a leased reader, returning its initial state.
     pub async fn register_leased_reader(
         &self,
         reader_id: &LeasedReaderId,
         purpose: &str,
         lease_duration: Duration,
-        heartbeat_timestamp_ms: u64,
         use_critical_since: bool,
     ) -> (LeasedReaderState<T>, RoutineMaintenance) {
         let metrics = Arc::clone(&self.applier.metrics);
@@ -232,7 +239,9 @@ where
                     purpose,
                     seqno,
                     lease_duration,
-                    heartbeat_timestamp_ms,
+                    // NOTE: Sample the clock here rather than hoisting it out of the closure so
+                    // that a fresh value is used on every retry of this command.
+                    (cfg.now)(),
                     use_critical_since,
                 )
             })
@@ -245,9 +254,10 @@ where
         // seqno hold). The real invariant we want to protect here is that the
         // hold is >= the seqno_since, so validate that instead of anything more
         // specific.
-        debug_assert!(
+        mz_ore::soft_assert_no_log!(
             reader_state.seqno >= seqno_since,
-            "{} vs {}",
+            "leased reader {} registered with seqno hold {} below the shard's seqno_since {}",
+            reader_id,
             reader_state.seqno,
             seqno_since,
         );
@@ -311,12 +321,12 @@ where
         (reqs, maintenance)
     }
 
+    /// Appends `batch` if the shard upper matches its lower.
     pub async fn compare_and_append(
         &self,
         batch: &HollowBatch<T>,
         writer_id: &WriterId,
         debug_info: &HandleDebugState,
-        heartbeat_timestamp_ms: u64,
     ) -> CompareAndAppendRes<T> {
         let idempotency_token = IdempotencyToken::new();
         loop {
@@ -324,7 +334,6 @@ where
                 .compare_and_append_idempotent(
                     batch,
                     writer_id,
-                    heartbeat_timestamp_ms,
                     &idempotency_token,
                     debug_info,
                     None,
@@ -368,7 +377,6 @@ where
         &self,
         batch: &HollowBatch<T>,
         writer_id: &WriterId,
-        heartbeat_timestamp_ms: u64,
         idempotency_token: &IdempotencyToken,
         debug_info: &HandleDebugState,
         // Only exposed for testing. In prod, this always starts as None, but
@@ -481,7 +489,9 @@ where
                     state.compare_and_append(
                         batch,
                         writer_id,
-                        heartbeat_timestamp_ms,
+                        // NOTE: Sample the clock here rather than hoisting it out of the closure
+                        // so that a fresh value is used on every retry of this command.
+                        (cfg.now)(),
                         lease_duration_ms,
                         idempotency_token,
                         debug_info,
@@ -505,7 +515,7 @@ where
                     info!(
                         "compare_and_append received an indeterminate error, retrying in {:?}: {}",
                         retry.next_sleep(),
-                        err
+                        err.display_with_causes()
                     );
                     if indeterminate.is_none() {
                         indeterminate = Some(err);
@@ -579,8 +589,8 @@ where
                     assert!(
                         PartialOrder::less_equal(&writer_upper, &shard_upper),
                         "{:?} vs {:?}",
-                        &writer_upper,
-                        &shard_upper
+                        writer_upper,
+                        shard_upper
                     );
                     if PartialOrder::less_than(&writer_upper, batch.desc.upper()) {
                         // No way this could have committed in some previous
@@ -620,22 +630,18 @@ where
         }
     }
 
+    /// Downgrades the reader's since capability, also heartbeating its lease.
     pub async fn downgrade_since(
         &self,
         reader_id: &LeasedReaderId,
         outstanding_seqno: SeqNo,
         new_since: &Antichain<T>,
-        heartbeat_timestamp_ms: u64,
     ) -> (SeqNo, Since<T>, RoutineMaintenance) {
         let metrics = Arc::clone(&self.applier.metrics);
-        self.apply_unbatched_idempotent_cmd(&metrics.cmds.downgrade_since, |seqno, _cfg, state| {
-            state.downgrade_since(
-                reader_id,
-                seqno,
-                outstanding_seqno,
-                new_since,
-                heartbeat_timestamp_ms,
-            )
+        self.apply_unbatched_idempotent_cmd(&metrics.cmds.downgrade_since, |seqno, cfg, state| {
+            // NOTE: Sample the clock here rather than hoisting it out of the closure so that a
+            // fresh value is used on every retry of this command.
+            state.downgrade_since(reader_id, seqno, outstanding_seqno, new_since, (cfg.now)())
         })
         .await
     }
@@ -867,7 +873,7 @@ where
         }
         let mut watch_fut = std::pin::pin!(
             watch
-                .wait_for_seqno_ge(seqno.next())
+                .wait_for_upper_past(frontier)
                 .map(Wake::Watch)
                 .instrument(trace_span!("snapshot::watch"))
         );
@@ -956,7 +962,7 @@ where
                 Wake::Watch(watch) => {
                     watch_fut.set(
                         watch
-                            .wait_for_seqno_ge(seqno.next())
+                            .wait_for_upper_past(frontier)
                             .map(Wake::Watch)
                             .instrument(trace_span!("snapshot::watch")),
                     );
@@ -1493,12 +1499,7 @@ pub mod datadriven {
         let reader_id = args.expect("reader_id");
         let (_, since, routine) = datadriven
             .machine
-            .downgrade_since(
-                &reader_id,
-                seqno,
-                &since,
-                (datadriven.machine.applier.cfg.now)(),
-            )
+            .downgrade_since(&reader_id, seqno, &since)
             .await;
         datadriven.routine.push(routine);
         Ok(format!(
@@ -2188,7 +2189,6 @@ pub mod datadriven {
                 &reader_id,
                 "tests",
                 READER_LEASE_DURATION.get(&datadriven.client.cfg),
-                (datadriven.client.cfg.now)(),
                 false,
             )
             .await;
@@ -2306,7 +2306,6 @@ pub mod datadriven {
             .expect("unknown batch")
             .clone();
         let token = args.optional("token").unwrap_or_else(IdempotencyToken::new);
-        let now = (datadriven.client.cfg.now)();
 
         let (id, maintenance) = datadriven
             .machine
@@ -2323,7 +2322,6 @@ pub mod datadriven {
                 .compare_and_append_idempotent(
                     &batch.batch,
                     &writer_id,
-                    now,
                     &token,
                     &HandleDebugState::default(),
                     indeterminate,
@@ -2487,7 +2485,6 @@ pub mod tests {
                     &batch.into_hollow_batch(),
                     &write.writer_id,
                     &HandleDebugState::default(),
-                    (write.cfg.now)(),
                 )
                 .await
                 .unwrap();
@@ -2665,5 +2662,67 @@ pub mod tests {
 
         write.expire().await;
         reader.expire().await;
+    }
+
+    /// Regression test for a panic where `upgrade_version` tried to commit a
+    /// new state on a tombstone shard. Upgrading a tombstone must be a no-op:
+    /// the shard stays finalized and its recorded version stays unchanged.
+    #[mz_persist_proc::test(tokio::test)]
+    #[cfg_attr(miri, ignore)] // too slow
+    async fn version_upgrade_tombstone(dyncfgs: ConfigUpdates) {
+        async fn shard_version(
+            persist_client: &PersistClient,
+            shard_id: ShardId,
+        ) -> Option<semver::Version> {
+            let shard_state = persist_client.inspect_shard::<u64>(&shard_id).await.ok()?;
+            let json_state = serde_json::to_value(shard_state).expect("state serialization error");
+            let version = json_state
+                .get("applier_version")
+                .cloned()
+                .expect("missing applier_version");
+            Some(serde_json::from_value(version).expect("version deserialization error"))
+        }
+
+        let mut cache = new_test_client_cache(&dyncfgs);
+        cache.cfg.build_version = Version::new(26, 1, 0);
+        let client = cache.open(PersistLocation::new_in_mem()).await.unwrap();
+        let shard_id = ShardId::new();
+
+        // Advance since and upper to the empty antichain and finalize the
+        // shard into a tombstone.
+        let (mut write, mut read) = client.expect_open::<String, (), u64, i64>(shard_id).await;
+        read.downgrade_since(&Antichain::new()).await;
+        write.advance_upper(&Antichain::new()).await;
+        write.expire().await;
+        read.expire().await;
+        client
+            .finalize_shard::<String, (), u64, i64>(shard_id, Diagnostics::for_tests())
+            .await
+            .expect("finalization must succeed");
+
+        // Upgrading at the version that wrote the tombstone must not panic or
+        // commit a new state.
+        client
+            .upgrade_version::<String, (), u64, i64>(shard_id, Diagnostics::for_tests())
+            .await
+            .expect("upgrade on tombstone must succeed");
+
+        // Same for upgrading at a newer build version.
+        cache.cfg.build_version = Version::new(27, 1, 0);
+        let client = cache.open(PersistLocation::new_in_mem()).await.unwrap();
+        client
+            .upgrade_version::<String, (), u64, i64>(shard_id, Diagnostics::for_tests())
+            .await
+            .expect("upgrade on tombstone must succeed");
+
+        assert_eq!(
+            shard_version(&client, shard_id).await,
+            Some(Version::new(26, 1, 0)),
+        );
+        let is_finalized = client
+            .is_finalized::<String, (), u64, i64>(shard_id, Diagnostics::for_tests())
+            .await
+            .expect("invalid persist usage");
+        assert!(is_finalized, "shard must still be finalized");
     }
 }

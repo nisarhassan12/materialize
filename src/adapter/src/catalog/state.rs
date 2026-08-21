@@ -31,7 +31,7 @@ use mz_catalog::expr_cache::LocalExpressions;
 use mz_catalog::memory::error::{Error, ErrorKind};
 use mz_catalog::memory::objects::{
     CatalogCollectionEntry, CatalogEntry, CatalogItem, Cluster, ClusterReplica, CommentsMap,
-    Connection, DataSourceDesc, Database, DefaultPrivileges, Index, MaterializedView,
+    Connection, DataSourceDesc, Database, DefaultPrivileges, Index, MaterializedView, MetricSink,
     NetworkPolicy, Role, RoleAuth, Schema, Secret, Sink, Source, SourceReferences, Table,
     TableDataSource, Type, View,
 };
@@ -74,9 +74,9 @@ use mz_sql::names::{
     ResolvedDatabaseSpecifier, ResolvedIds, SchemaId, SchemaSpecifier, SystemObjectId,
 };
 use mz_sql::plan::{
-    CreateConnectionPlan, CreateIndexPlan, CreateMaterializedViewPlan, CreateSecretPlan,
-    CreateSinkPlan, CreateSourcePlan, CreateTablePlan, CreateTypePlan, CreateViewPlan, Params,
-    Plan, PlanContext,
+    CreateConnectionPlan, CreateIndexPlan, CreateMaterializedViewPlan, CreateMetricSinkPlan,
+    CreateSecretPlan, CreateSinkPlan, CreateSourcePlan, CreateTablePlan, CreateTypePlan,
+    CreateViewPlan, Params, Plan, PlanContext,
 };
 use mz_sql::rbac;
 use mz_sql::session::metadata::SessionMetadata;
@@ -93,6 +93,7 @@ use serde::Serialize;
 use timely::progress::Antichain;
 use tokio::sync::mpsc;
 use tracing::{debug, warn};
+use uuid::Uuid;
 
 // DO NOT add any more imports from `crate` outside of `crate::catalog`.
 use crate::AdapterError;
@@ -167,7 +168,7 @@ pub struct CatalogState {
     // read-only catalog opened by Testdrive's consistency check has no
     // active connections, so this must be `#[serde(skip)]`.
     #[serde(skip)]
-    pub(super) temporary_schemas: imbl::OrdMap<ConnectionId, Schema>,
+    pub(super) temporary_namespaces: TemporaryNamespaces,
 
     // Read-only state not derived from the durable catalog.
     #[serde(skip)]
@@ -186,6 +187,143 @@ pub struct CatalogState {
     // Read-only not derived from the durable catalog.
     #[serde(skip)]
     pub(super) license_key: ValidatedLicenseKey,
+}
+
+/// The temporary namespaces of the sessions connected to this process: for
+/// each session that has created a temporary item, the ephemeral-owner
+/// mapping between the session's UUID (stamped on its durable temporary
+/// items) and its connection, together with the session's `mz_temp`
+/// [`Schema`] once it has materialized.
+///
+/// The coordinator registers a namespace at a session's first
+/// temporary-item creation, and unregisters it when the session terminates.
+#[derive(Debug, Clone, Default)]
+pub(super) struct TemporaryNamespaces {
+    by_conn: imbl::OrdMap<ConnectionId, TemporaryNamespace>,
+    // For resolving a durable item's owner UUID to its connection in
+    // the apply path.
+    conns_by_uuid: imbl::OrdMap<Uuid, ConnectionId>,
+}
+
+#[derive(Debug, Clone)]
+struct TemporaryNamespace {
+    uuid: Uuid,
+    // Instantiated by `ensure_schema` at the first applied temporary item
+    schema: Option<Schema>,
+}
+
+impl TemporaryNamespaces {
+    /// Registers `conn_id` as the connection of the session `uuid`.
+    ///
+    /// Callers guard on [`CatalogState::has_temporary_namespace`], so
+    /// registering an already-registered connection is a bug.
+    pub(super) fn register(&mut self, conn_id: ConnectionId, uuid: Uuid) {
+        let prev_conn = self.conns_by_uuid.insert(uuid, conn_id.clone());
+        mz_ore::soft_assert_or_log!(
+            prev_conn.is_none(),
+            "duplicate temporary namespace registration for {uuid}"
+        );
+        let prev_ns = self
+            .by_conn
+            .insert(conn_id, TemporaryNamespace { uuid, schema: None });
+        mz_ore::soft_assert_or_log!(
+            prev_ns.is_none(),
+            "duplicate temporary namespace registration for the connection of {uuid}"
+        );
+    }
+
+    /// Returns `conn_id`'s `mz_temp` schema, creating an empty one owned by
+    /// `owner_id` if one hasn't been instantiated yet.
+    pub(super) fn ensure_schema(
+        &mut self,
+        conn_id: &ConnectionId,
+        owner_id: RoleId,
+    ) -> &mut Schema {
+        let namespace = self
+            .by_conn
+            .get_mut(conn_id)
+            .expect("temporary namespace must be registered before items are applied");
+        namespace.schema.get_or_insert_with(|| {
+            // Temporary schema OIDs are never used, and it's therefore wasteful to go to the
+            // durable catalog to allocate a new OID for every temporary schema. Instead, we give
+            // them all the same invalid OID. This matches the semantics of temporary schema
+            // `GlobalId`s which are all -1.
+            let oid = INVALID_OID;
+            Schema {
+                name: QualifiedSchemaName {
+                    database: ResolvedDatabaseSpecifier::Ambient,
+                    schema: MZ_TEMP_SCHEMA.into(),
+                },
+                id: SchemaSpecifier::Temporary,
+                oid,
+                items: BTreeMap::new(),
+                functions: BTreeMap::new(),
+                types: BTreeMap::new(),
+                owner_id,
+                privileges: PrivilegeMap::from_mz_acl_items(vec![rbac::owner_privilege(
+                    mz_sql::catalog::ObjectType::Schema,
+                    owner_id,
+                )]),
+            }
+        })
+    }
+
+    /// Removes `conn_id`'s temporary namespace.
+    pub(super) fn unregister(&mut self, conn_id: &ConnectionId) {
+        let Some(namespace) = self.by_conn.get(conn_id) else {
+            return;
+        };
+        // A non-empty schema here means temporary items (and
+        // possibly their storage shards) weren't cleaned up, so we surface the
+        // invariant violation and keep the namespace registered.
+        if namespace
+            .schema
+            .as_ref()
+            .is_some_and(|schema| !schema.items.is_empty())
+        {
+            mz_ore::soft_panic_or_log!(
+                "temporary namespace for connection {conn_id} still has items at unregistration"
+            );
+            return;
+        }
+        let uuid = namespace.uuid;
+        self.by_conn.remove(conn_id);
+        self.conns_by_uuid.remove(&uuid);
+    }
+
+    pub(super) fn schema(&self, conn_id: &ConnectionId) -> Option<&Schema> {
+        self.by_conn
+            .get(conn_id)
+            .and_then(|namespace| namespace.schema.as_ref())
+    }
+
+    pub(super) fn schema_mut(&mut self, conn_id: &ConnectionId) -> Option<&mut Schema> {
+        self.by_conn
+            .get_mut(conn_id)
+            .and_then(|namespace| namespace.schema.as_mut())
+    }
+
+    pub(super) fn schemas(&self) -> impl Iterator<Item = &Schema> {
+        self.by_conn
+            .values()
+            .filter_map(|namespace| namespace.schema.as_ref())
+    }
+
+    pub(super) fn conn_for_uuid(&self, uuid: &Uuid) -> Option<&ConnectionId> {
+        self.conns_by_uuid.get(uuid)
+    }
+
+    pub(super) fn uuid_for_conn(&self, conn_id: &ConnectionId) -> Option<Uuid> {
+        self.by_conn.get(conn_id).map(|namespace| namespace.uuid)
+    }
+
+    pub(super) fn contains_conn(&self, conn_id: &ConnectionId) -> bool {
+        self.by_conn.contains_key(conn_id)
+    }
+
+    pub(super) fn contains_uuid(&self, uuid: &Uuid) -> bool {
+        self.conns_by_uuid.contains_key(uuid)
+    }
 }
 
 /// Keeps track of what expressions are cached or not during startup.
@@ -304,7 +442,7 @@ impl CatalogState {
             notices_by_dep_id: Default::default(),
             ambient_schemas_by_name: Default::default(),
             ambient_schemas_by_id: Default::default(),
-            temporary_schemas: Default::default(),
+            temporary_namespaces: Default::default(),
             clusters_by_id: Default::default(),
             clusters_by_name: Default::default(),
             network_policies_by_name: Default::default(),
@@ -323,6 +461,7 @@ impl CatalogState {
                 connection_context: ConnectionContext::for_tests(Arc::new(
                     InMemorySecretsController::new(),
                 )),
+                aws_account_id: None,
                 helm_chart_version: None,
             },
             cluster_replica_sizes: ClusterReplicaSizeMap::for_tests(),
@@ -434,35 +573,51 @@ impl CatalogState {
     /// depends on.
     pub fn introspection_dependencies(&self, id: CatalogItemId) -> Vec<CatalogItemId> {
         let mut out = Vec::new();
-        self.introspection_dependencies_inner(id, &mut out);
-        out
-    }
 
-    fn introspection_dependencies_inner(&self, id: CatalogItemId, out: &mut Vec<CatalogItemId>) {
-        match self.get_entry(&id).item() {
-            CatalogItem::Log(_) => out.push(id),
-            item @ (CatalogItem::View(_)
-            | CatalogItem::MaterializedView(_)
-            | CatalogItem::Connection(_)) => {
-                // TODO(jkosh44) Unclear if this table wants to include all uses or only references.
-                for item_id in item.references().items() {
-                    self.introspection_dependencies_inner(*item_id, out);
+        // Iterative worklist traversal rather than recursion. The dependency
+        // chain is user controlled and can be arbitrarily deep.
+        let mut queue: VecDeque<CatalogItemId> = [id].into_iter().collect();
+        let mut seen: BTreeSet<CatalogItemId> = [id].into_iter().collect();
+        while let Some(id) = queue.pop_front() {
+            match self.get_entry(&id).item() {
+                CatalogItem::Log(_) => out.push(id),
+                item @ (CatalogItem::View(_)
+                | CatalogItem::MaterializedView(_)
+                | CatalogItem::Connection(_)) => {
+                    // TODO Unclear if this table wants to include all uses or only references.
+                    for item_id in item.references().items() {
+                        if seen.insert(*item_id) {
+                            queue.push_back(*item_id);
+                        }
+                    }
                 }
+                CatalogItem::Sink(sink) => {
+                    let from_item_id = self.get_entry_by_global_id(&sink.from).id();
+                    if seen.insert(from_item_id) {
+                        queue.push_back(from_item_id);
+                    }
+                }
+                CatalogItem::MetricSink(metric_sink) => {
+                    let from_item_id = self.get_entry_by_global_id(&metric_sink.from).id();
+                    if seen.insert(from_item_id) {
+                        queue.push_back(from_item_id);
+                    }
+                }
+                CatalogItem::Index(idx) => {
+                    let on_item_id = self.get_entry_by_global_id(&idx.on).id();
+                    if seen.insert(on_item_id) {
+                        queue.push_back(on_item_id);
+                    }
+                }
+                CatalogItem::Table(_)
+                | CatalogItem::Source(_)
+                | CatalogItem::Type(_)
+                | CatalogItem::Func(_)
+                | CatalogItem::Secret(_) => (),
             }
-            CatalogItem::Sink(sink) => {
-                let from_item_id = self.get_entry_by_global_id(&sink.from).id();
-                self.introspection_dependencies_inner(from_item_id, out)
-            }
-            CatalogItem::Index(idx) => {
-                let on_item_id = self.get_entry_by_global_id(&idx.on).id();
-                self.introspection_dependencies_inner(on_item_id, out)
-            }
-            CatalogItem::Table(_)
-            | CatalogItem::Source(_)
-            | CatalogItem::Type(_)
-            | CatalogItem::Func(_)
-            | CatalogItem::Secret(_) => (),
         }
+
+        out
     }
 
     /// Returns all the IDs of all objects that depend on `ids`, including `ids` themselves.
@@ -644,21 +799,41 @@ impl CatalogState {
         seen: &mut BTreeSet<ObjectId>,
     ) -> Vec<ObjectId> {
         let mut dependents = Vec::new();
-        let object_id = ObjectId::Item(item_id);
-        if !seen.contains(&object_id) {
-            seen.insert(object_id.clone());
-            let entry = self.get_entry(&item_id);
-            for dependent_id in entry.used_by() {
-                dependents.extend_from_slice(&self.item_dependents(*dependent_id, seen));
-            }
-            dependents.push(object_id);
-            // We treat the progress collection as if it depends on the source
-            // for dropping. We have additional code in planning to create a
-            // kind of special-case "CASCADE" for this dependency.
-            if let Some(progress_id) = entry.progress_id() {
-                dependents.extend_from_slice(&self.item_dependents(progress_id, seen));
+
+        // Iterative post-order traversal rather than recursion. Dependency
+        // chains are user controlled and can be arbitrarily deep (e.g. a long
+        // chain of stacked views), so recursing risks a stack overflow.
+        enum Work {
+            Enter(CatalogItemId),
+            Emit(ObjectId),
+        }
+        let mut stack = vec![Work::Enter(item_id)];
+        while let Some(work) = stack.pop() {
+            match work {
+                Work::Enter(item_id) => {
+                    let object_id = ObjectId::Item(item_id);
+                    if !seen.insert(object_id.clone()) {
+                        continue;
+                    }
+                    let entry = self.get_entry(&item_id);
+                    // Pushed in reverse of the desired output order: dependents
+                    // first, then self, then the progress collection. We treat
+                    // the progress collection as if it depends on the source
+                    // for dropping. We have additional code in planning to
+                    // create a kind of special-case "CASCADE" for this
+                    // dependency.
+                    if let Some(progress_id) = entry.progress_id() {
+                        stack.push(Work::Enter(progress_id));
+                    }
+                    stack.push(Work::Emit(object_id));
+                    for dependent_id in entry.used_by().iter().rev() {
+                        stack.push(Work::Enter(*dependent_id));
+                    }
+                }
+                Work::Emit(object_id) => dependents.push(object_id),
             }
         }
+
         dependents
     }
 
@@ -795,20 +970,58 @@ impl CatalogState {
     }
 
     pub fn get_temp_items(&self, conn: &ConnectionId) -> impl Iterator<Item = ObjectId> + '_ {
-        // Temporary schemas are created lazily, so it's valid for one to not exist yet.
-        self.temporary_schemas
-            .get(conn)
+        // A temporary namespace is registered at the connection's first
+        // temporary-item creation, so it's valid for one to not exist yet.
+        self.temporary_namespaces
+            .schema(conn)
             .into_iter()
             .flat_map(|schema| schema.items.values().copied().map(ObjectId::from))
     }
 
-    /// Returns true if a temporary schema exists for the given connection.
+    /// Returns true if a temporary namespace is registered for the given
+    /// connection, i.e. it has (or has had) temporary items.
     ///
-    /// Temporary schemas are created lazily when the first temporary object is created
-    /// for a connection, so this may return false for connections that haven't created
+    /// The namespace is registered at the connection's first temporary-item
+    /// creation, so this returns false for connections that never created
     /// any temporary objects.
-    pub fn has_temporary_schema(&self, conn: &ConnectionId) -> bool {
-        self.temporary_schemas.contains_key(conn)
+    pub fn has_temporary_namespace(&self, conn: &ConnectionId) -> bool {
+        self.temporary_namespaces.contains_conn(conn)
+    }
+
+    /// Converts an in-memory catalog entry into its durable representation.
+    ///
+    /// The durable owner of a temporary entry is the session whose connection
+    /// currently holds it, resolved from the temporary namespace
+    /// registered at the session's first temporary-item creation.
+    pub(super) fn durable_item(
+        &self,
+        entry: CatalogEntry,
+    ) -> Result<mz_catalog::durable::Item, AdapterError> {
+        let ephemeral_owner_session = entry
+            .conn_id()
+            .map(|conn_id| {
+                self.temporary_namespaces
+                    .uuid_for_conn(conn_id)
+                    .ok_or_else(|| {
+                        AdapterError::Internal(format!(
+                            "no session record for connection {conn_id} owning temporary item"
+                        ))
+                    })
+            })
+            .transpose()?;
+        let (create_sql, global_id, extra_versions) = entry.item.into_serialized();
+        Ok(mz_catalog::durable::Item {
+            id: entry.id,
+            oid: entry.oid,
+            global_id,
+            schema_id: entry.name.qualifiers.schema_spec.into(),
+            name: entry.name.item,
+            create_sql,
+            owner_id: entry.owner_id,
+            privileges: entry.privileges.into_all_values().collect(),
+            extra_versions,
+            ephemeral_owner_session,
+        })
     }
 
     /// Gets a type named `name` from exactly one of the system schemas.
@@ -1473,6 +1686,19 @@ impl CatalogState {
                 physical_plan: None,
                 dataflow_metainfo: None,
             }),
+            Plan::CreateMetricSink(CreateMetricSinkPlan { metric_sink, .. }) => {
+                CatalogItem::MetricSink(MetricSink {
+                    create_sql: metric_sink.create_sql,
+                    global_id,
+                    from: metric_sink.from,
+                    resolved_ids,
+                    cluster_id: metric_sink.cluster_id,
+                    prefix: metric_sink.prefix,
+                    optimized_plan: None,
+                    physical_plan: None,
+                    dataflow_metainfo: None,
+                })
+            }
             Plan::CreateSink(CreateSinkPlan {
                 sink,
                 with_snapshot,
@@ -1567,6 +1793,11 @@ impl CatalogState {
         //    should be `enable_for_item_parsing` set to `true`.
         // 2. After this step, feature flag configuration must not be
         //    overridden.
+        // 3. We don't notify `SystemVars` callbacks here, neither for the
+        //    flags this enables nor for the `Arc` restore that undoes them
+        //    afterwards. A callback on a `feature_flags!` var therefore won't
+        //    observe this transient flip, only committed changes to it. See
+        //    `SystemVars::register_callback`.
         let restore = Arc::clone(&self.system_configuration);
         Arc::make_mut(&mut self.system_configuration).enable_for_item_parsing();
         let res = f(self);
@@ -1665,7 +1896,7 @@ impl CatalogState {
     ) -> Result<&Schema, SqlCatalogError> {
         let schema = match database_spec {
             ResolvedDatabaseSpecifier::Ambient if schema_name == MZ_TEMP_SCHEMA => {
-                self.temporary_schemas.get(conn_id)
+                self.temporary_namespaces.schema(conn_id)
             }
             ResolvedDatabaseSpecifier::Ambient => self
                 .ambient_schemas_by_name
@@ -1682,8 +1913,9 @@ impl CatalogState {
 
     /// Try to get a schema, returning `None` if it doesn't exist.
     ///
-    /// For temporary schemas, returns `None` if the schema hasn't been created yet
-    /// (temporary schemas are created lazily when the first temporary object is created).
+    /// For temporary schemas, returns `None` if the connection's temporary
+    /// namespace hasn't been registered yet (that happens at its first
+    /// temporary-item creation).
     pub fn try_get_schema(
         &self,
         database_spec: &ResolvedDatabaseSpecifier,
@@ -1693,7 +1925,7 @@ impl CatalogState {
         // Keep in sync with `get_schema` and `get_schemas_mut`
         match (database_spec, schema_spec) {
             (ResolvedDatabaseSpecifier::Ambient, SchemaSpecifier::Temporary) => {
-                self.temporary_schemas.get(conn_id)
+                self.temporary_namespaces.schema(conn_id)
             }
             (ResolvedDatabaseSpecifier::Ambient, SchemaSpecifier::Id(id)) => {
                 self.ambient_schemas_by_id.get(id)
@@ -1724,13 +1956,6 @@ impl CatalogState {
             .values()
             .filter_map(|database| database.schemas_by_id.get(schema_id))
             .chain(self.ambient_schemas_by_id.values())
-            .filter(|schema| schema.id() == &SchemaSpecifier::from(*schema_id))
-            .into_first()
-    }
-
-    pub(super) fn find_temp_schema(&self, schema_id: &SchemaId) -> &Schema {
-        self.temporary_schemas
-            .values()
             .filter(|schema| schema.id() == &SchemaSpecifier::from(*schema_id))
             .into_first()
     }
@@ -1797,40 +2022,6 @@ impl CatalogState {
         }
     }
 
-    /// Creates a new schema in the `Catalog` for temporary items
-    /// indicated by the TEMPORARY or TEMP keywords.
-    pub fn create_temporary_schema(
-        &mut self,
-        conn_id: &ConnectionId,
-        owner_id: RoleId,
-    ) -> Result<(), Error> {
-        // Temporary schema OIDs are never used, and it's therefore wasteful to go to the durable
-        // catalog to allocate a new OID for every temporary schema. Instead, we give them all the
-        // same invalid OID. This matches the semantics of temporary schema `GlobalId`s which are
-        // all -1.
-        let oid = INVALID_OID;
-        self.temporary_schemas.insert(
-            conn_id.clone(),
-            Schema {
-                name: QualifiedSchemaName {
-                    database: ResolvedDatabaseSpecifier::Ambient,
-                    schema: MZ_TEMP_SCHEMA.into(),
-                },
-                id: SchemaSpecifier::Temporary,
-                oid,
-                items: BTreeMap::new(),
-                functions: BTreeMap::new(),
-                types: BTreeMap::new(),
-                owner_id,
-                privileges: PrivilegeMap::from_mz_acl_items(vec![rbac::owner_privilege(
-                    mz_sql::catalog::ObjectType::Schema,
-                    owner_id,
-                )]),
-            },
-        );
-        Ok(())
-    }
-
     /// Return all OIDs that are allocated to temporary objects.
     pub(crate) fn get_temporary_oids(&self) -> impl Iterator<Item = u32> + '_ {
         std::iter::empty()
@@ -1888,6 +2079,7 @@ impl CatalogState {
             CatalogItemType::Table
             | CatalogItemType::Source
             | CatalogItemType::Sink
+            | CatalogItemType::MetricSink
             | CatalogItemType::View
             | CatalogItemType::MaterializedView
             | CatalogItemType::Index
@@ -2048,6 +2240,11 @@ impl CatalogState {
             .get(session.database())
             .map(|id| id.clone());
 
+        // NOTE: This drops schemas that don't resolve, and consumers rely on
+        // every returned entry existing (e.g. `allocate_full_name` and the
+        // `current_schemas` evaluation look schemas up infallibly). In
+        // particular, `mz_temp` is dropped until the session's temporary
+        // namespace is registered at its first temporary-item creation.
         session
             .search_path()
             .iter()
@@ -2710,6 +2907,7 @@ impl CatalogState {
             | CommentObjectId::MaterializedView(id)
             | CommentObjectId::Source(id)
             | CommentObjectId::Sink(id)
+            | CommentObjectId::MetricSink(id)
             | CommentObjectId::Index(id)
             | CommentObjectId::Func(id)
             | CommentObjectId::Connection(id)
@@ -2739,6 +2937,7 @@ impl CatalogState {
             | CommentObjectId::MaterializedView(id)
             | CommentObjectId::Source(id)
             | CommentObjectId::Sink(id)
+            | CommentObjectId::MetricSink(id)
             | CommentObjectId::Index(id)
             | CommentObjectId::Func(id)
             | CommentObjectId::Connection(id)
@@ -2853,5 +3052,184 @@ impl OptimizerCatalog for Catalog {
 impl Catalog {
     pub fn as_optimizer_catalog(self: Arc<Self>) -> Arc<dyn OptimizerCatalog> {
         self
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A deep dependency chain (a long chain of stacked views) must not
+    /// overflow the stack when computing its dependents, and the dependents
+    /// must come out in reverse-dependency order (deepest dependent first,
+    /// root last) so that `DROP ... CASCADE` drops them in a valid order.
+    #[mz_ore::test(tokio::test)]
+    #[cfg_attr(miri, ignore)] // unsupported operation: can't call foreign function `TLS_client_method`
+    async fn item_dependents_deep_chain_no_stack_overflow() {
+        use mz_ore::cast::CastFrom;
+
+        Catalog::with_debug(|mut catalog| async move {
+            // Deep enough that the previous recursive implementation overflowed
+            // the stack.
+            const DEPTH: usize = 100_000;
+            // Well above any id the debug catalog assigns, so the synthetic
+            // chain does not collide with real entries.
+            const BASE: u64 = 1 << 40;
+
+            // Clone a builtin log entry as a template so we don't have to
+            // construct a `CatalogItem` by hand. `item_dependents` only reads
+            // `used_by`/`progress_id`, and a log's `progress_id` is `None`.
+            let template = catalog
+                .state
+                .entry_by_id
+                .values()
+                .find(|entry| matches!(entry.item(), CatalogItem::Log(_)))
+                .expect("debug catalog has log sources")
+                .clone();
+
+            // Build a chain where entry `BASE + i` is used by `BASE + i + 1`.
+            for i in 0..=DEPTH {
+                let id = CatalogItemId::User(BASE + u64::cast_from(i));
+                let mut entry = template.clone();
+                entry.id = id;
+                entry.referenced_by = Vec::new();
+                entry.used_by = if i < DEPTH {
+                    vec![CatalogItemId::User(BASE + u64::cast_from(i + 1))]
+                } else {
+                    Vec::new()
+                };
+                catalog.state.entry_by_id.insert(id, entry);
+            }
+
+            let mut seen = BTreeSet::new();
+            let dependents = catalog
+                .state
+                .item_dependents(CatalogItemId::User(BASE), &mut seen);
+
+            // Every element of the chain appears exactly once.
+            assert_eq!(dependents.len(), DEPTH + 1);
+            // Reverse-dependency order: the deepest dependent is first and the
+            // root we asked about is last.
+            for (offset, dependent) in dependents.iter().enumerate() {
+                let expected = CatalogItemId::User(BASE + u64::cast_from(DEPTH - offset));
+                assert_eq!(dependent, &ObjectId::Item(expected));
+            }
+
+            catalog.expire().await;
+        })
+        .await
+    }
+
+    /// Read-then-write dependency validation walks the transitive `uses()` of
+    /// the read set. A deep chain of stacked views (user controlled, arbitrarily
+    /// deep) must be validated without overflowing the coordinator thread's
+    /// stack, so the traversal must not recurse.
+    #[mz_ore::test(tokio::test)]
+    #[cfg_attr(miri, ignore)] // unsupported operation: can't call foreign function `TLS_client_method`
+    async fn validate_read_then_write_deep_chain_no_stack_overflow() {
+        use crate::coord::read_then_write::validate_read_then_write_dependencies;
+
+        Catalog::with_debug(|mut catalog| async move {
+            // Deep enough that the previous recursive implementation overflowed
+            // the stack.
+            const DEPTH: usize = 100_000;
+            const BASE: u64 = 1 << 40;
+            insert_synthetic_view_chain(&mut catalog, BASE, DEPTH);
+
+            // A generous bound so this test isolates the no-overflow property
+            // rather than the dependency limit.
+            validate_read_then_write_dependencies(
+                &catalog,
+                [CatalogItemId::User(BASE)],
+                usize::MAX,
+            )
+            .expect("deep chain of user views is valid for read-then-write");
+
+            catalog.expire().await;
+        })
+        .await
+    }
+
+    /// Read-then-write dependency validation is bounded: a read set with more
+    /// transitive dependencies than the limit is rejected with a clean error
+    /// rather than walking an unbounded graph.
+    #[mz_ore::test(tokio::test)]
+    #[cfg_attr(miri, ignore)] // unsupported operation: can't call foreign function `TLS_client_method`
+    async fn validate_read_then_write_dependency_limit() {
+        use crate::coord::read_then_write::validate_read_then_write_dependencies;
+        use crate::error::AdapterError;
+
+        Catalog::with_debug(|mut catalog| async move {
+            const DEPTH: usize = 100;
+            const BASE: u64 = 1 << 40;
+            insert_synthetic_view_chain(&mut catalog, BASE, DEPTH);
+
+            // The chain has DEPTH + 1 distinct objects (root plus DEPTH links).
+            const OBJECTS: usize = DEPTH + 1;
+
+            // Exactly at the limit is allowed.
+            validate_read_then_write_dependencies(&catalog, [CatalogItemId::User(BASE)], OBJECTS)
+                .expect("chain at the limit is valid");
+
+            // One below the limit is rejected with a clean error.
+            let err = validate_read_then_write_dependencies(
+                &catalog,
+                [CatalogItemId::User(BASE)],
+                OBJECTS - 1,
+            )
+            .expect_err("chain over the limit is rejected");
+            assert!(matches!(
+                err,
+                AdapterError::ReadThenWriteDependencyLimitExceeded {
+                    max_rw_dependencies
+                } if max_rw_dependencies == OBJECTS - 1
+            ));
+
+            catalog.expire().await;
+        })
+        .await
+    }
+
+    /// Inserts a synthetic chain of `depth + 1` user views into `catalog` where
+    /// view `base + i` reads from `base + i + 1`. Ids start well above any id
+    /// the debug catalog assigns so they do not collide with real entries.
+    ///
+    /// Clones a builtin view as a template rather than constructing a `View` by
+    /// hand. Read-then-write validation only reads the item type, `uses()`, and
+    /// the optimized expression's temporal-ness, all of which a builtin view
+    /// satisfies (user id + non-temporal).
+    fn insert_synthetic_view_chain(catalog: &mut Catalog, base: u64, depth: usize) {
+        use mz_ore::cast::CastFrom;
+        use mz_sql::names::{DependencyIds, ResolvedIds};
+
+        let template = catalog
+            .state
+            .entry_by_id
+            .values()
+            .find(|entry| matches!(entry.item(), CatalogItem::View(_)))
+            .expect("debug catalog has builtin views")
+            .clone();
+
+        // `uses()` for a view unions `resolved_ids` and `dependencies`, so clear
+        // both and point only at the next link.
+        for i in 0..=depth {
+            let id = CatalogItemId::User(base + u64::cast_from(i));
+            let mut entry = template.clone();
+            entry.id = id;
+            entry.referenced_by = Vec::new();
+            entry.used_by = Vec::new();
+            let mut resolved_ids = ResolvedIds::empty();
+            if i < depth {
+                resolved_ids.add_item(CatalogItemId::User(base + u64::cast_from(i + 1)));
+            }
+            match &mut entry.item {
+                CatalogItem::View(view) => {
+                    view.resolved_ids = resolved_ids;
+                    view.dependencies = DependencyIds(BTreeSet::new());
+                }
+                _ => unreachable!("template is a view"),
+            }
+            catalog.state.entry_by_id.insert(id, entry);
+        }
     }
 }

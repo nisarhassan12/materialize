@@ -10,6 +10,7 @@ menu:
 aliases:
   - /ops/diagnosing-using-sql/
   - /ops/troubleshooting/
+  - /self-managed/v25.2/ingest-data/troubleshooting/
 ---
 
 As you wire up data ingestion in Materialize, you might run into some snags or
@@ -63,7 +64,7 @@ cannot serve queries. That is, queries issued to the snapshotting source (and
 its subsources) will return after the snapshotting completes (unless the user
 breaks out of the query).
 
-{{< include-md file="shared-content/snapshotting-cluster-size-postgres.md" >}}
+{{% include-headless "/headless/snapshotting-cluster-size-postgres" %}}
 
 To determine whether your source has completed ingesting the initial snapshot,
 you can query the [`mz_source_statistics`](/reference/system-catalog/mz_internal/#mz_source_statistics)
@@ -85,13 +86,13 @@ monitor its progress. See [Monitoring data ingestion](/ingest-data/monitoring-da
 
 ## How do I speed up the snapshotting process?
 
-{{< include-md file="shared-content/snapshotting-cluster-size-postgres.md" >}}
+{{% include-headless "/headless/snapshotting-cluster-size-postgres" %}}
 
 To speed up the snapshotting process, you can scale up the [size of the cluster
 ](/sql/alter-cluster/#alter-cluster-size) used for snapshotting, then scale it
 back down once the snapshot completes.
 
-{{< include-md file="shared-content/resize-cluster-for-snapshotting.md" >}}
+{{% include-headless "/headless/resize-cluster-for-snapshotting" %}}
 
 For upsert sources, a larger cluster can not only speed up snapshotting, but may
 also be necessary to support increased memory usage during the process. For more

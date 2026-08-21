@@ -155,6 +155,33 @@ where
     pub(crate) _phantom: PhantomData<fn() -> (K, V, T, D)>,
 }
 
+// Hand-written (rather than derived) so cloning does not require `K: Clone`
+// etc.: every field is an `Arc` or independently `Clone`. The `schema_cache`
+// clone shares the schema-lookup maps and applier, so clones reuse cached
+// schema fetches and only duplicate a small per-clone migration memo. Used to
+// run several `fetch_leased_part` calls concurrently, each on its own clone.
+impl<K, V, T, D> Clone for BatchFetcher<K, V, T, D>
+where
+    T: Timestamp + Lattice + Codec64,
+    K: Debug + Codec,
+    V: Debug + Codec,
+    D: Monoid + Codec64 + Send + Sync,
+{
+    fn clone(&self) -> Self {
+        Self {
+            cfg: self.cfg.clone(),
+            blob: Arc::clone(&self.blob),
+            metrics: Arc::clone(&self.metrics),
+            shard_metrics: Arc::clone(&self.shard_metrics),
+            shard_id: self.shard_id.clone(),
+            read_schemas: self.read_schemas.clone(),
+            schema_cache: self.schema_cache.clone(),
+            is_transient: self.is_transient,
+            _phantom: PhantomData,
+        }
+    }
+}
+
 impl<K, V, T, D> BatchFetcher<K, V, T, D>
 where
     K: Debug + Codec,
@@ -629,8 +656,11 @@ where
     }
 
     /// Returns the pushdown stats for this part.
+    ///
+    /// Stats written by a newer version may not decode; those return `None`,
+    /// the same as a part that carries no stats.
     pub fn stats(&self) -> Option<PartStats> {
-        self.part.stats().map(|x| x.decode())
+        self.part.stats().and_then(|x| x.try_decode().ok())
     }
 
     /// Apply any relevant projection pushdown optimizations, assuming that the data in the part
@@ -661,6 +691,11 @@ where
             &[as_of] => as_of,
             _ => return,
         };
+        // NOTE: `diffs_sum` sums every row physically in the blob, while
+        // reads truncate rows outside the registered desc. Substituting it is
+        // sound only while no writer registers a batch with tighter bounds
+        // than the blob holds (none does today, and rewritten batches prove
+        // it), which nothing here can re-check without fetching the blob.
         let eligible = self.desc.upper().less_equal(as_of) && self.desc.since().less_equal(as_of);
         if !eligible {
             return;
@@ -843,9 +878,14 @@ impl<K: Codec, V: Codec, T: Timestamp + Lattice + Codec64, D> FetchedBlob<K, V, 
     }
 
     /// Decodes and returns the pushdown stats for this part, if known.
+    ///
+    /// Stats written by a newer version may not decode; those return `None`,
+    /// the same as a part that carries no stats.
     pub fn stats(&self) -> Option<PartStats> {
         match &self.buf {
-            FetchedBlobBuf::Hollow { part, .. } => part.stats.as_ref().map(|x| x.decode()),
+            FetchedBlobBuf::Hollow { part, .. } => {
+                part.stats.as_ref().and_then(|x| x.try_decode().ok())
+            }
             FetchedBlobBuf::Inline { .. } => None,
         }
     }

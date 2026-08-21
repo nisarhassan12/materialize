@@ -1,6 +1,6 @@
 ---
 source: src/expr/src/scalar/func/variadic.rs
-revision: 641dc71585
+revision: f4650d00b
 ---
 
 # mz-expr::scalar::func::variadic

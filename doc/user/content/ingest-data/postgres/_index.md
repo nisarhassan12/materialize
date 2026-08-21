@@ -9,6 +9,8 @@ menu:
     identifier: 'postgresql'
 aliases:
   - /self-managed/v25.1/ingest-data/postgres/
+  - /self-managed/v25.2/ingest-data/postgres/
+  - /self-managed/v25.2/ingest-data/postgres/amazon-aurora/
 ---
 
 ## Change Data Capture (CDC)
@@ -44,9 +46,13 @@ common PostgreSQL hosted services.
 
 To help you get started, the following integration guides are available:
 
-{{% include-md file="shared-content/postgresql-ingest-data-guides.md" %}}
+{{% include-headless "/headless/postgresql-ingest-data-guides" %}}
 
 ## Considerations
 
 {{% include-from-yaml data="postgres_source_details"
-name="postgres-considerations" %}}
+name="postgres-considerations-body" %}}
+
+## Handling upstream operations
+
+{{% upstream-schema-change-behavior connector="postgres" %}}

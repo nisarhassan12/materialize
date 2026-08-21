@@ -161,7 +161,9 @@ snk1             kafka    snk1_cluster  ""
 snk2             kafka    snk2_cluster  ""
 snk3             kafka    snk3_cluster  ""
 
-$ kafka-verify-data format=avro sink=materialize.public.snk1 sort-messages=true
+# Several later sinks in this file (default_cluster_sink, sink_with_options,
+# cluster_c_sink) also write to this topic, so it is not exhaustively verified.
+$ kafka-verify-data format=avro sink=materialize.public.snk1 sort-messages=true exhaustive=false
 {"before": null, "after": {"row":{"a": "goofus", "b": "gallant", "offset": [0, 0, 0, 0, 0, 0, 0, 1]}}}
 {"before": null, "after": {"row":{"a": "jack", "b": "jill", "offset": [0, 0, 0, 0, 0, 0, 0, 0]}}}
 
@@ -239,6 +241,18 @@ $ kafka-verify-data format=avro sink=materialize.public.snk6 sort-messages=true
 {"before": null, "after": {"row":{"a": "goofus", "b": "gallant", "offset": [0, 0, 0, 0, 0, 0, 0, 1]}}}
 {"before": null, "after": {"row":{"a": "jack", "b": "jill", "offset": [0, 0, 0, 0, 0, 0, 0, 0]}}}
 
+# The `extra,row` ingest above also reaches snk2, snk3, and snk4, which were
+# verified before it arrived. Verify the trailing record on each so their
+# topics are fully consumed.
+$ kafka-verify-data format=avro sink=materialize.public.snk2
+{"before": null, "after": {"row":{"a": "extra", "b": "row", "offset": [0, 0, 0, 0, 0, 0, 0, 2]}}}
+
+$ kafka-verify-data format=avro sink=materialize.public.snk3
+{"before": null, "after": {"row":{"c": "extrarow"}}}
+
+$ kafka-verify-data format=avro sink=materialize.public.snk4
+{"before": null, "after": {"row":{"c": true}}}
+
 # Test that we are correctly handling SNAPSHOT on views with empty upper
 # frontier
 > CREATE MATERIALIZED VIEW foo AS VALUES (1), (2), (3);
@@ -315,27 +329,6 @@ contains:Expected one of PARTITION or SNAPSHOT or VERSION or COMMIT, found SIZE
   FORMAT AVRO USING CONFLUENT SCHEMA REGISTRY CONNECTION csr_conn
   ENVELOPE DEBEZIUM
 
-> CREATE SINK zero_interval_sink
-  IN CLUSTER ${arg.single-replica-cluster}
-  FROM src_tbl
-  INTO KAFKA CONNECTION kafka_conn (
-    TOPIC 'testdrive-kafka-sink-zero-interval-${testdrive.seed}',
-    TOPIC METADATA REFRESH INTERVAL '0s'
-  )
-  FORMAT AVRO USING CONFLUENT SCHEMA REGISTRY CONNECTION csr_conn
-  ENVELOPE DEBEZIUM
-
-> CREATE SINK clamp_refresh_interval_sink
-  IN CLUSTER ${arg.single-replica-cluster}
-  FROM src_tbl
-  INTO KAFKA CONNECTION kafka_conn (
-    TOPIC 'testdrive-kafka-sink-clamp-interval-${testdrive.seed}',
-    TOPIC METADATA REFRESH INTERVAL '1ms'
-  )
-  FORMAT AVRO USING CONFLUENT SCHEMA REGISTRY CONNECTION csr_conn
-  ENVELOPE DEBEZIUM
-
-
 # All sinks are unlinked
 > SELECT bool_and(size IS NULL) FROM mz_sinks;
 true
@@ -357,5 +350,3 @@ snk7                  kafka  snk7_cluster                   ""
 snk8                  kafka  snk8_cluster                   ""
 snk9                  kafka  snk9_cluster                   ""
 snk_unsigned          kafka  snk_unsigned_cluster           ""
-zero_interval_sink    kafka ${arg.single-replica-cluster}   ""
-clamp_refresh_interval_sink  kafka ${arg.single-replica-cluster}  ""

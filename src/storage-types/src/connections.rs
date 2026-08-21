@@ -11,6 +11,7 @@
 
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::SystemTime;
@@ -50,6 +51,7 @@ use mz_ore::error::ErrorExt;
 use mz_ore::future::{InTask, OreFutureExt};
 use mz_ore::netio::resolve_address;
 use mz_ore::num::NonNeg;
+use mz_ore::str::StrExt;
 use mz_repr::{CatalogItemId, GlobalId};
 use mz_secrets::SecretsReader;
 use mz_sql_parser::ast::ConnectionRulePattern;
@@ -543,6 +545,8 @@ pub enum ConnectionValidationError {
     Aws(#[from] AwsConnectionValidationError),
     #[error(transparent)]
     Gcp(#[from] gcp::GcpConnectionValidationError),
+    #[error(transparent)]
+    AwsPrivatelinkServiceName(#[from] InvalidAwsPrivatelinkServiceName),
     #[error("{}", .0.display_with_causes())]
     Other(#[from] anyhow::Error),
 }
@@ -556,6 +560,7 @@ impl ConnectionValidationError {
             ConnectionValidationError::SqlServer(e) => e.detail(),
             ConnectionValidationError::Aws(e) => e.detail(),
             ConnectionValidationError::Gcp(e) => e.detail(),
+            ConnectionValidationError::AwsPrivatelinkServiceName(_) => None,
             ConnectionValidationError::Other(_) => None,
         }
     }
@@ -568,6 +573,7 @@ impl ConnectionValidationError {
             ConnectionValidationError::SqlServer(e) => e.hint(),
             ConnectionValidationError::Aws(e) => e.hint(),
             ConnectionValidationError::Gcp(e) => e.hint(),
+            ConnectionValidationError::AwsPrivatelinkServiceName(e) => Some(e.hint()),
             ConnectionValidationError::Other(_) => None,
         }
     }
@@ -764,25 +770,6 @@ impl IcebergCatalogConnection<InlinedConnection> {
     ) -> Result<Arc<dyn Catalog>, anyhow::Error> {
         let secret_reader = &storage_configuration.connection_context.secrets_reader;
         let aws_ref = &s3tables.aws_connection;
-        let aws_config = aws_ref
-            .connection
-            .load_sdk_config(
-                &storage_configuration.connection_context,
-                aws_ref.connection_id,
-                in_task,
-                ENFORCE_EXTERNAL_ADDRESSES.get(storage_configuration.config_set()),
-            )
-            .await
-            .with_context(|| {
-                format!(
-                    "failed to load AWS SDK config for S3 Tables Iceberg catalog \
-                     (connection id: {}, auth method: {}, catalog uri: {}, warehouse: {})",
-                    aws_ref.connection_id,
-                    aws_ref.connection.auth_method(),
-                    self.uri,
-                    s3tables.warehouse
-                )
-            })?;
 
         let aws_region = aws_ref
             .connection
@@ -819,9 +806,61 @@ impl IcebergCatalogConnection<InlinedConnection> {
         // Sign REST catalog requests with the Materialize AWS credential chain
         // via a custom `RequestAuthenticator`. For AssumeRole auth, also feed
         // the chain to OpenDAL's S3 loader so data-file IO uses the same creds.
-        let credentials_provider = aws_config
-            .credentials_provider()
-            .ok_or_else(|| anyhow!("aws_config missing credentials provider"))?;
+        //
+        // For AssumeRole auth, the provider serves cached credentials that a
+        // background task keeps fresh, so no request through this catalog ever
+        // waits on STS. The task lives as long as the catalog holds the
+        // provider.
+        let credentials_provider = match &aws_auth {
+            // NOTE: This branch never contacts the connection's ENDPOINT.
+            // REST requests go to the catalog URI and the STS calls use the
+            // SDK defaults. The endpoint is still validated so a forbidden
+            // one is rejected rather than silently ignored.
+            AwsAuth::AssumeRole(assume_role) => {
+                aws_ref.connection.validate_endpoint(
+                    ENFORCE_EXTERNAL_ADDRESSES.get(storage_configuration.config_set()),
+                )?;
+                assume_role
+                    .prefetch_credentials(
+                        &storage_configuration.connection_context,
+                        aws_ref.connection_id,
+                        storage_configuration.config_set(),
+                        format!("aws-connection-{}", aws_ref.connection_id),
+                    )
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "failed to initialize AssumeRole credentials for S3 Tables Iceberg \
+                             catalog (catalog uri: {}, warehouse: {})",
+                            self.uri, s3tables.warehouse
+                        )
+                    })?
+            }
+            AwsAuth::Credentials(_) => {
+                let aws_config = aws_ref
+                    .connection
+                    .load_sdk_config(
+                        &storage_configuration.connection_context,
+                        aws_ref.connection_id,
+                        in_task,
+                        ENFORCE_EXTERNAL_ADDRESSES.get(storage_configuration.config_set()),
+                    )
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "failed to load AWS SDK config for S3 Tables Iceberg catalog \
+                             (connection id: {}, auth method: {}, catalog uri: {}, warehouse: {})",
+                            aws_ref.connection_id,
+                            aws_ref.connection.auth_method(),
+                            self.uri,
+                            s3tables.warehouse
+                        )
+                    })?;
+                aws_config
+                    .credentials_provider()
+                    .ok_or_else(|| anyhow!("aws_config missing credentials provider"))?
+            }
+        };
 
         let authenticator = Arc::new(Sigv4Authenticator {
             provider: credentials_provider.clone(),
@@ -981,6 +1020,51 @@ impl AlterCompatible for AwsPrivatelinkConnection {
     }
 }
 
+/// A `SERVICE NAME` that cannot name an AWS VPC endpoint service.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct InvalidAwsPrivatelinkServiceName {
+    pub name: String,
+}
+
+impl fmt::Display for InvalidAwsPrivatelinkServiceName {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "invalid AWS PrivateLink service name {}",
+            self.name.quoted()
+        )
+    }
+}
+
+impl std::error::Error for InvalidAwsPrivatelinkServiceName {}
+
+impl InvalidAwsPrivatelinkServiceName {
+    /// Explains how to find the right value.
+    pub fn hint(&self) -> String {
+        "SERVICE NAME must name an AWS VPC endpoint service, for example \
+         `com.amazonaws.vpce.us-east-1.vpce-svc-0e123abc123198abc`. Endpoint service names are \
+         listed in the AWS console under VPC > Endpoint services."
+            .into()
+    }
+}
+
+impl AwsPrivatelinkConnection {
+    /// Checks that `service_name` could name an AWS VPC endpoint service.
+    ///
+    /// Every endpoint service name starts with `com.amazonaws.`, whether the
+    /// service is customer-owned (`com.amazonaws.vpce.<region>.vpce-svc-<id>`)
+    /// or AWS-managed (`com.amazonaws.<region>.<service>`). Only the prefix is
+    /// checked, so a name AWS would accept is never rejected here.
+    pub fn check_service_name(service_name: &str) -> Result<(), InvalidAwsPrivatelinkServiceName> {
+        if service_name.starts_with("com.amazonaws.") {
+            return Ok(());
+        }
+        Err(InvalidAwsPrivatelinkServiceName {
+            name: service_name.to_string(),
+        })
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
 pub struct KafkaTlsConfig {
     pub identity: Option<TlsIdentity>,
@@ -1091,6 +1175,11 @@ impl<C: ConnectionAccess> KafkaConnection<C> {
     ///
     /// The caller is responsible for providing the connection ID as it is not
     /// known to `KafkaConnection`.
+    ///
+    /// NOTE: the `mz_catalog.mz_kafka_connections` builtin materialized view
+    /// reconstructs the default (`_materialize-progress-<env>-<conn>`) in SQL
+    /// (see `MZ_KAFKA_CONNECTIONS` in `src/catalog/src/builtin/mz_catalog.rs`).
+    /// Keep the two in sync.
     pub fn progress_topic(
         &self,
         connection_context: &ConnectionContext,
@@ -1115,6 +1204,13 @@ impl KafkaConnection {
     /// Generates a string that can be used as the base for a configuration ID
     /// (e.g., `client.id`, `group.id`, `transactional.id`) for a Kafka source
     /// or sink.
+    ///
+    /// NOTE: the `mz_catalog.mz_kafka_sources` builtin materialized view
+    /// reconstructs this exact `materialize-<env>-<conn>-<obj>` format in SQL
+    /// (see `MZ_KAFKA_SOURCES` in `src/catalog/src/builtin/mz_catalog.rs`).
+    /// The two must stay in sync. `test/testdrive/kafka-commit.td` guards this
+    /// by feeding the view's reconstructed value into `kafka-verify-commit`,
+    /// so a divergence here fails that test.
     pub fn id_base(
         connection_context: &ConnectionContext,
         connection_id: CatalogItemId,
@@ -3168,12 +3264,16 @@ impl AwsPrivatelinkConnection {
         &self,
         id: CatalogItemId,
         storage_configuration: &StorageConfiguration,
-    ) -> Result<(), anyhow::Error> {
+    ) -> Result<(), ConnectionValidationError> {
+        // An endpoint for an unusable service name reports a misleading
+        // condition (missing availability zones), so check the name first.
+        Self::check_service_name(&self.service_name)?;
+
         let Some(ref cloud_resource_reader) = storage_configuration
             .connection_context
             .cloud_resource_reader
         else {
-            return Err(anyhow!("AWS PrivateLink connections are unsupported"));
+            return Err(anyhow!("AWS PrivateLink connections are unsupported").into());
         };
 
         // No need to optionally run this in a task, as we are just validating from envd.
@@ -3186,12 +3286,47 @@ impl AwsPrivatelinkConnection {
 
         match availability {
             Some(condition) if condition.status == "True" => Ok(()),
-            Some(condition) => Err(anyhow!("{}", condition.message)),
-            None => Err(anyhow!("Endpoint availability is unknown")),
+            Some(condition) => Err(anyhow!("{}", condition.message).into()),
+            None => Err(anyhow!("Endpoint availability is unknown").into()),
         }
     }
 
     fn validate_by_default(&self) -> bool {
         false
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[mz_ore::test]
+    fn test_check_service_name() {
+        // Customer-owned and AWS-managed endpoint services are both accepted,
+        // as is anything else that could be an endpoint service name.
+        for name in [
+            "com.amazonaws.vpce.us-east-1.vpce-svc-0e123abc123198abc",
+            "com.amazonaws.vpce.test.vpce-svc-e2e-test",
+            "com.amazonaws.us-east-1.s3",
+            "com.amazonaws.anything",
+        ] {
+            assert_eq!(
+                AwsPrivatelinkConnection::check_service_name(name),
+                Ok(()),
+                "expected {name} to be accepted"
+            );
+        }
+
+        for name in [
+            "",
+            "com.amazonaws",
+            "vpce-svc-0e123abc123198abc",
+            "my-db-lb-0123456789abcdef.elb.eu-central-1.amazonaws.com",
+            "db.internal.example.org",
+        ] {
+            let err = AwsPrivatelinkConnection::check_service_name(name)
+                .expect_err("service name should be rejected");
+            assert_eq!(err.name, name);
+        }
     }
 }

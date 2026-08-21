@@ -128,10 +128,6 @@ impl GlobalLirPlan {
     pub fn df_desc(&self) -> &LirDataflowDescription {
         &self.df_desc
     }
-
-    pub fn df_meta(&self) -> &DataflowMetainfo {
-        &self.df_meta
-    }
 }
 
 impl Optimize<Index> for Optimizer {
@@ -237,7 +233,11 @@ impl Optimize<GlobalMirPlan> for Optimizer {
         // Finalize the dataflow. This includes:
         // - MIR ⇒ LIR lowering
         // - LIR ⇒ LIR transforms
-        let df_desc = LirRelationExpr::finalize_dataflow(df_desc, &self.config.features)?;
+        let df_desc = LirRelationExpr::finalize_dataflow(
+            df_desc,
+            &self.config.features,
+            Some(self.metrics.lowering()),
+        )?;
 
         // Trace the pipeline output under `optimize`.
         trace_plan(&df_desc);

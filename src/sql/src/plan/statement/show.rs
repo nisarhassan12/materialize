@@ -724,7 +724,8 @@ pub fn show_columns<'a>(
         | ty @ CatalogItemType::Func
         | ty @ CatalogItemType::Secret
         | ty @ CatalogItemType::Type
-        | ty @ CatalogItemType::Sink => {
+        | ty @ CatalogItemType::Sink
+        | ty @ CatalogItemType::MetricSink => {
             sql_bail!("{full_name} is a {ty} and so does not have columns");
         }
     }
@@ -757,13 +758,14 @@ pub fn show_clusters<'a>(
     scx: &'a StatementContext<'a>,
     filter: Option<ShowStatementFilter<Aug>>,
 ) -> Result<ShowSelect<'a>, PlanError> {
-    let query = "SELECT name, replicas, comment FROM mz_internal.mz_show_clusters".to_string();
+    let query =
+        "SELECT name, replicas, activity, comment FROM mz_internal.mz_show_clusters".to_string();
     ShowSelect::new(
         scx,
         query,
         filter,
         None,
-        Some(&["name", "replicas", "comment"]),
+        Some(&["name", "replicas", "activity", "comment"]),
     )
 }
 

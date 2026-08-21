@@ -53,6 +53,7 @@ pub enum Statement<T: AstInfo> {
     CreateSource(CreateSourceStatement<T>),
     CreateSubsource(CreateSubsourceStatement<T>),
     CreateSink(CreateSinkStatement<T>),
+    CreateMetricSink(CreateMetricSinkStatement<T>),
     CreateView(CreateViewStatement<T>),
     CreateMaterializedView(CreateMaterializedViewStatement<T>),
     CreateTable(CreateTableStatement<T>),
@@ -132,6 +133,7 @@ impl<T: AstInfo> AstDisplay for Statement<T> {
             Statement::CreateSource(stmt) => f.write_node(stmt),
             Statement::CreateSubsource(stmt) => f.write_node(stmt),
             Statement::CreateSink(stmt) => f.write_node(stmt),
+            Statement::CreateMetricSink(stmt) => f.write_node(stmt),
             Statement::CreateView(stmt) => f.write_node(stmt),
             Statement::CreateMaterializedView(stmt) => f.write_node(stmt),
             Statement::CreateTable(stmt) => f.write_node(stmt),
@@ -239,6 +241,7 @@ pub fn statement_kind_label_value(kind: StatementKind) -> &'static str {
         StatementKind::CreateSource => "create_source",
         StatementKind::CreateSubsource => "create_subsource",
         StatementKind::CreateSink => "create_sink",
+        StatementKind::CreateMetricSink => "create_metric_sink",
         StatementKind::CreateView => "create_view",
         StatementKind::CreateMaterializedView => "create_materialized_view",
         StatementKind::CreateTable => "create_table",
@@ -1432,6 +1435,79 @@ impl<T: AstInfo> AstDisplay for CreateSinkStatement<T> {
 }
 impl_display_t!(CreateSinkStatement);
 
+/// An option in a `CREATE METRIC SINK` statement.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum CreateMetricSinkOptionName {
+    Prefix,
+}
+
+impl AstDisplay for CreateMetricSinkOptionName {
+    fn fmt<W: fmt::Write>(&self, f: &mut AstFormatter<W>) {
+        match self {
+            CreateMetricSinkOptionName::Prefix => {
+                f.write_str("PREFIX");
+            }
+        }
+    }
+}
+
+impl WithOptionName for CreateMetricSinkOptionName {
+    /// # WARNING
+    ///
+    /// Whenever implementing this trait consider very carefully whether or not
+    /// this value could contain sensitive user data. If you're uncertain, err
+    /// on the conservative side and return `true`.
+    fn redact_value(&self) -> bool {
+        match self {
+            CreateMetricSinkOptionName::Prefix => false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct CreateMetricSinkOption<T: AstInfo> {
+    pub name: CreateMetricSinkOptionName,
+    pub value: Option<WithOptionValue<T>>,
+}
+impl_display_for_with_option!(CreateMetricSinkOption);
+
+/// `CREATE METRIC SINK`
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct CreateMetricSinkStatement<T: AstInfo> {
+    pub name: UnresolvedItemName,
+    pub in_cluster: Option<T::ClusterName>,
+    pub if_not_exists: bool,
+    pub from: T::ItemName,
+    pub with_options: Vec<CreateMetricSinkOption<T>>,
+}
+
+impl<T: AstInfo> AstDisplay for CreateMetricSinkStatement<T> {
+    fn fmt<W: fmt::Write>(&self, f: &mut AstFormatter<W>) {
+        f.write_str("CREATE METRIC SINK ");
+        if self.if_not_exists {
+            f.write_str("IF NOT EXISTS ");
+        }
+        f.write_node(&self.name);
+        f.write_str(" ");
+        if let Some(cluster) = &self.in_cluster {
+            f.write_str("IN CLUSTER ");
+            f.write_node(cluster);
+            f.write_str(" ");
+        }
+        f.write_str("FROM ");
+        f.write_node(&self.from);
+
+        // NOTE: `create_sql` is persisted through this impl and re-parsed on boot, so dropping
+        // the clause here would silently lose the prefix across a restart.
+        if !self.with_options.is_empty() {
+            f.write_str(" WITH (");
+            f.write_node(&display::comma_separated(&self.with_options));
+            f.write_str(")");
+        }
+    }
+}
+impl_display_t!(CreateMetricSinkStatement);
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ViewDefinition<T: AstInfo> {
     /// View name
@@ -2247,10 +2323,14 @@ impl_display_t!(CreateTypeStatement);
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum ClusterOptionName {
+    /// The `AUTO SCALING STRATEGY [[=] (...)]` option.
+    AutoScalingStrategy,
     /// The `AVAILABILITY ZONES [[=] '[' <values> ']' ]` option.
     AvailabilityZones,
     /// The `DISK` option.
     Disk,
+    /// The `EXPERIMENTAL ARRANGEMENT COMPRESSION [[=] <enabled>]` option.
+    ExperimentalArrangementCompression,
     /// The `INTROSPECTION INTERVAL [[=] <interval>]` option.
     IntrospectionInterval,
     /// The `INTROSPECTION DEBUGGING [[=] <enabled>]` option.
@@ -2272,8 +2352,12 @@ pub enum ClusterOptionName {
 impl AstDisplay for ClusterOptionName {
     fn fmt<W: fmt::Write>(&self, f: &mut AstFormatter<W>) {
         match self {
+            ClusterOptionName::AutoScalingStrategy => f.write_str("AUTO SCALING STRATEGY"),
             ClusterOptionName::AvailabilityZones => f.write_str("AVAILABILITY ZONES"),
             ClusterOptionName::Disk => f.write_str("DISK"),
+            ClusterOptionName::ExperimentalArrangementCompression => {
+                f.write_str("EXPERIMENTAL ARRANGEMENT COMPRESSION")
+            }
             ClusterOptionName::IntrospectionDebugging => f.write_str("INTROSPECTION DEBUGGING"),
             ClusterOptionName::IntrospectionInterval => f.write_str("INTROSPECTION INTERVAL"),
             ClusterOptionName::Managed => f.write_str("MANAGED"),
@@ -2294,8 +2378,10 @@ impl WithOptionName for ClusterOptionName {
     /// on the conservative side and return `true`.
     fn redact_value(&self) -> bool {
         match self {
-            ClusterOptionName::AvailabilityZones
+            ClusterOptionName::AutoScalingStrategy
+            | ClusterOptionName::AvailabilityZones
             | ClusterOptionName::Disk
+            | ClusterOptionName::ExperimentalArrangementCompression
             | ClusterOptionName::IntrospectionDebugging
             | ClusterOptionName::IntrospectionInterval
             | ClusterOptionName::Managed
@@ -2457,11 +2543,15 @@ pub struct CreateClusterStatement<T: AstInfo> {
     pub options: Vec<ClusterOption<T>>,
     /// The comma-separated features enabled on the cluster.
     pub features: Vec<ClusterFeature<T>>,
+    pub if_not_exists: bool,
 }
 
 impl<T: AstInfo> AstDisplay for CreateClusterStatement<T> {
     fn fmt<W: fmt::Write>(&self, f: &mut AstFormatter<W>) {
         f.write_str("CREATE CLUSTER ");
+        if self.if_not_exists {
+            f.write_str("IF NOT EXISTS ");
+        }
         f.write_node(&self.name);
         if !self.options.is_empty() {
             f.write_str(" (");
@@ -2556,11 +2646,15 @@ pub struct CreateClusterReplicaStatement<T: AstInfo> {
     pub of_cluster: Ident,
     /// The replica's definition.
     pub definition: ReplicaDefinition<T>,
+    pub if_not_exists: bool,
 }
 
 impl<T: AstInfo> AstDisplay for CreateClusterReplicaStatement<T> {
     fn fmt<W: fmt::Write>(&self, f: &mut AstFormatter<W>) {
         f.write_str("CREATE CLUSTER REPLICA ");
+        if self.if_not_exists {
+            f.write_str("IF NOT EXISTS ");
+        }
         f.write_node(&self.of_cluster);
         f.write_str(".");
         f.write_node(&self.definition.name);
@@ -2597,6 +2691,8 @@ pub enum ReplicaOptionName {
     IntrospectionDebugging,
     /// The `DISK [[=] <enabled>]` option.
     Disk,
+    /// The `EXPERIMENTAL ARRANGEMENT COMPRESSION [[=] <enabled>]` option.
+    ExperimentalArrangementCompression,
 }
 
 impl AstDisplay for ReplicaOptionName {
@@ -2614,6 +2710,9 @@ impl AstDisplay for ReplicaOptionName {
             ReplicaOptionName::IntrospectionInterval => f.write_str("INTROSPECTION INTERVAL"),
             ReplicaOptionName::IntrospectionDebugging => f.write_str("INTROSPECTION DEBUGGING"),
             ReplicaOptionName::Disk => f.write_str("DISK"),
+            ReplicaOptionName::ExperimentalArrangementCompression => {
+                f.write_str("EXPERIMENTAL ARRANGEMENT COMPRESSION")
+            }
         }
     }
 }
@@ -2637,7 +2736,8 @@ impl WithOptionName for ReplicaOptionName {
             | ReplicaOptionName::Internal
             | ReplicaOptionName::IntrospectionInterval
             | ReplicaOptionName::IntrospectionDebugging
-            | ReplicaOptionName::Disk => false,
+            | ReplicaOptionName::Disk
+            | ReplicaOptionName::ExperimentalArrangementCompression => false,
         }
     }
 }
@@ -4090,6 +4190,7 @@ pub enum ExplainPlanOptionName {
     EnableLetrecFixpointAnalysis,
     EnableJoinPrioritizeArranged,
     EnableProjectionPushdownAfterRelationCse,
+    EnableFixedCorrelatedCteLowering,
 }
 
 impl WithOptionName for ExplainPlanOptionName {
@@ -4126,7 +4227,8 @@ impl WithOptionName for ExplainPlanOptionName {
             | Self::EnableVariadicLeftJoinLowering
             | Self::EnableLetrecFixpointAnalysis
             | Self::EnableJoinPrioritizeArranged
-            | Self::EnableProjectionPushdownAfterRelationCse => false,
+            | Self::EnableProjectionPushdownAfterRelationCse
+            | Self::EnableFixedCorrelatedCteLowering => false,
         }
     }
 }
@@ -4323,6 +4425,7 @@ pub enum ObjectType {
     MaterializedView,
     Source,
     Sink,
+    MetricSink,
     Index,
     Type,
     Role,
@@ -4345,6 +4448,7 @@ impl ObjectType {
             | ObjectType::MaterializedView
             | ObjectType::Source
             | ObjectType::Sink
+            | ObjectType::MetricSink
             | ObjectType::Index
             | ObjectType::Type
             | ObjectType::Secret
@@ -4369,6 +4473,7 @@ impl AstDisplay for ObjectType {
             ObjectType::MaterializedView => "MATERIALIZED VIEW",
             ObjectType::Source => "SOURCE",
             ObjectType::Sink => "SINK",
+            ObjectType::MetricSink => "METRIC SINK",
             ObjectType::Index => "INDEX",
             ObjectType::Type => "TYPE",
             ObjectType::Role => "ROLE",
@@ -4445,6 +4550,7 @@ pub enum WithOptionValue<T: AstInfo> {
     RetainHistoryFor(Value),
     Refresh(RefreshOptionValue<T>),
     ClusterScheduleOptionValue(ClusterScheduleOptionValue),
+    ClusterAutoScalingStrategyOptionValue(ClusterAutoScalingStrategyOptionValue),
     ClusterAlterStrategy(ClusterAlterOptionValue<T>),
     NetworkPolicyRules(Vec<NetworkPolicyRuleDefinition<T>>),
 }
@@ -4463,10 +4569,16 @@ impl<T: AstInfo> AstDisplay for WithOptionValue<T> {
                 | WithOptionValue::Expr(_) => {
                     // These are redact-aware.
                 }
-                WithOptionValue::Secret(_) | WithOptionValue::ConnectionKafkaBroker(_) => {
+                WithOptionValue::ConnectionKafkaBroker(_) => {
                     f.write_str("'<REDACTED>'");
                     return;
                 }
+                // A secret reference is a catalog item name, not the secret
+                // value, so it is safe to show in redacted output. An option
+                // that accepts an inline credential is parsed as a `Value`,
+                // which is redacted by that arm together with the option's
+                // `redact_value()`.
+                WithOptionValue::Secret(_) => {}
                 WithOptionValue::DataType(_)
                 | WithOptionValue::Item(_)
                 | WithOptionValue::UnresolvedItemName(_)
@@ -4475,6 +4587,7 @@ impl<T: AstInfo> AstDisplay for WithOptionValue<T> {
                 | WithOptionValue::KafkaMatchingBrokerRule(_)
                 | WithOptionValue::ClusterReplicas(_)
                 | WithOptionValue::ClusterScheduleOptionValue(_)
+                | WithOptionValue::ClusterAutoScalingStrategyOptionValue(_)
                 | WithOptionValue::ClusterAlterStrategy(_)
                 | WithOptionValue::NetworkPolicyRules(_) => {
                     // These do not need redaction.
@@ -4536,6 +4649,7 @@ impl<T: AstInfo> AstDisplay for WithOptionValue<T> {
             }
             WithOptionValue::Refresh(opt) => f.write_node(opt),
             WithOptionValue::ClusterScheduleOptionValue(value) => f.write_node(value),
+            WithOptionValue::ClusterAutoScalingStrategyOptionValue(value) => f.write_node(value),
             WithOptionValue::ClusterAlterStrategy(value) => f.write_node(value),
         }
     }
@@ -4634,6 +4748,67 @@ impl AstDisplay for ClusterScheduleOptionValue {
                 }
             }
         }
+    }
+}
+
+/// The value of the `AUTO SCALING STRATEGY` cluster option: the autoscaling
+/// policy block. Extensible: future strategies are additional optional
+/// sub-policies, so the block grows without changing existing ones. An empty
+/// block (all sub-policies absent) disables autoscaling for the cluster, the same
+/// as `RESET (AUTO SCALING STRATEGY)`.
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Eq,
+    Hash,
+    PartialOrd,
+    Ord,
+    Deserialize,
+    Serialize
+)]
+pub struct ClusterAutoScalingStrategyOptionValue {
+    pub on_hydration: Option<OnHydrationOptionValue>,
+}
+
+impl AstDisplay for ClusterAutoScalingStrategyOptionValue {
+    fn fmt<W: fmt::Write>(&self, f: &mut AstFormatter<W>) {
+        f.write_str("(");
+        if let Some(on_hydration) = &self.on_hydration {
+            f.write_node(on_hydration);
+        }
+        f.write_str(")");
+    }
+}
+
+/// The `ON HYDRATION` autoscaling sub-policy: while objects are un-hydrated, run
+/// an extra replica at `hydration_size` to accelerate hydration, lingering for
+/// `linger_duration` after the steady-state replicas hydrate.
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Eq,
+    Hash,
+    PartialOrd,
+    Ord,
+    Deserialize,
+    Serialize
+)]
+pub struct OnHydrationOptionValue {
+    pub hydration_size: Value,
+    pub linger_duration: Option<Value>,
+}
+
+impl AstDisplay for OnHydrationOptionValue {
+    fn fmt<W: fmt::Write>(&self, f: &mut AstFormatter<W>) {
+        f.write_str("ON HYDRATION (HYDRATION SIZE = ");
+        f.write_node(&self.hydration_size);
+        if let Some(linger_duration) = &self.linger_duration {
+            f.write_str(", LINGER DURATION = ");
+            f.write_node(linger_duration);
+        }
+        f.write_str(")");
     }
 }
 

@@ -41,7 +41,7 @@ use uncased::UncasedStr;
 use crate::session::user::{SUPPORT_USER, SYSTEM_USER, User};
 use crate::session::vars::constraints::{
     BYTESIZE_AT_LEAST_1MB, DomainConstraint, NON_ZERO_DURATION, NUMERIC_BOUNDED_0_1_INCLUSIVE,
-    NUMERIC_NON_NEGATIVE, ValueConstraint,
+    NUMERIC_NON_NEGATIVE, U32_AT_LEAST_1, ValueConstraint,
 };
 use crate::session::vars::errors::VarError;
 use crate::session::vars::polyfill::{LazyValueFn, lazy_value, value};
@@ -340,7 +340,7 @@ pub static DEFAULT_CLUSTER_REPLICATION_FACTOR: VarDefinition = VarDefinition::ne
 
 pub static EXTRA_FLOAT_DIGITS: VarDefinition = VarDefinition::new(
     "extra_float_digits",
-    value!(i32; 3),
+    value!(i32; 1),
     "Adjusts the number of digits displayed for floating-point values (PostgreSQL).",
     true,
 );
@@ -643,6 +643,24 @@ pub static ALLOWED_CLUSTER_REPLICA_SIZES: VarDefinition = VarDefinition::new(
     value!(Vec<Ident>; Vec::new()),
     "The allowed sizes when creating a new cluster replica (Materialize).",
     true,
+);
+
+/// Sizes the OCC write semaphore at boot. Zero permits would block every
+/// read-then-write until its `statement_timeout`, so the value must be at
+/// least 1.
+pub static MAX_CONCURRENT_OCC_WRITES: VarDefinition = VarDefinition::new(
+    "max_concurrent_occ_writes",
+    value!(u32; 4),
+    "Maximum number of concurrent read-then-write (DELETE/UPDATE) operations using OCC. Read at startup; changes require an environmentd restart (Materialize).",
+    false,
+)
+.with_constraint(&U32_AT_LEAST_1);
+
+pub static MAX_OCC_RETRIES: VarDefinition = VarDefinition::new(
+    "max_occ_retries",
+    value!(u32; 1000),
+    "Maximum number of OCC retry attempts per read-then-write operation before giving up (Materialize).",
+    false,
 );
 
 pub static PERSIST_FAST_PATH_LIMIT: VarDefinition = VarDefinition::new(
@@ -1047,6 +1065,15 @@ pub static MYSQL_SOURCE_SNAPSHOT_LOCK_WAIT_TIMEOUT: VarDefinition = VarDefinitio
     false,
 );
 
+/// Sets the `wait_timeout` session value on connections used during the
+/// snapshotting phase of MySQL sources.
+pub static MYSQL_SOURCE_SNAPSHOT_WAIT_TIMEOUT: VarDefinition = VarDefinition::new(
+    "mysql_source_snapshot_wait_timeout",
+    value!(Duration; mz_mysql_util::DEFAULT_SNAPSHOT_WAIT_TIMEOUT),
+    "Sets the `wait_timeout` value to use on connections during the snapshotting phase of MySQL sources (Materialize)",
+    false,
+);
+
 /// Sets the timeout for establishing an authenticated connection to MySQL
 pub static MYSQL_SOURCE_CONNECT_TIMEOUT: VarDefinition = VarDefinition::new(
     "mysql_source_connect_timeout",
@@ -1061,7 +1088,8 @@ pub static SSH_CHECK_INTERVAL: VarDefinition = VarDefinition::new(
     value!(Duration; mz_ssh_util::tunnel::DEFAULT_CHECK_INTERVAL),
     "Controls the check interval for connections to SSH bastions via `mz_ssh_util`.",
     false,
-);
+)
+.with_constraint(&NON_ZERO_DURATION);
 
 /// Controls the connect timeout for connections to SSH bastions via `mz_ssh_util`.
 pub static SSH_CONNECT_TIMEOUT: VarDefinition = VarDefinition::new(
@@ -1193,7 +1221,8 @@ pub static STORAGE_STATISTICS_INTERVAL: VarDefinition = VarDefinition::new(
     "The interval to submit statistics to `mz_source_statistics_per_worker` \
         and `mz_sink_statistics` (Materialize).",
     false,
-);
+)
+.with_constraint(&NON_ZERO_DURATION);
 
 /// The interval to collect statistics for `mz_source_statistics_per_worker` and `mz_sink_statistics_per_worker` in
 /// clusterd. Controls the accuracy of metrics.
@@ -1390,6 +1419,41 @@ pub static ENABLE_INTERNAL_STATEMENT_LOGGING: VarDefinition = VarDefinition::new
     "enable_internal_statement_logging",
     value!(bool; false),
     "Whether to log statements from the `mz_system` user.",
+    false,
+);
+
+/// When on, the SQL frontends log incoming statements and other frontend
+/// messages at info level as soon as they arrive, before processing them
+/// (except that SQL text is parsed, for redaction). Messages consumed by
+/// pgwire's COPY subprotocol or its post-error drain loop are not logged.
+///
+/// This is an emergency diagnostic for statements that crash the process
+/// before they reach the statement log (or before its contents are written
+/// out to persist). It adds a lot of log volume, so use it only in emergencies,
+/// i.e. to debug active incidents.
+///
+/// SQL text is logged with its literals redacted, which is the same redaction
+/// the statement log applies, see `redact_sql_for_logging`.
+pub static ENABLE_STATEMENT_ARRIVAL_LOGGING: VarDefinition = VarDefinition::new(
+    "enable_statement_arrival_logging",
+    value!(bool; false),
+    "Whether to log incoming statements and other frontend messages at info \
+    level as they arrive at the SQL frontends, before processing. SQL text is \
+    logged with its literals redacted, as in the statement log. Use it only in \
+    emergencies, i.e. debugging active incidents.",
+    false,
+);
+
+/// Off is the escape hatch for clients that pipeline statements Materialize
+/// cannot run in one transaction, for example a read or a DDL after a write.
+/// Those fail while this is on, rather than silently committing the writes
+/// staged before them.
+pub static ENABLE_EXTENDED_PROTOCOL_IMPLICIT_TRANSACTION: VarDefinition = VarDefinition::new(
+    "enable_extended_protocol_implicit_transaction",
+    value!(bool; true),
+    "Whether an implicit write transaction started by the extended query \
+    protocol spans the whole pipeline up to the client's Sync, so that the \
+    pipeline commits or rolls back atomically as in PostgreSQL (Materialize).",
     false,
 );
 
@@ -1634,17 +1698,6 @@ pub mod cluster_scheduling {
         "How often to poll readiness checks for cluster alter",
         false,
     );
-
-    const DEFAULT_CHECK_SCHEDULING_POLICIES_INTERVAL: Duration = Duration::from_secs(3);
-
-    pub static CLUSTER_CHECK_SCHEDULING_POLICIES_INTERVAL: VarDefinition = VarDefinition::new(
-        "cluster_check_scheduling_policies_interval",
-        value!(Duration; DEFAULT_CHECK_SCHEDULING_POLICIES_INTERVAL),
-        "How often policies are invoked to automatically start/stop clusters, e.g., \
-            for REFRESH EVERY materialized views.",
-        false,
-    )
-    .with_constraint(&NON_ZERO_DURATION);
 
     pub static CLUSTER_SECURITY_CONTEXT_ENABLED: VarDefinition = VarDefinition::new(
         "cluster_security_context_enabled",
@@ -1917,6 +1970,12 @@ feature_flags!(
         enable_for_item_parsing: true,
     },
     {
+        name: unsafe_enable_incomplete_view_column_lists,
+        desc: "declaring a view with fewer column names than columns",
+        default: false,
+        enable_for_item_parsing: true,
+    },
+    {
         name: unsafe_enable_table_check_constraint,
         desc: "CREATE TABLE with a check constraint",
         default: false,
@@ -1947,6 +2006,12 @@ feature_flags!(
         enable_for_item_parsing: true,
     },
     {
+        name: unsafe_enable_unbounded_custom_type_resolution,
+        desc: "resolving custom types without the depth and complexity limits that bound resolution work",
+        default: false,
+        enable_for_item_parsing: true,
+    },
+    {
         name: enable_within_timestamp_order_by_in_subscribe,
         desc: "`WITHIN TIMESTAMP ORDER BY ..`",
         default: false,
@@ -1967,12 +2032,6 @@ feature_flags!(
     {
         name: enable_kafka_broker_matching_rules,
         desc: "MATCHING broker rules in BROKERS for Kafka PrivateLink connections",
-        default: false,
-        enable_for_item_parsing: true,
-    },
-    {
-        name: enable_glue_schema_registry,
-        desc: "CREATE CONNECTION ... TO AWS GLUE SCHEMA REGISTRY",
         default: false,
         enable_for_item_parsing: true,
     },
@@ -2036,6 +2095,13 @@ feature_flags!(
         default: true,
         enable_for_item_parsing: false,
         scope: ParameterScope::Cluster,
+    },
+    {
+        name: enable_fixed_correlated_cte_lowering,
+        desc: "CTE-aware branch keys in HIR-to-MIR lowering, fixing references to \
+               correlated CTEs from nested correlated scopes",
+        default: true,
+        enable_for_item_parsing: false,
     },
     {
         name: enable_time_at_time_zone,
@@ -2106,6 +2172,12 @@ feature_flags!(
         enable_for_item_parsing: true,
     },
     {
+        name: enable_auto_scaling_strategy,
+        desc: "`AUTO SCALING STRATEGY` cluster option",
+        default: true,
+        enable_for_item_parsing: true,
+    },
+    {
         name: enable_reduce_mfp_fusion,
         desc: "fusion of MFPs in reductions",
         default: true,
@@ -2153,6 +2225,14 @@ feature_flags!(
         name: enable_kafka_sink_headers,
         desc: "Enable the HEADERS option for Kafka sinks",
         default: false,
+        enable_for_item_parsing: true,
+    },
+    {
+        name: enable_metric_sink,
+        desc: "CREATE METRIC SINK",
+        default: false,
+        // Boot re-parses every item's `create_sql`, so turning this off would leave any
+        // already-created metric sink unparseable and take the whole catalog down with it.
         enable_for_item_parsing: true,
     },
     {
@@ -2275,6 +2355,12 @@ feature_flags!(
         enable_for_item_parsing: false,
     },
     {
+        name: enable_simplify_from_less_existence,
+        desc: "Allow the optimizer to collapse EXISTS/NOT EXISTS over a FROM-less correlated subquery into a plain Filter during HIR-to-MIR lowering.",
+        default: true,
+        enable_for_item_parsing: false,
+    },
+    {
         name: enable_coalesce_case_transform,
         desc: "Allow the optimizer to push `COALESCE` into `CASE WHEN`.",
         default: true,
@@ -2316,8 +2402,10 @@ impl From<&super::SystemVars> for OptimizerFeatures {
             enable_cast_elimination: vars.enable_cast_elimination(),
             enable_case_literal_transform: vars.enable_case_literal_transform(),
             enable_simplify_quantified_comparisons: vars.enable_simplify_quantified_comparisons(),
+            enable_simplify_from_less_existence: vars.enable_simplify_from_less_existence(),
             enable_coalesce_case_transform: vars.enable_coalesce_case_transform(),
             enable_will_distinct_propagation: vars.enable_will_distinct_propagation(),
+            enable_fixed_correlated_cte_lowering: vars.enable_fixed_correlated_cte_lowering(),
         }
     }
 }
@@ -2339,6 +2427,12 @@ mod tests {
         // We do this in a roundabout way, by first constructing all-false `OptimizerFeatures` and
         // then assigning them to their respective system vars, to ensure we don't forget to update
         // this test when new optimizer features are added.
+        //
+        // NOTE: if the new feature ships enabled, also turn it on in
+        // `mz_transform_fuzz::fuzz_features`, which the cargo-fuzz optimizer targets plan with.
+        // That helper falls back to `Default` (all-`false`) for anything it does not name, so a
+        // flag missing from it silently fuzzes the disabled path. This exhaustive destructuring is
+        // the tripwire for both.
         let false_features = OptimizerFeatures::default();
         let OptimizerFeatures {
             enable_eq_classes_withholding_errors,
@@ -2358,8 +2452,10 @@ mod tests {
             enable_cast_elimination,
             enable_case_literal_transform,
             enable_simplify_quantified_comparisons,
+            enable_simplify_from_less_existence,
             enable_coalesce_case_transform,
             enable_will_distinct_propagation,
+            enable_fixed_correlated_cte_lowering,
         } = false_features;
 
         let mut vars = SystemVars::new();
@@ -2388,8 +2484,10 @@ mod tests {
         set_var!(enable_cast_elimination);
         set_var!(enable_case_literal_transform);
         set_var!(enable_simplify_quantified_comparisons);
+        set_var!(enable_simplify_from_less_existence);
         set_var!(enable_coalesce_case_transform);
         set_var!(enable_will_distinct_propagation);
+        set_var!(enable_fixed_correlated_cte_lowering);
 
         // Enable for item parsing, then ensure we still get the same optimizer features.
         vars.enable_for_item_parsing();

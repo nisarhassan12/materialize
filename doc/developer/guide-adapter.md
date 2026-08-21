@@ -91,12 +91,17 @@ This means:
 
 #### Why the batching oracle is correct
 
-`BatchingTimestampOracle` collects multiple `read_ts` requests that arrive
-concurrently and serves them all with a single call to the backing oracle.
-Because the backing oracle is called *during* all of their real-time intervals
-(after all requests arrived, before any have returned), the returned timestamp
-is within bounds for every request. Batching can only push timestamps later,
-never earlier. See the comment on the `BatchingTimestampOracle` struct.
+`BatchingTimestampOracle` drains the queued `read_ts` requests and serves each
+collected batch with one call to the backing oracle. That call occurs during
+every collected request's real-time interval, after each request arrived and
+before any returns. Its timestamp is therefore within bounds for every request.
+Batching can only push timestamps later, never earlier.
+
+Coalescing is opportunistic. A request that overlaps a backing call but arrives
+after the queue is drained waits for a later call. A serial await loop
+guarantees that its calls cannot coalesce. When exactly one round trip is
+required, use one explicit shared call only if it occurs within every
+operation's real-time bounds and satisfies every caller's contract.
 
 #### Why caching an oracle result is not correct
 
@@ -213,7 +218,8 @@ compare-and-append. It is a time-of-check to time-of-use gap.
 
 - It is safe today only by the fragile accident that the coordinator loop does
   not yield between the check and the durable commit. Any await later inserted
-  between them, or any move of the check off the loop, reopens the race.
+  between them, or any move of the check off the coordinator loop, reopens
+  the race.
 - It does not hold across writers. Another `environmentd` that commits a
   conflicting change to the durable store between this node's in-memory check and
   its durable commit is not detected. The durable layer does not re-validate a
@@ -222,7 +228,59 @@ compare-and-append. It is a time-of-check to time-of-use gap.
 
 If you need conflict detection, evaluate the precondition atomically with the
 commit, a real compare-and-append against the durable store. A check that merely
-precedes the write on the loop is not that, even when it reads the right state.
+precedes the write on the coordinator loop is not that, even when it reads the
+right state.
+
+### Catalog mutations must bump the transient revision or stay invisible
+
+Sessions cache catalog snapshots and reuse them while
+`Catalog::transient_revision` is unchanged (see
+`doc/developer/design/20260709_session_catalog_snapshot_cache.md`). Only
+`Catalog::transact` bumps the revision. So when adding a new way to mutate
+the Coordinator's in-memory catalog, either route it through `transact` or
+keep the change invisible to session-visible catalog reads (name resolution,
+planning). Otherwise sessions serve stale catalogs where today they would see
+the change.
+
+### Group commits and generation handover
+
+At runtime, one group committer per `environmentd` serializes txns-shard operations:
+
+```text
+append / register / forget -> FIFO group committer -> table-write worker -> txns shard
+```
+
+FIFO ordering prevents an append from overtaking table registration or forgetting. Bootstrap is
+the only local exception because it runs before the process serves.
+
+Each runtime command uses this protocol:
+
+```text
+shared oracle write timestamp -> advance catalog upper -> compare-and-append txns shard
+                                                       | conflict -> retry
+                                                       ` success  -> apply write to oracle
+```
+
+The successful timestamp is applied to the oracle only after the txns write is durable.
+
+On `environmentd` bootstrap in read/write mode:
+
+```text
+catalog fence -> set up and register tables -> txns write advances table uppers
+              -> snapshot and reset system tables -> start serving
+```
+
+The snapshots cannot complete until the txns write has advanced the table uppers. Therefore:
+
+```text
+pre-fence write before barrier -> ordered before the snapshot
+pre-fence write after barrier  -> `InvalidUppers` -> retry at a fresh timestamp
+                                -> catalog advance observes the fence -> old generation exits
+```
+
+A system-table write before the barrier is included in the reset. A user-table write remains
+visible to later reads. The retry's `advance_to` is above the stale catalog handle's cached upper,
+so its catalog check is durable. An `advance_upper` no-op only checks an already-observed fence.
 
 ## Rejected Optimizations
 
@@ -254,3 +312,32 @@ real, but the solution must maintain strict serializability. Correct alternative
 might include: reducing oracle round-trip latency, colocating the oracle,
 using the batching oracle's existing mechanism to serve more callers per batch,
 or relaxing the isolation level for queries that opt in.
+
+### Session records in the durable catalog
+
+**What:** Write a durable catalog record (`StateUpdateKind::Session`) on every
+session connect and delete it on close, so that `mz_sessions` becomes a
+materialized view over `mz_catalog_raw` and cleanup logic has a durable
+session inventory.
+
+**Why it was rejected:** Connection lifecycle events are far more frequent
+than DDL, and the catalog shard has a single writer. Every connect became a
+timestamp oracle round-trip plus a compare-and-append against the catalog
+shard, serialized on the coordinator loop. Startup could not respond before
+the record was durable (otherwise temp DDL could race its own session
+record), so connect latency was coupled to catalog commit latency, and
+connection churn queued real DDL behind session commits. Batching session ops
+into shared catalog transactions and bounding the flush rate reduced the
+commit count but kept both couplings.
+
+The durable records also bought nothing for garbage collection in the
+single-envd world. Cleanup at promotion deletes all ephemeral rows, justified
+by the deploy-generation fence alone, and graceful session close knows the
+session UUID from in-memory connection metadata.
+
+**The general lesson:** high-frequency per-connection state belongs in builtin
+tables written through group commit, which is fire-and-forget from the
+coordinator loop, batched with all other builtin writes, and never touches
+the catalog shard. Reserve durable catalog writes for state that must be
+transactional with DDL. See
+`doc/developer/design/20260706_sql_150_durable_temporary_objects.md`.

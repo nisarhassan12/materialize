@@ -66,7 +66,6 @@ use crate::durable::objects::SystemObjectDescription;
 use crate::memory::objects::DataSourceDesc;
 
 pub const BUILTIN_PREFIXES: &[&str] = &["mz_", "pg_", "external_"];
-const BUILTIN_CLUSTER_REPLICA_NAME: &str = "r1";
 
 /// A sentinel used in place of a fingerprint that indicates that a builtin
 /// object is runtime alterable. Runtime alterable objects don't have meaningful
@@ -696,14 +695,6 @@ pub struct BuiltinCluster {
     pub owner_id: &'static RoleId,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct BuiltinClusterReplica {
-    /// Name of the compute replica.
-    pub name: &'static str,
-    /// Name of the cluster that this replica belongs to.
-    pub cluster_name: &'static str,
-}
-
 /// Uniquely identifies the definition of a builtin object.
 pub trait Fingerprint {
     fn fingerprint(&self) -> String;
@@ -906,11 +897,6 @@ pub const MZ_SYSTEM_CLUSTER: BuiltinCluster = BuiltinCluster {
     ],
 };
 
-pub const MZ_SYSTEM_CLUSTER_REPLICA: BuiltinClusterReplica = BuiltinClusterReplica {
-    name: BUILTIN_CLUSTER_REPLICA_NAME,
-    cluster_name: MZ_SYSTEM_CLUSTER.name,
-};
-
 pub const MZ_CATALOG_SERVER_CLUSTER: BuiltinCluster = BuiltinCluster {
     name: "mz_catalog_server",
     owner_id: &MZ_SYSTEM_ROLE_ID,
@@ -929,11 +915,6 @@ pub const MZ_CATALOG_SERVER_CLUSTER: BuiltinCluster = BuiltinCluster {
     ],
 };
 
-pub const MZ_CATALOG_SERVER_CLUSTER_REPLICA: BuiltinClusterReplica = BuiltinClusterReplica {
-    name: BUILTIN_CLUSTER_REPLICA_NAME,
-    cluster_name: MZ_CATALOG_SERVER_CLUSTER.name,
-};
-
 pub const MZ_PROBE_CLUSTER: BuiltinCluster = BuiltinCluster {
     name: "mz_probe",
     owner_id: &MZ_SYSTEM_ROLE_ID,
@@ -950,10 +931,6 @@ pub const MZ_PROBE_CLUSTER: BuiltinCluster = BuiltinCluster {
         },
         rbac::owner_privilege(ObjectType::Cluster, MZ_SYSTEM_ROLE_ID),
     ],
-};
-pub const MZ_PROBE_CLUSTER_REPLICA: BuiltinClusterReplica = BuiltinClusterReplica {
-    name: BUILTIN_CLUSTER_REPLICA_NAME,
-    cluster_name: MZ_PROBE_CLUSTER.name,
 };
 
 pub const MZ_SUPPORT_CLUSTER: BuiltinCluster = BuiltinCluster {
@@ -1130,26 +1107,26 @@ pub static BUILTINS_STATIC: LazyLock<Vec<Builtin<NameReference>>> = LazyLock::ne
         Builtin::Log(&MZ_COMPUTE_ERROR_COUNTS_RAW),
         Builtin::Log(&MZ_COMPUTE_HYDRATION_TIMES_PER_WORKER),
         Builtin::Log(&MZ_COMPUTE_OPERATOR_HYDRATION_STATUSES_PER_WORKER),
-        Builtin::Table(&MZ_KAFKA_SINKS),
-        Builtin::Table(&MZ_KAFKA_CONNECTIONS),
-        Builtin::Table(&MZ_KAFKA_SOURCES),
+        Builtin::MaterializedView(&MZ_KAFKA_SINKS),
+        Builtin::MaterializedView(&MZ_KAFKA_CONNECTIONS),
+        Builtin::MaterializedView(&MZ_KAFKA_SOURCES),
         Builtin::Table(&MZ_OBJECT_DEPENDENCIES),
-        Builtin::Table(&MZ_ICEBERG_SINKS),
+        Builtin::MaterializedView(&MZ_ICEBERG_SINKS),
         Builtin::MaterializedView(&MZ_DATABASES),
         Builtin::MaterializedView(&MZ_SCHEMAS),
         Builtin::Table(&MZ_COLUMNS),
         // mz_indexes is generated dynamically below with inlined builtin VALUES.
         Builtin::Table(&MZ_INDEX_COLUMNS),
-        Builtin::Table(&MZ_TABLES),
+        Builtin::MaterializedView(&MZ_TABLES),
         // mz_sources is generated dynamically below with inlined builtin VALUES.
         Builtin::Table(&MZ_SOURCE_REFERENCES),
-        Builtin::Table(&MZ_POSTGRES_SOURCES),
-        Builtin::Table(&MZ_POSTGRES_SOURCE_TABLES),
-        Builtin::Table(&MZ_MYSQL_SOURCE_TABLES),
-        Builtin::Table(&MZ_SQL_SERVER_SOURCE_TABLES),
-        Builtin::Table(&MZ_KAFKA_SOURCE_TABLES),
-        Builtin::Table(&MZ_SINKS),
-        Builtin::Table(&MZ_VIEWS),
+        Builtin::MaterializedView(&MZ_POSTGRES_SOURCES),
+        Builtin::MaterializedView(&MZ_POSTGRES_SOURCE_TABLES),
+        Builtin::MaterializedView(&MZ_MYSQL_SOURCE_TABLES),
+        Builtin::MaterializedView(&MZ_SQL_SERVER_SOURCE_TABLES),
+        Builtin::MaterializedView(&MZ_KAFKA_SOURCE_TABLES),
+        Builtin::MaterializedView(&MZ_SINKS),
+        Builtin::MaterializedView(&MZ_VIEWS),
         Builtin::Table(&MZ_TYPES),
         Builtin::Table(&MZ_TYPE_PG_METADATA),
         Builtin::Table(&MZ_ARRAY_TYPES),
@@ -1169,9 +1146,11 @@ pub static BUILTINS_STATIC: LazyLock<Vec<Builtin<NameReference>>> = LazyLock::ne
         Builtin::MaterializedView(&MZ_CLUSTERS),
         Builtin::MaterializedView(&MZ_CLUSTER_WORKLOAD_CLASSES),
         Builtin::MaterializedView(&MZ_CLUSTER_SCHEDULES),
+        Builtin::MaterializedView(&MZ_CLUSTER_RECONFIGURATIONS),
+        Builtin::MaterializedView(&MZ_CLUSTER_AUTO_SCALING_STRATEGIES),
         Builtin::MaterializedView(&MZ_SECRETS),
         Builtin::MaterializedView(&MZ_CONNECTIONS),
-        Builtin::Table(&MZ_SSH_TUNNEL_CONNECTIONS),
+        Builtin::MaterializedView(&MZ_SSH_TUNNEL_CONNECTIONS),
         Builtin::MaterializedView(&MZ_CLUSTER_REPLICAS),
         Builtin::Source(&MZ_CLUSTER_REPLICA_METRICS_HISTORY),
         Builtin::View(&MZ_CLUSTER_REPLICA_METRICS),
@@ -1179,11 +1158,11 @@ pub static BUILTINS_STATIC: LazyLock<Vec<Builtin<NameReference>>> = LazyLock::ne
         Builtin::View(&MZ_CLUSTER_REPLICA_STATUSES),
         Builtin::MaterializedView(&MZ_INTERNAL_CLUSTER_REPLICAS),
         Builtin::MaterializedView(&MZ_PENDING_CLUSTER_REPLICAS),
-        Builtin::Table(&MZ_AUDIT_EVENTS),
+        Builtin::MaterializedView(&MZ_AUDIT_EVENTS),
         Builtin::Table(&MZ_STORAGE_USAGE_BY_SHARD),
         Builtin::Table(&MZ_EGRESS_IPS),
-        Builtin::Table(&MZ_AWS_PRIVATELINK_CONNECTIONS),
-        Builtin::Table(&MZ_AWS_CONNECTIONS),
+        Builtin::MaterializedView(&MZ_AWS_PRIVATELINK_CONNECTIONS),
+        Builtin::MaterializedView(&MZ_AWS_CONNECTIONS),
         Builtin::Table(&MZ_SUBSCRIPTIONS),
         Builtin::Table(&MZ_SESSIONS),
         Builtin::MaterializedView(&MZ_OVERRIDDEN_SYSTEM_PARAMETERS),
@@ -1393,6 +1372,7 @@ pub static BUILTINS_STATIC: LazyLock<Vec<Builtin<NameReference>>> = LazyLock::ne
         Builtin::Source(&MZ_MATERIALIZED_VIEW_REFRESHES),
         Builtin::Source(&MZ_COMPUTE_DEPENDENCIES),
         Builtin::View(&MZ_MATERIALIZATION_DEPENDENCIES),
+        Builtin::View(&MZ_OBJECT_GRAPH_EDGES),
         Builtin::View(&MZ_MATERIALIZATION_LAG),
         Builtin::View(&MZ_CONSOLE_CLUSTER_UTILIZATION_OVERVIEW),
         Builtin::View(&MZ_CONSOLE_CLUSTER_UTILIZATION_OVERVIEW_3H),
@@ -1433,6 +1413,8 @@ pub static BUILTINS_STATIC: LazyLock<Vec<Builtin<NameReference>>> = LazyLock::ne
         Builtin::Index(&MZ_SHOW_SECRETS_IND),
         Builtin::Index(&MZ_SHOW_ROLES_IND),
         Builtin::Index(&MZ_CLUSTERS_IND),
+        Builtin::Index(&MZ_CLUSTER_RECONFIGURATIONS_IND),
+        Builtin::Index(&MZ_CLUSTER_AUTO_SCALING_STRATEGIES_IND),
         Builtin::Index(&MZ_INDEXES_IND),
         Builtin::Index(&MZ_ROLES_IND),
         Builtin::Index(&MZ_SOURCES_IND),
@@ -1456,6 +1438,7 @@ pub static BUILTINS_STATIC: LazyLock<Vec<Builtin<NameReference>>> = LazyLock::ne
         Builtin::Index(&MZ_OBJECT_DEPENDENCIES_IND),
         Builtin::Index(&MZ_COMPUTE_DEPENDENCIES_IND),
         Builtin::Index(&MZ_OBJECT_TRANSITIVE_DEPENDENCIES_IND),
+        Builtin::Index(&MZ_OBJECT_GRAPH_EDGES_IND),
         Builtin::Index(&MZ_FRONTIERS_IND),
         Builtin::Index(&MZ_WALLCLOCK_GLOBAL_LAG_RECENT_HISTORY_IND),
         Builtin::Index(&MZ_KAFKA_SOURCES_IND),
@@ -1571,11 +1554,6 @@ pub const BUILTIN_CLUSTERS: &[&BuiltinCluster] = &[
     &MZ_PROBE_CLUSTER,
     &MZ_SUPPORT_CLUSTER,
     &MZ_ANALYTICS_CLUSTER,
-];
-pub const BUILTIN_CLUSTER_REPLICAS: &[&BuiltinClusterReplica] = &[
-    &MZ_SYSTEM_CLUSTER_REPLICA,
-    &MZ_CATALOG_SERVER_CLUSTER_REPLICA,
-    &MZ_PROBE_CLUSTER_REPLICA,
 ];
 
 #[allow(non_snake_case)]

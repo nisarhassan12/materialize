@@ -1729,9 +1729,16 @@ pub struct LazyPartStats {
 
 impl Debug for LazyPartStats {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        f.debug_tuple("LazyPartStats")
-            .field(&self.decode())
-            .finish()
+        let mut f = f.debug_tuple("LazyPartStats");
+        // These bytes come from blob and are never validated on the way in, so
+        // `Debug` runs on malformed encodings: `Spine::validate` formats the
+        // whole spine into the message it rejects an untrusted rollup with, and
+        // `Trace::unflatten` returns that as a decode error. Rendering the
+        // failure keeps that rejection path a hard error instead of a panic.
+        match self.try_decode() {
+            Ok(stats) => f.field(&stats).finish(),
+            Err(err) => f.field(&format_args!("<undecodable: {err}>")).finish(),
+        }
     }
 }
 
@@ -1748,11 +1755,20 @@ impl LazyPartStats {
     ///
     /// This does not cache the returned value, it decodes each time it's
     /// called.
-    pub fn decode(&self) -> PartStats {
-        let key = self.key.decode().expect("valid proto");
-        PartStats {
-            key: key.into_rust().expect("valid stats"),
-        }
+    ///
+    /// The bytes are stored undecoded (see the [RustType] impl) and are never
+    /// validated on the way in, so a corrupted, crafted, or newer-version blob
+    /// reaches here intact. There is deliberately no infallible variant: every
+    /// caller reads stats straight off durable state, where a decode failure
+    /// must fail open (keep the part, report it selected) rather than panic.
+    pub fn try_decode(&self) -> Result<PartStats, TryFromProtoError> {
+        let key = self
+            .key
+            .decode()
+            .map_err(|err| TryFromProtoError::InvalidPersistState(err.to_string()))?;
+        Ok(PartStats {
+            key: key.into_rust()?,
+        })
     }
 }
 
@@ -1955,6 +1971,7 @@ impl<T: Timestamp + Codec64> RustType<ProtoU64Antichain> for Antichain<T> {
 #[cfg(test)]
 mod tests {
     use mz_ore::assert_none;
+    use mz_persist_types::stats::{ProtoDynStats, ProtoStructStats};
 
     use bytes::Bytes;
     use mz_build_info::DUMMY_BUILD_INFO;
@@ -2629,5 +2646,40 @@ mod tests {
         testcase("28.0.0", "26.0.1", Err(()));
         testcase("28.0.0", "26.1000.1", Err(()));
         testcase("28.0.0", "27.0.0", Ok(()));
+    }
+
+    /// `LazyPartStats`'s bytes are stored undecoded, so `Debug` runs on
+    /// encodings that came straight off blob and may be malformed. It must render
+    /// the failure: `Spine::validate` formats the whole spine into the message
+    /// with which `Trace::unflatten` rejects an untrusted rollup, so a panic here
+    /// turns that rejection into an unrecoverable shard.
+    #[mz_ore::test]
+    fn lazy_part_stats_debug_does_not_panic_on_garbage() {
+        // Tag 0 is never a legal protobuf tag.
+        let stats = LazyPartStats::from_proto(Bytes::from_static(&[0x00, 0xff]))
+            .expect("stats bytes are stored undecoded");
+        assert_err!(stats.try_decode());
+        assert!(format!("{stats:?}").contains("undecodable"));
+    }
+
+    /// The exact shape version skew produces: valid protobuf whose stats
+    /// oneof uses a variant this version does not know (a newer writer's new
+    /// stats kind reaching an older reader).
+    fn version_skewed_part_stats() -> LazyPartStats {
+        let mut proto = ProtoStructStats::default();
+        proto.cols.insert("c".into(), ProtoDynStats::default());
+        let bytes = prost::Message::encode_to_vec(&proto);
+        LazyPartStats::from_proto(Bytes::from(bytes)).expect("stats bytes are stored undecoded")
+    }
+
+    /// Stats from a newer version are an error rather than a value this
+    /// version misreads, which is what lets every read path fail open on
+    /// them: the `shard_source` filter and the fast-path peek filter keep the
+    /// part, the `stats()` accessors in fetch report `None`, `EXPLAIN FILTER
+    /// PUSHDOWN` reports the part as selected, and inspect-state serializes
+    /// the stats as absent.
+    #[mz_ore::test]
+    fn part_stats_try_decode_fails_open_on_unknown_variant() {
+        assert_err!(version_skewed_part_stats().try_decode());
     }
 }

@@ -645,6 +645,160 @@ fn test_partition_by_value_redacted() {
 
 #[mz_ore::test]
 #[cfg_attr(miri, ignore)] // unsupported operation: can't call foreign function `rust_psm_stack_pointer` on OS `linux`
+fn test_connection_option_redaction() {
+    // Credential-bearing connection options must not leak an inline credential
+    // literal (AWS keys/session tokens, SASL usernames, SSL material, Iceberg
+    // credentials) onto the redacted-telemetry channel (`mz_sql_text_redacted`,
+    // catalog `create_sql` redacted round-trips, trace attributes). A `SECRET`
+    // reference is a catalog name rather than a credential, so it stays visible,
+    // as do other non-sensitive options, keeping redacted SQL diagnostic.
+    struct Case {
+        sql: &'static str,
+        // Substrings that must be gone from the redacted output.
+        redacted_absent: &'static [&'static str],
+        // Substrings that must survive redaction: non-sensitive values,
+        // redacted-literal placeholders, and secret-name references.
+        redacted_present: &'static [&'static str],
+    }
+
+    let cases = [
+        Case {
+            sql: "CREATE CONNECTION c TO AWS (ACCESS KEY ID = 'akid_leak', ENDPOINT = 'endpoint_ok', REGION = 'region_ok', SECRET ACCESS KEY = 'sak_leak', SESSION TOKEN = 'token_leak')",
+            redacted_absent: &["akid_leak", "sak_leak", "token_leak"],
+            redacted_present: &[
+                "ACCESS KEY ID = '<REDACTED>'",
+                "SESSION TOKEN = '<REDACTED>'",
+                "ENDPOINT = 'endpoint_ok'",
+                "REGION = 'region_ok'",
+            ],
+        },
+        Case {
+            sql: "CREATE CONNECTION c TO AWS (ACCESS KEY ID = AKIAEXAMPLE, REGION = region_ok, SECRET ACCESS KEY = sak_leak, SESSION TOKEN = token_leak)",
+            redacted_absent: &["akiaexample", "sak_leak", "token_leak"],
+            redacted_present: &[
+                "ACCESS KEY ID = '<REDACTED>'",
+                "SECRET ACCESS KEY = '<REDACTED>'",
+                "SESSION TOKEN = '<REDACTED>'",
+                "REGION = region_ok",
+            ],
+        },
+        Case {
+            sql: "CREATE CONNECTION c TO POSTGRES (HOST = pghost, PORT = 1234, DATABASE = 'db_ok', SSL MODE = 'mode_ok', SSL CERTIFICATE AUTHORITY = 'ca_leak', PASSWORD = 'pw_leak', SSL CERTIFICATE = 'cert_leak', SSL KEY = 'key_leak', USER = 'user_leak')",
+            redacted_absent: &["ca_leak", "pw_leak", "cert_leak", "key_leak", "user_leak"],
+            redacted_present: &[
+                "PASSWORD = '<REDACTED>'",
+                "USER = '<REDACTED>'",
+                "HOST = pghost",
+                "PORT = 1234",
+                "DATABASE = 'db_ok'",
+                "SSL MODE = 'mode_ok'",
+            ],
+        },
+        Case {
+            sql: "CREATE CONNECTION c TO POSTGRES (HOST = pghost, PORT = 1234, DATABASE = db_ok, SSL MODE = mode_ok, SSL CERTIFICATE AUTHORITY = ca_leak, PASSWORD = secretpw123, SSL CERTIFICATE = cert_leak, SSL KEY = key_leak, USER = myuser)",
+            redacted_absent: &["ca_leak", "secretpw123", "cert_leak", "key_leak", "myuser"],
+            redacted_present: &[
+                "SSL CERTIFICATE AUTHORITY = '<REDACTED>'",
+                "PASSWORD = '<REDACTED>'",
+                "SSL CERTIFICATE = '<REDACTED>'",
+                "SSL KEY = '<REDACTED>'",
+                "USER = '<REDACTED>'",
+                "HOST = pghost",
+                "PORT = 1234",
+                "DATABASE = db_ok",
+                "SSL MODE = mode_ok",
+            ],
+        },
+        Case {
+            // `SASL USERNAME` carries an inline literal (redacted); `SASL
+            // PASSWORD` is a secret reference whose catalog name stays visible.
+            sql: "CREATE CONNECTION c TO KAFKA (BROKER = 'broker_ok:9092', SASL MECHANISMS = 'mech_ok', SASL USERNAME = 'sasluser_leak', SASL PASSWORD = SECRET saslpw_ref, SECURITY PROTOCOL = 'proto_ok')",
+            redacted_absent: &["sasluser_leak"],
+            redacted_present: &[
+                "SASL USERNAME = '<REDACTED>'",
+                "SASL PASSWORD = SECRET saslpw_ref",
+                "BROKER = 'broker_ok:9092'",
+                "SASL MECHANISMS = 'mech_ok'",
+                "SECURITY PROTOCOL = 'proto_ok'",
+            ],
+        },
+        Case {
+            sql: "CREATE CONNECTION c TO KAFKA (BROKER = 'broker_ok:9092', SASL MECHANISMS = mech_ok, SASL USERNAME = svcacct, SASL PASSWORD = saslpw_leak, SECURITY PROTOCOL = proto_ok)",
+            redacted_absent: &["svcacct", "saslpw_leak"],
+            redacted_present: &[
+                "SASL USERNAME = '<REDACTED>'",
+                "SASL PASSWORD = '<REDACTED>'",
+                "BROKER = 'broker_ok:9092'",
+                "SASL MECHANISMS = mech_ok",
+                "SECURITY PROTOCOL = proto_ok",
+            ],
+        },
+        Case {
+            // A secret-only option carrying just a reference: nothing to redact,
+            // the catalog name shows.
+            sql: "CREATE CONNECTION c TO GCP (SERVICE ACCOUNT KEY = SECRET gcpkey_ref)",
+            redacted_absent: &[],
+            redacted_present: &["SERVICE ACCOUNT KEY = SECRET gcpkey_ref"],
+        },
+        Case {
+            // A `StringOrSecret` option pointing at a secret keeps the name too.
+            sql: "CREATE CONNECTION c TO AWS (ACCESS KEY ID = SECRET akid_ref, REGION = 'region_ok')",
+            redacted_absent: &[],
+            redacted_present: &["ACCESS KEY ID = SECRET akid_ref", "REGION = 'region_ok'"],
+        },
+        Case {
+            sql: "CREATE CONNECTION c TO ICEBERG CATALOG (CATALOG TYPE = 'type_ok', CREDENTIAL = 'cred_leak', WAREHOUSE = 'wh_ok')",
+            redacted_absent: &["cred_leak"],
+            redacted_present: &[
+                "CREDENTIAL = '<REDACTED>'",
+                "CATALOG TYPE = 'type_ok'",
+                "WAREHOUSE = 'wh_ok'",
+            ],
+        },
+        Case {
+            sql: "CREATE CONNECTION c TO ICEBERG CATALOG (CATALOG TYPE = type_ok, CREDENTIAL = cred_leak, WAREHOUSE = wh_ok)",
+            redacted_absent: &["cred_leak"],
+            redacted_present: &[
+                "CREDENTIAL = '<REDACTED>'",
+                "CATALOG TYPE = type_ok",
+                "WAREHOUSE = wh_ok",
+            ],
+        },
+    ];
+
+    for case in cases {
+        let ast = parse_statements(case.sql)
+            .unwrap_or_else(|e| panic!("{:?} should parse: {e}", case.sql))
+            .into_iter()
+            .next()
+            .expect("one statement")
+            .ast;
+
+        let redacted = ast.to_ast_string_redacted();
+        let simple = ast.to_ast_string_simple();
+        for needle in case.redacted_absent {
+            assert!(
+                !redacted.contains(needle),
+                "redacted output leaked {needle:?}:\n{redacted}"
+            );
+            // The value must still render in the non-redacted form, proving we
+            // only changed the redacted path.
+            assert!(
+                simple.contains(needle),
+                "non-redacted output unexpectedly missing {needle:?}:\n{simple}"
+            );
+        }
+        for needle in case.redacted_present {
+            assert!(
+                redacted.contains(needle),
+                "redacted output missing expected {needle:?}:\n{redacted}"
+            );
+        }
+    }
+}
+
+#[mz_ore::test]
+#[cfg_attr(miri, ignore)] // unsupported operation: can't call foreign function `rust_psm_stack_pointer` on OS `linux`
 fn test_collate_low_precedence_display_roundtrip() {
     // `COLLATE` binds very tightly (`PostfixCollateAt`), so a low-precedence
     // operand must print parenthesized — `(a + b) COLLATE c` would otherwise
@@ -719,6 +873,29 @@ fn test_list_keyword_bare_identifier_subscript_display_roundtrip() {
         r#"SELECT "list"[1:2]"#,
         r#"SELECT "list"['a':0]"#,
         r#"SELECT "list""#,
+    ] {
+        assert_display_roundtrips(sql);
+    }
+}
+
+#[mz_ore::test]
+#[cfg_attr(miri, ignore)] // unsupported operation: can't call foreign function `rust_psm_stack_pointer` on OS `linux`
+fn test_map_keyword_bare_identifier_option_value_display_roundtrip() {
+    // A `MAP` that no `[` follows is the item name `map`, which is how a quoted
+    // `"map"` prints. `parse_option_map` used to commit on the keyword alone, so
+    // the printed form failed to reparse in every generic option-value position.
+    // Regression for the sql_roundtrip fuzz finding `(TOPIC = "map")`.
+    for sql in [
+        r#"CREATE SINK s FROM t INTO KAFKA CONNECTION c (TOPIC = "map") FORMAT BYTES ENVELOPE DEBEZIUM"#,
+        r#"CREATE SOURCE s FROM KAFKA CONNECTION c (TOPIC = "map") FORMAT BYTES"#,
+        r#"CREATE MATERIALIZED VIEW v WITH (PARTITION BY = "map") AS SELECT 1"#,
+        // A real map-literal option value still takes the map branch.
+        r#"CREATE SINK s FROM t INTO KAFKA CONNECTION c (TOPIC = 't', TOPIC CONFIG = MAP['a' => 'b']) FORMAT BYTES ENVELOPE DEBEZIUM"#,
+        // Expression position needs no quoting: a subscripted receiver prints as
+        // `(map)[1]`, which is why `can_be_printed_bare` has no `MAP` clause.
+        r#"SELECT "map""#,
+        r#"SELECT "map"[1]"#,
+        r#"SELECT map['a' => 1]"#,
     ] {
         assert_display_roundtrips(sql);
     }

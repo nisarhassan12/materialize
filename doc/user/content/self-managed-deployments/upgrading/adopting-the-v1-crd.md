@@ -14,9 +14,12 @@ your Materialize instances.
 
 Starting in v26.30, Materialize introduces support for a new version of the
 Materialize CRD, `v1`, which provides simplified rollouts. Previously,
-Materialize only supported `v1alpha1`; `v1alpha1` remains the default.
+Materialize only supported `v1alpha1`. The Helm chart still defaults to
+`v1alpha1`, while the [Terraform
+modules](https://github.com/MaterializeInc/materialize-terraform-self-managed)
+default to `v1` starting in v4.0.0.
 
-- **v1alpha1** (default) uses a two-step rollout: first stage the spec
+- **v1alpha1** (Helm chart default) uses a two-step rollout: first stage the spec
   change, then trigger a rollout with a new `requestRollout` UUID.
 
   ```yaml
@@ -48,9 +51,10 @@ Materialize only supported `v1alpha1`; `v1alpha1` remains the default.
     backendSecretName: materialize-backend
   ```
 
-Adopting `v1` is **opt-in** for now. Upgrading the operator to v26.30+ does not
-change your existing `v1alpha1` CRs or their behavior; you can continue using
-`v1alpha1` until the next major release.
+When using the Helm chart, adopting `v1` is **opt-in** for now. When using the
+Terraform modules, `crd_version` defaults to `v1` starting in v4.0.0. Upgrading
+the operator to v26.30+ does not change your existing `v1alpha1` CRs or their
+behavior; you can continue using `v1alpha1` until the next major release.
 
 {{< important >}}
 
@@ -78,19 +82,20 @@ For instructions on completing the prerequisites, select the tab that matches
 your deployment method:
 
 {{< tabs >}}
-{{< tab "Supported Terraform" >}}
+{{< tab "Terraform" >}}
 
-If you are using the [supported Terraform
+If you are using the [Terraform
 modules](https://github.com/MaterializeInc/materialize-terraform-self-managed),
 the required infrastructure changes (cert-manager and network ingress) and
 enabling of `v1` CRD will be handled for you automatically starting in TF
-modules (**v3.1.1 or greater**).
+modules (**v3.1.1 or greater**). Starting in TF modules **v4.0.0**, the
+`materialize-instance` module also defaults `crd_version` to `v1`.
 
 - If you have already upgraded your TF modules to **v3.1.1 or greater**, the
   prerequisites are handled automatically.
 
 - If you are on earlier TF modules, use the same [procedure to perform version
-  upgrades](/self-managed-deployments/upgrading/#upgrade-using-the-new-terraform-modules)
+  upgrades](/self-managed-deployments/upgrading/#upgrade-using-terraform-modules)
   to upgrade to **v3.1.1 or greater**; i.e., update each module's `source` to
   point to the new release tag (v3.1.1 or greater), then run `terraform init &&
   terraform plan && terraform apply`.
@@ -102,28 +107,6 @@ modules (**v3.1.1 or greater**).
   - [Upgrade on AWS](/self-managed-deployments/upgrading/upgrade-on-aws/)
   - [Upgrade on Azure](/self-managed-deployments/upgrading/upgrade-on-azure/)
   - [Upgrade on GCP](/self-managed-deployments/upgrading/upgrade-on-gcp/)
-
-{{< /tab >}}
-{{< tab "Legacy Terraform" >}}
-
-If you are using the legacy Terraform modules
-([AWS](https://github.com/MaterializeInc/terraform-aws-materialize),
-[GCP](https://github.com/MaterializeInc/terraform-gcp-materialize), or
-[Azure](https://github.com/MaterializeInc/terraform-azure-materialize)),
-we recommend migrating to the [new supported Terraform
-modules](https://github.com/MaterializeInc/materialize-terraform-self-managed)
-before opting in to the `v1` CRD.
-
-The new modules include built-in support for the conversion webhooks used by
-the `v1` CRD, including cert-manager installation and network policy
-configuration. The legacy modules do not include these changes, so you would
-need to apply them manually (see the **Manual** tab).
-
-For migration guidance, see the documentation for your cloud provider:
-
-- [AWS migration guide](https://github.com/MaterializeInc/materialize-terraform-self-managed/tree/main/aws/examples/migration)
-- [GCP migration guide](https://github.com/MaterializeInc/materialize-terraform-self-managed/tree/main/gcp/examples/migration)
-- [Azure migration guide](https://github.com/MaterializeInc/materialize-terraform-self-managed/tree/main/azure/examples/migration)
 
 {{< /tab >}}
 {{< tab "Manual" >}}
@@ -235,7 +218,7 @@ if nothing else in the spec changed.
 {{< /important >}}
 
 {{< tabs >}}
-{{< tab "Supported Terraform" >}}
+{{< tab "Terraform" >}}
 
 If you are managing your Materialize instance with the [Materialize Terraform
 modules](https://github.com/MaterializeInc/materialize-terraform-self-managed),
@@ -245,6 +228,9 @@ set:
 crd_version     = "v1"
 request_rollout = null
 ```
+
+Starting in Terraform module version v4.0.0, `crd_version` defaults to `v1`,
+so you can also omit it.
 
 **Once on v1, an unchanged spec will not trigger a rollout.** Reapplying the
 same spec produces the same hash and the same derived `requestRollout`. Changing
@@ -281,4 +267,6 @@ a hashed spec field produces a new value and triggers a rollout automatically.
 
 You can go back to the `v1alpha1` rollout behavior at any time by applying your
 CR with `apiVersion: materialize.cloud/v1alpha1` and an explicit
-`requestRollout` UUID.
+`requestRollout` UUID. With the Terraform modules, set `crd_version =
+"v1alpha1"` explicitly (required starting in v4.0.0, where `crd_version`
+defaults to `v1`) and set `request_rollout` to a new UUID.

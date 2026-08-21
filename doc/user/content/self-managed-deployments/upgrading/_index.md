@@ -34,9 +34,6 @@ name="upgrade-landing-guides-helm" %}}
 {{% include-from-yaml data="self_managed/upgrades"
 name="upgrade-landing-guides-unified" %}}
 
-{{% include-from-yaml data="self_managed/upgrades"
-name="upgrade-landing-guides-legacy" %}}
-
 ## Upgrading the Helm Chart and Materialize Operator
 
 {{< important >}}
@@ -101,8 +98,9 @@ rollouts work.
 
 ## Rollout configuration
 
-Materialize supports two CRD API versions: `v1alpha1` (default) and `v1`
-(available starting in v26.30).
+Materialize supports two CRD API versions: `v1alpha1` and `v1` (available
+starting in v26.30). The Helm chart defaults to `v1alpha1`. The Terraform
+modules default to `v1` starting in v4.0.0.
 
 How you trigger a rollout depends on the CRD API version of your instances.
 

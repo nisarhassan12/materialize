@@ -15,21 +15,24 @@ use columnar::Len;
 use itertools::Itertools;
 use mz_expr::JoinImplementation::{DeltaQuery, Differential, IndexedFilter, Unimplemented};
 use mz_expr::{
-    AggregateExpr, Columns, Id, JoinInputMapper, MapFilterProject, MirRelationExpr, MirScalarExpr,
-    OptimizedMirRelationExpr, SafeMfpPlan, TableFunc, permutation_for_arrangement,
+    AggregateExpr, Columns, Id, JoinInputMapper, MapFilterProject, MfpPlan, MirRelationExpr,
+    MirScalarExpr, OptimizedMirRelationExpr, SafeMfpPlan, TableFunc, permutation_for_arrangement,
 };
 use mz_ore::{assert_none, soft_assert_eq_or_log, soft_panic_or_log};
 use mz_repr::optimize::OptimizerFeatures;
-use mz_repr::{GlobalId, Timestamp};
+use mz_repr::{GlobalId, StableRow, Timestamp};
 
 use crate::dataflows::{BuildDesc, DataflowDescription, IndexImport};
 use crate::plan::join::{DeltaJoinPlan, JoinPlan, LinearJoinPlan};
 use crate::plan::reduce::{KeyValPlan, ReducePlan};
-use crate::plan::scalar::{LirScalarExpr, lses_from_mses, mfp_mir_to_lir, mfp_mir_to_lir_plan};
+use crate::plan::scalar::{
+    LirScalarExpr, lses_from_mses, mfp_mir_to_lir, mfp_mir_to_lir_plan, mfp_plan_mir_to_lir,
+};
 use crate::plan::threshold::ThresholdPlan;
 use crate::plan::top_k::TopKPlan;
 use crate::plan::{
     ArrangementStrategy, AvailableCollections, GetPlan, LirId, LirRelationExpr, LirRelationNode,
+    LoweringMetrics,
 };
 
 /// Pick an [`ArrangementStrategy`] based on whether the input may contain future-stamped
@@ -68,10 +71,40 @@ pub(super) struct Context {
     debug_info: LirDebugInfo,
     /// Whether to enable fusion of MFPs in reductions.
     enable_reduce_mfp_fusion: bool,
+    /// Metrics recorded during lowering, if any are being collected.
+    metrics: Option<LoweringMetrics>,
+    /// Whether the current expression is subject to single-time (one-shot
+    /// `SELECT`) monotonic operator selection.
+    ///
+    /// Lowering locks in which arrangements a node makes available, and that set
+    /// changes with the chosen operator variant (e.g. a monotonic `TopK`/`Reduce`
+    /// arranges differently than its non-monotonic form). So the variant must be
+    /// picked here, during lowering, rather than by a later rewrite that would
+    /// leave the already-computed `AvailableCollections` describing the wrong shape.
+    ///
+    /// Initialized from the dataflow's `is_single_time()` and forced to `false`
+    /// while lowering the recursive bindings of a `LetRec`, whose values are not
+    /// restricted to a single time.
+    single_time: bool,
+    /// Global ids of the dataflow's source imports.
+    source_imports: BTreeSet<GlobalId>,
+    /// MIR `MfpPlan`s pushed onto `Get::Collection` reads of source imports,
+    /// keyed by the `Get`'s `LirId`.
+    ///
+    /// `refine_source_mfps` identifies common parts across sibling reads and pushes the
+    /// common part into the shared source MFP. That pass runs on MIR because
+    /// only MIR can utter the `mz_now()` predicates that temporal bounds fold
+    /// into. Retaining the MIR form here lets it find common parts without
+    /// round-tripping the LIR plans back through MIR.
+    source_get_mfps: BTreeMap<LirId, MfpPlan<MirScalarExpr>>,
 }
 
 impl Context {
-    pub fn new(debug_name: String, features: &OptimizerFeatures) -> Self {
+    pub fn new(
+        debug_name: String,
+        features: &OptimizerFeatures,
+        metrics: Option<&LoweringMetrics>,
+    ) -> Self {
         Self {
             arrangements: Default::default(),
             has_future_updates: Default::default(),
@@ -81,6 +114,11 @@ impl Context {
                 id: GlobalId::Transient(0),
             },
             enable_reduce_mfp_fusion: features.enable_reduce_mfp_fusion,
+            metrics: metrics.cloned(),
+            // Set from the dataflow in `lower` before any expression is lowered.
+            single_time: false,
+            source_imports: Default::default(),
+            source_get_mfps: Default::default(),
         }
     }
 
@@ -127,7 +165,13 @@ impl Context {
             self.arrangements
                 .entry(Id::Global(*id))
                 .or_insert_with(AvailableCollections::new_raw);
+            self.source_imports.insert(*id);
         }
+
+        // One-shot `SELECT` dataflows run at a single time, which lets us select
+        // monotonic operator variants during lowering (see the `TopK` and `Reduce`
+        // arms), so that `AvailableCollections` reflect the final operator variant.
+        self.single_time = desc.is_single_time();
 
         // Build each object in order, registering the arrangements it forms.
         let mut objects_to_build = Vec::with_capacity(desc.objects_to_build.len());
@@ -146,7 +190,7 @@ impl Context {
             objects_to_build.push(BuildDesc { id: build.id, plan });
         }
 
-        Ok(DataflowDescription {
+        let mut dataflow = DataflowDescription {
             source_imports: desc.source_imports,
             index_imports: desc.index_imports,
             objects_to_build,
@@ -158,7 +202,120 @@ impl Context {
             refresh_schedule: desc.refresh_schedule,
             debug_name: desc.debug_name,
             time_dependence: desc.time_dependence,
-        })
+        };
+
+        // Refining: identify the common parts in the MFPs pushed onto a
+        // source's reads and hoist the shared prefix into the source itself.
+        self.refine_source_mfps(&mut dataflow);
+
+        Ok(dataflow)
+    }
+
+    /// Identifies common parts of the `MapFilterProject`s pushed onto sibling `Get::Collection`
+    /// reads of each imported source, hoisting the shared prefix into the
+    /// source's own MFP.
+    ///
+    /// The reads' MFPs are lowering artifacts (MIR sees only `Get(GlobalId)`),
+    /// so this belongs in lowering. We run on MIR because only MIR can
+    /// utter the `mz_now()` predicates that temporal bounds fold into, so it
+    /// consumes the MIR `MfpPlan`s stashed in [`Self::source_get_mfps`] rather
+    /// than round-tripping the lowered LIR plans back through MIR.
+    fn refine_source_mfps(&mut self, dataflow: &mut DataflowDescription<LirRelationExpr>) {
+        for (source_id, source_import) in dataflow.source_imports.iter_mut() {
+            let source = &mut source_import.desc;
+            let source_id = *source_id;
+            let mut identity_present = false;
+
+            // Collect the MIR `MfpPlan`s pushed onto this source's
+            // `Get::Collection` reads. Folding their temporal bounds back into
+            // `mz_now()` predicates (`into_map_filter_project`) lets
+            // `extract_common`'s column remapping apply uniformly across the
+            // whole MFP. Also note identity reads, which block pushdown.
+            let mut taken: Vec<(LirId, MapFilterProject<MirScalarExpr>)> = Vec::new();
+            for build_desc in dataflow.objects_to_build.iter() {
+                let mut todo = vec![&build_desc.plan];
+                while let Some(expression) = todo.pop() {
+                    let node = &expression.node;
+                    if let LirRelationNode::Get { id, plan, .. } = node {
+                        if *id == Id::Global(source_id) {
+                            match plan {
+                                GetPlan::Collection(_) => {
+                                    let mir_plan = self
+                                        .source_get_mfps
+                                        .remove(&expression.lir_id)
+                                        .expect("stashed MIR MfpPlan for source Get::Collection");
+                                    taken.push((
+                                        expression.lir_id,
+                                        mir_plan.into_map_filter_project(),
+                                    ));
+                                }
+                                GetPlan::PassArrangements => {
+                                    identity_present = true;
+                                }
+                                GetPlan::Arrangement(..) => {
+                                    panic!("Surprising `GetPlan` for imported source: {:?}", plan);
+                                }
+                            }
+                        }
+                    } else {
+                        todo.extend(node.children());
+                    }
+                }
+            }
+
+            // Direct exports of sources are possible, and prevent pushdown.
+            identity_present |= dataflow
+                .index_exports
+                .values()
+                .any(|(x, _)| x.on_id == source_id);
+            identity_present |= dataflow.sink_exports.values().any(|x| x.from == source_id);
+
+            if identity_present || taken.is_empty() {
+                // Nothing to push down. The reads already carry their final LIR
+                // MFPs, so leave them untouched.
+                continue;
+            }
+
+            // Extract the common prefix and push it into the source's MFP.
+            let mut mfp_refs: Vec<&mut MapFilterProject<MirScalarExpr>> =
+                taken.iter_mut().map(|(_, mfp)| mfp).collect();
+            let common = MapFilterProject::extract_common(&mut mfp_refs[..]);
+            let mut source_mfp = if let Some(mfp) = source.arguments.operators.take() {
+                MapFilterProject::compose(mfp, common)
+            } else {
+                common
+            };
+            source_mfp.optimize();
+            source.arguments.operators = Some(source_mfp);
+
+            // Convert each residual MFP back to an LIR `MfpPlan` once, and
+            // install it on the corresponding read by `LirId`.
+            let replacements: BTreeMap<LirId, MfpPlan<LirScalarExpr>> = taken
+                .into_iter()
+                .map(|(lir_id, mir_mfp)| (lir_id, mfp_mir_to_lir_plan(mir_mfp)))
+                .collect();
+
+            for build_desc in dataflow.objects_to_build.iter_mut() {
+                let mut todo = vec![&mut build_desc.plan];
+                while let Some(expression) = todo.pop() {
+                    if let Some(replacement) = replacements.get(&expression.lir_id) {
+                        if let LirRelationNode::Get {
+                            plan: GetPlan::Collection(mfp_plan),
+                            ..
+                        } = &mut expression.node
+                        {
+                            *mfp_plan = replacement.clone();
+                        } else {
+                            panic!(
+                                "LirId {:?} was a GetPlan::Collection but is now {:?}",
+                                expression.lir_id, expression.node
+                            );
+                        }
+                    }
+                    todo.extend(expression.node.children_mut());
+                }
+            }
+        }
     }
 
     /// This method converts a MirRelationExpr into a plan that can be directly rendered.
@@ -222,7 +379,7 @@ impl Context {
                 let node = LirRelationNode::Constant {
                     rows: rows.clone().map(|rows| {
                         rows.into_iter()
-                            .map(|(row, diff)| (row, Timestamp::MIN, diff))
+                            .map(|(row, diff)| (StableRow(row), Timestamp::MIN, diff))
                             .collect()
                     }),
                 };
@@ -254,9 +411,18 @@ impl Context {
                         mfp.literal_constraints(
                             &key.0.iter().map(MirScalarExpr::from).collect_vec(),
                         )
-                        .map(|val| (key.clone(), val))
+                        .map(|val| {
+                            if let Some(metrics) = &self.metrics {
+                                metrics.inc_literal_constraints("get");
+                            }
+                            (key.clone(), val)
+                        })
                     })
                     .max_by_key(|(key, _val)| key.0.len());
+
+                // A source-import `Get::Collection`'s MIR `MfpPlan`, retained for
+                // `refine_source_mfps`. Stashed by `LirId` once the id is allocated below.
+                let mut source_get_mfp: Option<MfpPlan<MirScalarExpr>> = None;
 
                 // Determine the plan of action for the `Get` stage.
                 let plan = if let Some(((key, permutation, thinning), val)) = &key_val {
@@ -276,7 +442,11 @@ impl Context {
                     // present when handling the leftover MFP after this big match.)
                     mfp.permute_fn(|c| permutation[c], thinning.len() + key.len());
                     in_keys.arranged = vec![(key.clone(), permutation.clone(), thinning.clone())];
-                    GetPlan::Arrangement(key.clone(), Some(val.clone()), mfp_mir_to_lir_plan(mfp))
+                    GetPlan::Arrangement(
+                        key.clone(),
+                        Some(StableRow(val.clone())),
+                        mfp_mir_to_lir_plan(mfp),
+                    )
                 } else if !mfp.is_identity() {
                     // We need to ensure a collection exists, which means we must form it.
                     if let Some((key, permutation, thinning)) =
@@ -287,7 +457,13 @@ impl Context {
                             vec![(key.clone(), permutation.clone(), thinning.clone())];
                         GetPlan::Arrangement(key.clone(), None, mfp_mir_to_lir_plan(mfp))
                     } else {
-                        GetPlan::Collection(mfp_mir_to_lir_plan(mfp))
+                        let mir_plan = mfp.into_plan().expect("MFP planning failed");
+                        if let Id::Global(gid) = id {
+                            if self.source_imports.contains(gid) {
+                                source_get_mfp = Some(mir_plan.clone());
+                            }
+                        }
+                        GetPlan::Collection(mfp_plan_mir_to_lir(mir_plan))
                     }
                 } else {
                     // By default, just pass input arrangements through.
@@ -315,6 +491,9 @@ impl Context {
                     };
 
                 let lir_id = self.allocate_lir_id();
+                if let Some(mir_plan) = source_get_mfp {
+                    self.source_get_mfps.insert(lir_id, mir_plan);
+                }
                 let node = LirRelationNode::Get {
                     id: id.clone(),
                     keys: in_keys,
@@ -380,6 +559,11 @@ impl Context {
                 // as we cannot circulate an arrangement through a `Variable` yet.
                 let mut lir_values = Vec::with_capacity(values.len());
                 let mut any_v_future = false;
+                // The recursive bindings of a `LetRec` are not restricted to a single
+                // time, so single-time monotonic selection must not apply to them. Only
+                // the `body`, lowered below, inherits the enclosing scope's flag.
+                let outer_single_time = self.single_time;
+                self.single_time = false;
                 for (id, value) in ids.iter().zip_eq(values) {
                     let LoweredExpr {
                         plan: mut lir_value,
@@ -465,6 +649,7 @@ impl Context {
                 }
                 // Plan the body using initial and `value` arrangements,
                 // and then remove reference to the value arrangements.
+                self.single_time = outer_single_time;
                 let LoweredExpr {
                     plan: body,
                     keys: b_keys,
@@ -870,7 +1055,7 @@ This is not expected to cause incorrect results, but could indicate a performanc
                     has_future_updates: input_future,
                 } = self.lower_mir_expr(input)?;
 
-                let top_k_plan = TopKPlan::create_from(
+                let mut top_k_plan = TopKPlan::create_from(
                     group_key.clone(),
                     order_key.clone(),
                     *offset,
@@ -881,6 +1066,13 @@ This is not expected to cause incorrect results, but could indicate a performanc
                     *monotonic,
                     *expected_group_size,
                 );
+
+                // For single-time dataflows, upgrade to the monotonic variant with
+                // mandatory consolidation. `refine_single_time_consolidation` later
+                // relaxes `must_consolidate` where the input is physically monotonic.
+                if self.single_time {
+                    top_k_plan.as_monotonic(true);
+                }
 
                 // We don't have an MFP here -- install an operator to permute the
                 // input, if necessary.
@@ -896,7 +1088,25 @@ This is not expected to cause incorrect results, but could indicate a performanc
                 } else {
                     input
                 };
-                // Return the plan, and no arrangements.
+                // Return the plan, and the keys it produces. `MonotonicTop1` arranges its
+                // output by the group key (see `render_top1_monotonic`), so a downstream
+                // consumer keyed the same way can reuse that arrangement instead of forcing
+                // another `ArrangeBy`.
+                let out_keys = match &top_k_plan {
+                    TopKPlan::MonotonicTop1(_) => {
+                        let key = group_key
+                            .iter()
+                            .map(|c| LirScalarExpr::column(*c))
+                            .collect::<Vec<_>>();
+                        let (permutation, thinning) = permutation_for_arrangement(&key, arity);
+                        AvailableCollections::new_arranged(vec![(key, permutation, thinning)])
+                    }
+                    // MonotonicTopK / Basic key their arrangements by (hash, group_key), which is
+                    // not reusable by a group-key consumer, so they advertise no arrangement.
+                    TopKPlan::MonotonicTopK(_) | TopKPlan::Basic(_) => {
+                        AvailableCollections::new_raw()
+                    }
+                };
                 let temporal_bucketing_strategy = strategy_from_future(input_future);
                 let lir_id = self.allocate_lir_id();
                 LoweredExpr {
@@ -906,7 +1116,7 @@ This is not expected to cause incorrect results, but could indicate a performanc
                         temporal_bucketing_strategy,
                     }
                     .as_plan(lir_id),
-                    keys: AvailableCollections::new_raw(),
+                    keys: out_keys,
                     has_future_updates: false,
                 }
             }
@@ -1151,7 +1361,12 @@ This is not expected to cause incorrect results, but could indicate a performanc
                     let mut mfp = mfp.clone();
                     mfp.permute_fn(|c| permutation[c], thinning.len() + key.len());
                     mfp.literal_constraints(&key.iter().map(MirScalarExpr::from).collect_vec())
-                        .map(|val| (key.clone(), permutation, thinning, val))
+                        .map(|val| {
+                            if let Some(metrics) = &self.metrics {
+                                metrics.inc_literal_constraints("mfp");
+                            }
+                            (key.clone(), permutation, thinning, val)
+                        })
                 })
                 .max_by_key(|(key, _, _, _)| key.len());
 
@@ -1210,7 +1425,7 @@ This is not expected to cause incorrect results, but could indicate a performanc
                     plan = LirRelationNode::Mfp {
                         input: Box::new(plan),
                         mfp: mfp_mir_to_lir_plan(mfp),
-                        input_key_val: Some((key.clone(), val)),
+                        input_key_val: Some((key.clone(), val.map(StableRow))),
                     }
                     .as_plan(lir_id)
                 }
@@ -1219,7 +1434,7 @@ This is not expected to cause incorrect results, but could indicate a performanc
                 plan = LirRelationNode::Mfp {
                     input: Box::new(plan),
                     mfp: mfp_mir_to_lir_plan(mfp),
-                    input_key_val,
+                    input_key_val: input_key_val.map(|(key, val)| (key, val.map(StableRow))),
                 }
                 .as_plan(lir_id);
                 keys = AvailableCollections::new_raw();
@@ -1268,12 +1483,26 @@ This is not expected to cause incorrect results, but could indicate a performanc
             aggregates,
             permutation_and_new_arity,
         );
-        let reduce_plan = ReducePlan::create_from(
+        let mut reduce_plan = ReducePlan::create_from(
             aggregates.clone(),
             *monotonic,
             *expected_group_size,
             fused_unnest_list,
         );
+
+        // For single-time dataflows, upgrade a hierarchical reduce to its monotonic
+        // variant with mandatory consolidation. `refine_single_time_consolidation`
+        // later relaxes `must_consolidate` where the input is physically monotonic.
+        // Selecting the variant before computing `keys` below keeps the advertised
+        // `AvailableCollections` consistent with the final plan. `Reduce::keys()` is
+        // the same for every hierarchical sub-variant, so the advertisement is in fact
+        // identical either way.
+        if self.single_time {
+            if let ReducePlan::Hierarchical(hierarchical) = &mut reduce_plan {
+                hierarchical.as_monotonic(true);
+            }
+        }
+
         // Return the plan, and the keys it produces.
         let mfp_after;
         let output_arity;

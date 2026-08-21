@@ -48,10 +48,18 @@ use mz_sql::names::{CommentObjectId, DatabaseId, SchemaId};
 use mz_sql::plan::{AutoScalingStrategy, ClusterSchedule, NetworkPolicyRule, OnTimeoutAction};
 #[cfg(test)]
 use proptest_derive::Arbitrary;
+use uuid::Uuid;
 
 use crate::builtin::RUNTIME_ALTERABLE_FINGERPRINT_SENTINEL;
 use crate::durable::Epoch;
 use crate::durable::objects::serialization::proto;
+
+/// A proptest strategy for [`Uuid`]s, which don't implement `Arbitrary`.
+#[cfg(test)]
+fn any_uuid() -> impl proptest::strategy::Strategy<Value = Uuid> {
+    use proptest::strategy::Strategy;
+    proptest::arbitrary::any::<u128>().prop_map(Uuid::from_u128)
+}
 
 // Structs used to pass information to outside modules.
 
@@ -349,24 +357,44 @@ pub struct ClusterVariantManaged {
     pub size: String,
     pub availability_zones: Vec<String>,
     pub logging: ReplicaLogging,
+    /// Whether arrangements on this cluster's replicas request dictionary compression.
+    pub arrangement_compression: bool,
     pub replication_factor: u32,
     pub optimizer_feature_overrides: BTreeMap<String, String>,
     pub schedule: ClusterSchedule,
     /// User-configured autoscaling policy, distinct from the in-flight runtime
     /// records below.
     pub auto_scaling_strategy: Option<AutoScalingStrategy>,
-    /// In-flight graceful reconfiguration the controller is converging on.
+    /// Latest graceful reconfiguration record, if one has been written.
     pub reconfiguration: Option<ReconfigurationState>,
     /// In-flight hydration burst the controller is running.
     pub burst: Option<BurstState>,
 }
 
-/// An in-flight graceful reconfiguration: the config shape the cluster is
-/// moving to plus the deadline by which it must complete.
+/// The canonical name of the `index`-th (zero-based) replica of a managed
+/// cluster.
 ///
-/// `ALTER` writes this record and returns; the realized config (`cluster.size`,
-/// ...) is advanced by the controller only at cut-over. A past `deadline` with
-/// the record still present is a timeout tombstone.
+/// A managed cluster's replicas are derived from its `replication_factor`: for a
+/// factor of N they are named `r1` through `rN`.
+///
+/// `ALTER CLUSTER` computes the replicas it creates and drops by this rule, and
+/// so does the catalog-open reconciler that materializes builtin replicas. The
+/// two have to share it, or `ALTER` cannot find the replicas it means to change.
+/// The cluster controller deliberately does not: its `ReplicaNameGen` picks names
+/// that avoid the observed set, which is why `ALTER` against a controller-owned
+/// cluster drops by observed id rather than by derived name.
+pub fn managed_cluster_replica_name(index: u32) -> String {
+    format!("r{}", index + 1)
+}
+
+/// The latest graceful reconfiguration: the config shape the cluster is moving
+/// to or most recently moved toward, plus its deadline and terminal state.
+///
+/// `ALTER` writes this record with [`ReconfigurationStatus::InProgress`] and
+/// returns. The realized config (`cluster.size`, ...) is advanced by the
+/// controller only at cut-over. When the reconfiguration settles, the controller
+/// retains the record with a terminal status so readers can inspect the latest
+/// outcome without reconstructing it from the audit log.
 #[derive(Clone, Debug, PartialOrd, PartialEq, Eq, Ord)]
 pub struct ReconfigurationState {
     pub target: ReconfigurationTarget,
@@ -375,6 +403,29 @@ pub struct ReconfigurationState {
     /// target hydrates. Success takes precedence: a hydrated target cuts over
     /// regardless of this field.
     pub on_timeout: OnTimeoutAction,
+    pub status: ReconfigurationStatus,
+}
+
+/// The lifecycle status of the latest graceful reconfiguration.
+#[derive(Clone, Copy, Debug, PartialOrd, PartialEq, Eq, Ord)]
+pub enum ReconfigurationStatus {
+    /// The controller is converging the cluster onto the target shape.
+    InProgress,
+    /// The realized config reached the target shape.
+    Finalized,
+    /// The deadline fired under rollback and the realized config stayed put.
+    TimedOut,
+    /// The user retargeted the reconfiguration back to the realized shape.
+    Cancelled,
+    /// The controller could not create the target replicas within the budget.
+    ResourceExhausted,
+}
+
+impl ReconfigurationState {
+    /// Whether this record should still drive target-replica convergence.
+    pub fn is_in_progress(&self) -> bool {
+        matches!(self.status, ReconfigurationStatus::InProgress)
+    }
 }
 
 /// The full config shape a reconfiguration is moving the cluster to, so a
@@ -385,6 +436,7 @@ pub struct ReconfigurationTarget {
     pub replication_factor: u32,
     pub availability_zones: Vec<String>,
     pub logging: ReplicaLogging,
+    pub arrangement_compression: bool,
 }
 
 /// An active hydration burst the controller is running.
@@ -499,6 +551,7 @@ impl DurableType for ClusterReplica {
 pub struct ReplicaConfig {
     pub location: ReplicaLocation,
     pub logging: ReplicaLogging,
+    pub arrangement_compression: bool,
 }
 
 impl From<mz_controller::clusters::ReplicaConfig> for ReplicaConfig {
@@ -506,6 +559,7 @@ impl From<mz_controller::clusters::ReplicaConfig> for ReplicaConfig {
         Self {
             location: config.location.into(),
             logging: config.compute.logging,
+            arrangement_compression: config.compute.arrangement_compression,
         }
     }
 }
@@ -577,6 +631,9 @@ pub struct Item {
     pub owner_id: RoleId,
     pub privileges: Vec<MzAclItem>,
     pub extra_versions: BTreeMap<RelationVersion, GlobalId>,
+    /// `Some(uuid)` marks a temporary item owned by, and only visible to, the
+    /// session with that UUID. `None` is a normal durable item.
+    pub ephemeral_owner_session: Option<Uuid>,
 }
 
 impl Item {
@@ -601,6 +658,7 @@ impl DurableType for Item {
                 owner_id: self.owner_id,
                 privileges: self.privileges,
                 extra_versions: self.extra_versions,
+                ephemeral_owner_session: self.ephemeral_owner_session,
             },
         )
     }
@@ -616,6 +674,7 @@ impl DurableType for Item {
             owner_id: value.owner_id,
             privileges: value.privileges,
             extra_versions: value.extra_versions,
+            ephemeral_owner_session: value.ephemeral_owner_session,
         }
     }
 
@@ -1469,6 +1528,8 @@ pub struct ItemValue {
     pub(crate) oid: u32,
     pub(crate) global_id: GlobalId,
     pub(crate) extra_versions: BTreeMap<RelationVersion, GlobalId>,
+    #[cfg_attr(test, proptest(strategy = "proptest::option::of(any_uuid())"))]
+    pub(crate) ephemeral_owner_session: Option<Uuid>,
 }
 
 impl ItemValue {
@@ -1498,6 +1559,10 @@ pub fn item_type(create_sql: &str) -> CatalogItemType {
         Some("MATERIALIZED") => {
             assert_eq!(tokens.next(), Some("VIEW"));
             CatalogItemType::MaterializedView
+        }
+        Some("METRIC") => {
+            assert_eq!(tokens.next(), Some("SINK"));
+            CatalogItemType::MetricSink
         }
         Some("INDEX") => CatalogItemType::Index,
         Some("TYPE") => CatalogItemType::Type,

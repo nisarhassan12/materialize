@@ -9,7 +9,13 @@
 
 //! An abstraction presenting as a durable time-varying collection (aka shard)
 
-#![warn(missing_docs, missing_debug_implementations)]
+// The `fuzzing` feature re-exports internal types (see `fuzz_exports`) that are
+// intentionally undocumented. Don't require docs/Debug for them in that
+// test-only build. The normal public API is still linted.
+#![cfg_attr(
+    not(feature = "fuzzing"),
+    warn(missing_docs, missing_debug_implementations)
+)]
 // #[track_caller] is currently a no-op on async functions, but that hopefully won't be the case
 // forever. So we already annotate those functions now and ignore the compiler warning until
 // https://github.com/rust-lang/rust/issues/87417 pans out.
@@ -97,6 +103,17 @@ pub mod schema;
 pub mod stats;
 pub mod usage;
 pub mod write;
+
+/// Internal durable-state types re-exported under `cfg(feature = "fuzzing")` so
+/// the fuzz crate can drive their proto round-trips (`ProtoRollup`/`ProtoStateDiff`
+/// are decoded from blob/consensus on every state load). Not part of the public
+/// API.
+#[cfg(feature = "fuzzing")]
+pub mod fuzz_exports {
+    pub use crate::internal::encoding::Rollup;
+    pub use crate::internal::state::{ProtoRollup, ProtoStateDiff};
+    pub use crate::internal::state_diff::StateDiff;
+}
 
 /// An implementation of the public crate interface.
 mod internal {
@@ -340,13 +357,11 @@ impl PersistClient {
         let gc = GarbageCollector::new(machine.clone(), Arc::clone(&self.isolated_runtime));
 
         let reader_id = LeasedReaderId::new();
-        let heartbeat_ts = (self.cfg.now)();
         let (reader_state, maintenance) = machine
             .register_leased_reader(
                 &reader_id,
                 &diagnostics.handle_purpose,
                 READER_LEASE_DURATION.get(&self.cfg),
-                heartbeat_ts,
                 use_critical_since,
             )
             .await;
@@ -694,6 +709,33 @@ impl PersistClient {
             .make_machine::<K, V, T, D>(shard_id, diagnostics)
             .await?;
         Ok(machine.latest_schema())
+    }
+
+    /// Fetches and returns a recent shard-global `upper`, without requiring a
+    /// [`WriteHandle`].
+    ///
+    /// Importantly, this operation is linearized with write operations, giving
+    /// the same guarantee as [`WriteHandle::fetch_recent_upper`]. It requires
+    /// fetching the latest state from consensus and is therefore a potentially
+    /// expensive operation.
+    ///
+    /// If `shard_id` has never been used before, initializes the shard and
+    /// returns an upper of `Antichain::from_elem(T::minimum())`.
+    pub async fn recent_upper<K, V, T, D>(
+        &self,
+        shard_id: ShardId,
+        diagnostics: Diagnostics,
+    ) -> Result<Antichain<T>, InvalidUsage<T>>
+    where
+        K: Debug + Codec,
+        V: Debug + Codec,
+        T: Timestamp + Lattice + Codec64 + Sync,
+        D: Monoid + Codec64 + Send + Sync,
+    {
+        let machine = self
+            .make_machine::<K, V, T, D>(shard_id, diagnostics)
+            .await?;
+        Ok(machine.applier.fetch_upper(|upper| upper.clone()).await)
     }
 
     /// Registers a schema for the given shard.

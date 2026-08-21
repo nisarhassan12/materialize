@@ -17,8 +17,9 @@ use std::time::{Duration, Instant};
 use bytesize::ByteSize;
 use differential_dataflow::Hashable;
 use differential_dataflow::lattice::Lattice;
+use differential_dataflow::trace::cursor::BatchCursor;
 use differential_dataflow::trace::implementations::BatchContainer;
-use differential_dataflow::trace::{Cursor, TraceReader};
+use differential_dataflow::trace::{Cursor, Navigable, TraceReader};
 use mz_compute_client::logging::LoggingConfig;
 use mz_compute_client::protocol::command::{
     ComputeCommand, ComputeParameters, InstanceConfig, Peek, PeekTarget,
@@ -359,6 +360,76 @@ impl ComputeState {
             apply_tiered_config(enabled, total, backend, codec, swap_pageout);
         }
 
+        // Install and retune the process-wide buffer pool that backs chunk
+        // spilling. Installation is the gate. The pool is constructed, and its
+        // MAP_NORESERVE address space reserved and spill threads spawned, only
+        // when a config apply runs with a spill gate on, so a process that
+        // never enables spilling never mmaps the pool. Config application
+        // reruns on every UpdateConfiguration, so flipping a gate on installs
+        // the pool on the next tick. The pool is a process singleton with no
+        // teardown: once installed it stays active for the life of the process.
+        // Turning both gates back off makes this block do nothing, so the pool
+        // keeps its last-applied budget rather than being uninstalled. Later
+        // ticks with a gate on retune the one instance in place.
+        //
+        // Storage's stash shares the singleton and gates only participation,
+        // so its spill gate installs the pool too. The worker config set is
+        // the full dyncfg aggregate, which is what makes the storage flag
+        // readable here.
+        {
+            use mz_timely_util::pool_config::{PoolPagerConfig, apply_pool_config};
+
+            let compute_spill = ENABLE_COLUMN_PAGED_BATCHER_SPILL.get(config);
+            let storage_spill = mz_storage_types::dyncfgs::ENABLE_UPSERT_PAGED_SPILL.get(config);
+            if !(compute_spill || storage_spill) {
+                debug!("chunk spill: gates off, leaving the buffer pool uninstalled");
+            } else {
+                let spill_threads = COLUMN_PAGED_BATCHER_SPILL_WORKER_COUNT.get(config);
+                let eager_backing = COLUMN_PAGED_BATCHER_EAGER_BACKING.get(config);
+
+                // Budget derivation: fraction of physical RAM, with a 128 MiB
+                // floor so the no-pressure case doesn't page per chunk.
+                // Resident budgets derive from RAM, never from the announced
+                // memory limit, which on swap-provisioned nodes deliberately
+                // includes swap for the memory limiter's purposes. Falls back
+                // to a 4 GiB assumption if detection fails.
+                const MIB: usize = 1024 * 1024;
+                const DEFAULT_RAM: usize = 4 * 1024 * MIB;
+                let ram = mz_ore::memory::physical_memory_bytes().unwrap_or(DEFAULT_RAM);
+                let of_ram =
+                    |fraction: f64| usize::cast_lossy(f64::cast_lossy(ram) * fraction.max(0.0));
+                let fraction = COLUMN_PAGED_BATCHER_BUDGET_FRACTION.get(config);
+                let total = of_ram(fraction).max(128 * MIB);
+                // No ordering is enforced between the target and the budget. A
+                // target at or below budget + warm cap leaves no compressed-tier
+                // headroom, which legally collapses the tier. Every backing
+                // write then pages out immediately, the pre-tier behavior.
+                let rss_target = of_ram(COLUMN_PAGED_BATCHER_POOL_RSS_TARGET_FRACTION.get(config));
+
+                let applied = apply_pool_config(PoolPagerConfig {
+                    budget_bytes: total,
+                    spill_threads,
+                    eager_backing,
+                    rss_target_bytes: rss_target,
+                });
+                if applied {
+                    info!(
+                        compute_spill,
+                        storage_spill,
+                        fraction,
+                        ram,
+                        budget_bytes = total,
+                        spill_threads,
+                        eager_backing,
+                        rss_target_bytes = rss_target,
+                        "chunk spill: applying buffer-pool config",
+                    );
+                } else {
+                    warn!("chunk spill: buffer pool unavailable; chunks stay resident");
+                }
+            }
+        }
+
         // Remember the maintenance interval locally to avoid reading it from the config set on
         // every server iteration.
         self.server_maintenance_interval = COMPUTE_SERVER_MAINTENANCE_INTERVAL.get(config);
@@ -597,6 +668,16 @@ impl<'a> ActiveComputeState<'a> {
             .chain(dataflow.copy_to_ids())
             .collect();
 
+        // `StartSignal` is attached only to imported sources and imported indexes, and
+        // `import_ids` is exactly those two sets, so a dataflow with no imports has nothing
+        // suspended and begins computing as soon as it is rendered. Such a dataflow can reach
+        // hydration before its `Schedule` arrives, and the controller sends one anyway to keep
+        // protocol communication predictable, so a `started_at` stamped only from
+        // `handle_schedule` would land after `hydrated_at`. Stamping it here also keeps the row
+        // truthful from the moment it appears, rather than reporting the object as queued while
+        // nothing is queueing it.
+        let starts_immediately = dataflow.import_ids().next().is_none();
+
         // Initialize compute and logging state for each object.
         for object_id in dataflow.export_ids() {
             let is_subscribe_or_copy = subscribe_copy_ids.contains(&object_id);
@@ -615,6 +696,9 @@ impl<'a> ActiveComputeState<'a> {
                     *dataflow_index,
                     dataflow.import_ids(),
                 );
+                if starts_immediately {
+                    logging.set_hydration_start();
+                }
                 collection.logging = Some(logging);
             }
 
@@ -656,6 +740,12 @@ impl<'a> ActiveComputeState<'a> {
         // scheduled.
         let suspension_token = self.compute_state.suspended_collections.remove(&id);
         drop(suspension_token);
+
+        if let Some(collection) = self.compute_state.collections.get(&id) {
+            if let Some(logging) = &collection.logging {
+                logging.set_hydration_start();
+            }
+        }
     }
 
     fn handle_allow_compaction(&mut self, id: GlobalId, frontier: Antichain<Timestamp>) {
@@ -800,6 +890,11 @@ impl<'a> ActiveComputeState<'a> {
 
             let logging =
                 CollectionLogging::new(id, logger.clone(), *dataflow_index, std::iter::empty());
+            // Log collections are never suspended and the controller marks them scheduled
+            // implicitly, so no `Schedule` command ever arrives for them. Record their hydration
+            // start here, or they would sit permanently in the illegal state of being hydrated
+            // without having started.
+            logging.set_hydration_start();
             collection.logging = Some(logging);
 
             let existing = self.compute_state.collections.insert(id, collection);
@@ -971,7 +1066,9 @@ impl<'a> ActiveComputeState<'a> {
                         .compute_state
                         .metrics
                         .index_peek_row_iteration_seconds,
+                    row_iteration_rows: &self.compute_state.metrics.index_peek_row_iteration_rows,
                     result_sort_seconds: &self.compute_state.metrics.index_peek_result_sort_seconds,
+                    result_sort_rows: &self.compute_state.metrics.index_peek_result_sort_rows,
                     row_collection_seconds: &self
                         .compute_state
                         .metrics
@@ -1496,7 +1593,9 @@ pub(crate) struct IndexPeekMetrics<'a> {
     pub error_scan_seconds: &'a prometheus::Histogram,
     pub cursor_setup_seconds: &'a prometheus::Histogram,
     pub row_iteration_seconds: &'a prometheus::Histogram,
+    pub row_iteration_rows: &'a prometheus::Histogram,
     pub result_sort_seconds: &'a prometheus::Histogram,
+    pub result_sort_rows: &'a prometheus::Histogram,
     pub row_collection_seconds: &'a prometheus::Histogram,
 }
 
@@ -1622,7 +1721,8 @@ impl IndexPeek {
         metrics: &IndexPeekMetrics<'_>,
     ) -> PeekStatus
     where
-        for<'a> Tr: TraceReader<
+        Tr: TraceReader<Batch: Navigable>,
+        for<'a> BatchCursor<Tr>: Cursor<
                 Key<'a>: ExtendDatums + Eq,
                 KeyContainer: BatchContainer<Owned = Row>,
                 Val<'a>: ExtendDatums,
@@ -1666,6 +1766,7 @@ impl IndexPeek {
         // Row iteration timing
         let row_iteration_start = Instant::now();
         let mut sort_time_accum = Duration::ZERO;
+        let mut rows_sorted = 0usize;
 
         while let Some(row) = peek_iterator.next() {
             let row: (Row, _) = match row {
@@ -1696,15 +1797,33 @@ impl IndexPeek {
                 // We use a threshold twice what we intend, to amortize the work
                 // across all of the insertions. We could tighten this, but it
                 // works for the moment.
-                if results.len() >= 2 * max_results {
+                //
+                // `max_results` is `limit + offset`, so a `LIMIT` near
+                // `i64::MAX` makes the doubling overflow. We then hold fewer
+                // rows than the threshold no matter what, and never thin. That
+                // is the right answer: such a peek cannot accumulate that many
+                // rows anyway, the result size limit stops it long before.
+                // Wrapping instead would make the threshold tiny, and we would
+                // thin while holding almost nothing, dropping rows past the end
+                // of the buffer.
+                if max_results
+                    .checked_mul(2)
+                    .is_some_and(|threshold| results.len() >= threshold)
+                {
                     if peek.finishing.order_by.is_empty() {
                         results.truncate(max_results);
                         metrics
                             .row_iteration_seconds
                             .observe(row_iteration_start.elapsed().as_secs_f64());
                         metrics
+                            .row_iteration_rows
+                            .observe(f64::cast_lossy(peek_iterator.rows_processed()));
+                        metrics
                             .result_sort_seconds
                             .observe(sort_time_accum.as_secs_f64());
+                        metrics
+                            .result_sort_rows
+                            .observe(f64::cast_lossy(rows_sorted));
                         let row_collection_start = Instant::now();
                         let collection = RowCollection::new(results, &peek.finishing.order_by);
                         metrics
@@ -1721,6 +1840,7 @@ impl IndexPeek {
                         // inner test (as we prefer not to maintain `Vec<Datum>`
                         // in the other case).
                         let sort_start = Instant::now();
+                        rows_sorted = rows_sorted.saturating_add(results.len());
                         results.sort_by(|left, right| {
                             comparator.compare_rows(&left.0, &right.0, || left.0.cmp(&right.0))
                         });
@@ -1744,8 +1864,14 @@ impl IndexPeek {
             .row_iteration_seconds
             .observe(row_iteration_start.elapsed().as_secs_f64());
         metrics
+            .row_iteration_rows
+            .observe(f64::cast_lossy(peek_iterator.rows_processed()));
+        metrics
             .result_sort_seconds
             .observe(sort_time_accum.as_secs_f64());
+        metrics
+            .result_sort_rows
+            .observe(f64::cast_lossy(rows_sorted));
 
         let row_collection_start = Instant::now();
         let collection = RowCollection::new(results, &peek.finishing.order_by);

@@ -21,6 +21,7 @@ use mz_compute_client::controller::error::InstanceMissing;
 use mz_compute_types::ComputeInstanceId;
 use mz_controller_types::ClusterId;
 use mz_expr::EvalError;
+use mz_ore::cast::CastFrom;
 use mz_ore::error::ErrorExt;
 use mz_ore::stack::RecursionLimitError;
 use mz_ore::str::StrExt;
@@ -110,6 +111,12 @@ pub enum AdapterError {
         /// Human-readable type of the object (e.g. "source", "source-export table").
         object_type: String,
     },
+    /// A read-then-write statement's read set has more transitive dependencies
+    /// than validation is willing to walk.
+    ReadThenWriteDependencyLimitExceeded {
+        /// The configured maximum number of dependencies.
+        max_rw_dependencies: usize,
+    },
     /// Expression violated a column's constraint
     ConstraintViolation(NotNullViolation),
     /// An error occurred while decoding COPY data.
@@ -123,9 +130,27 @@ pub enum AdapterError {
     },
     /// A dependency's definition changed while a statement was being sequenced.
     /// Raised by `PlanValidity::check` when a dependency's `create_sql` hash no
-    /// longer matches what we captured at plan time.
+    /// longer matches what we captured at plan time, and by
+    /// `Coordinator::stage_group_commit` when a table's `RelationDesc` no longer
+    /// matches the rows a staged write packed against it.
     ConcurrentDependencyMutation {
         dependency_id: String,
+    },
+    /// A frontend read-then-write exhausted its OCC retry budget.
+    ///
+    /// The statement is retryable: every attempt was refused before anything
+    /// was appended, so nothing it intended has been committed.
+    ReadThenWriteContention,
+    /// The write timestamp ran past what the write timeline may be advanced to,
+    /// so nothing was appended. See `coord::timeline::write_ts_upper_bound` for
+    /// the bound and why exceeding it is not recoverable.
+    ///
+    /// The timestamp comes from the timeline's oracle, so reaching this means the
+    /// oracle has run away from the wall clock rather than that the statement
+    /// asked for anything unusual.
+    ReadThenWriteTimestampTooFarAhead {
+        target_timestamp: mz_repr::Timestamp,
+        limit: mz_repr::Timestamp,
     },
     CollectionUnreadable {
         id: String,
@@ -167,6 +192,16 @@ pub enum AdapterError {
     },
     /// Result size of a query is too large.
     ResultSize(String),
+    /// A `SUBSCRIBE` (or `COPY (SUBSCRIBE ...) TO STDOUT`) buffered more bytes in
+    /// environmentd than its budget allows because the client was not reading
+    /// fast enough. The subscribe is retired rather than let one slow client
+    /// grow the shared process's memory without bound.
+    SubscribeFellBehind {
+        /// Bytes buffered when the budget was exceeded.
+        buffered_bytes: usize,
+        /// The `subscribe_max_buffered_bytes` budget that was exceeded.
+        max_buffered_bytes: usize,
+    },
     /// The specified feature is not permitted in safe mode.
     SafeModeViolation(String),
     /// The current transaction had the wrong set of write locks.
@@ -271,6 +306,21 @@ pub enum AdapterError {
     ReadOnly,
     AlterClusterTimeout,
     AlterClusterWhilePendingReplicas,
+    /// Attempt to convert a cluster to unmanaged while a graceful
+    /// reconfiguration is in progress.
+    AlterClusterUnmanagedWhileReconfiguring,
+    /// Attempt to convert a cluster to unmanaged while a hydration burst is in
+    /// flight.
+    AlterClusterUnmanagedWhileBursting,
+    /// Attempt to change a cluster's replication factor while a graceful
+    /// reconfiguration is in progress.
+    AlterClusterReplicationFactorWhileReconfiguring,
+    /// Attempt to change a cluster's schedule while a graceful reconfiguration
+    /// is in progress.
+    AlterClusterScheduleWhileReconfiguring,
+    /// Attempt to use `WAIT` on an `ALTER` of a scheduled (non-`MANUAL`)
+    /// cluster, whose replica set the controller reshapes in the background.
+    AlterClusterWaitOnScheduledCluster,
     AuthenticationError(AuthenticationError),
     /// Schema of a replacement is incompatible with the target.
     ReplacementSchemaMismatch(RelationDescDiff),
@@ -453,6 +503,7 @@ fn eval_error_code(err: &EvalError) -> SqlState {
         EvalError::StringValueTooLong { .. } => SqlState::STRING_DATA_RIGHT_TRUNCATION,
         EvalError::LikePatternTooLong
         | EvalError::LengthTooLarge
+        | EvalError::TempStorageBudgetExceeded
         | EvalError::NullCharacterNotPermitted
         | EvalError::MaxArraySizeExceeded(_)
         | EvalError::LetRecLimitExceeded(_) => SqlState::PROGRAM_LIMIT_EXCEEDED,
@@ -533,6 +584,13 @@ impl AdapterError {
                      the selection may refer to views and materialized views, but transitive \
                      dependencies must not include sources or source-export tables",
                 object_name.quoted()
+            )),
+            AdapterError::ReadThenWriteDependencyLimitExceeded {
+                max_rw_dependencies,
+            } => Some(format!(
+                "The read set transitively depends on more than {max_rw_dependencies} \
+                     objects. Reduce the number of dependencies, or raise the \
+                     read_then_write_max_dependencies system parameter."
             )),
             AdapterError::SafeModeViolation(_) => Some(
                 "The Materialize server you are connected to is running in \
@@ -707,6 +765,36 @@ impl AdapterError {
             ),
             AdapterError::Catalog(c) => c.hint(),
             AdapterError::Eval(e) => e.hint(),
+            AdapterError::SubscribeFellBehind { .. } => Some(
+                "The client is not reading results fast enough. Use a client that reads output \
+                without buffering, or raise the subscribe_max_buffered_bytes system variable."
+                    .to_string(),
+            ),
+            AdapterError::AlterClusterUnmanagedWhileReconfiguring => Some(
+                "Cancel the reconfiguration by altering the cluster back to its current \
+                configuration, or wait for it to settle, then convert."
+                    .to_string(),
+            ),
+            AdapterError::AlterClusterUnmanagedWhileBursting => Some(
+                "Remove the strategy with ALTER CLUSTER ... RESET (AUTO SCALING STRATEGY), \
+                or wait for the burst to wind down, then convert."
+                    .to_string(),
+            ),
+            AdapterError::AlterClusterReplicationFactorWhileReconfiguring => Some(
+                "Cancel the reconfiguration by altering the cluster back to its current \
+                configuration, or wait for it to settle, then change the replication factor."
+                    .to_string(),
+            ),
+            AdapterError::AlterClusterScheduleWhileReconfiguring => Some(
+                "Cancel the reconfiguration by altering the cluster back to its current \
+                configuration, or wait for it to settle, then change the schedule."
+                    .to_string(),
+            ),
+            AdapterError::AlterClusterWaitOnScheduledCluster => Some(
+                "The scheduler reshapes a scheduled cluster's replicas in the background. \
+                Run the ALTER without a WAIT option, or set SCHEDULE = MANUAL first."
+                    .to_string(),
+            ),
             AdapterError::InvalidClusterReplicaAz { expected, az: _ } => {
                 Some(if expected.is_empty() {
                     "No availability zones configured; do not specify AVAILABILITY ZONE".into()
@@ -771,6 +859,15 @@ impl AdapterError {
                 "Another session modified one of this statement's dependencies before \
                  it could commit. Retry the statement.".into()
             ),
+            AdapterError::ReadThenWriteContention => Some(
+                "Concurrent writes to the target table kept this statement from \
+                 committing. Retry the statement, or lower the write concurrency.".into()
+            ),
+            AdapterError::ReadThenWriteTimestampTooFarAhead { .. } => Some(
+                "The write timestamp this statement would have committed at is far ahead of \
+                 the wall clock. Committing there would keep writes and strict-serializable \
+                 reads on this timeline from proceeding until the clock caught up.".into()
+            ),
             AdapterError::CollectionUnreadable { .. } => Some(
                 "This could be because the collection has recently been dropped.".into()
             ),
@@ -824,12 +921,22 @@ impl AdapterError {
             AdapterError::InvalidTableMutationSelection { .. } => {
                 SqlState::INVALID_TRANSACTION_STATE
             }
+            AdapterError::ReadThenWriteDependencyLimitExceeded { .. } => {
+                SqlState::PROGRAM_LIMIT_EXCEEDED
+            }
             AdapterError::ConstraintViolation(NotNullViolation(_)) => SqlState::NOT_NULL_VIOLATION,
             AdapterError::CopyFormatError(_) => SqlState::BAD_COPY_FILE_FORMAT,
             AdapterError::ConcurrentClusterDrop => SqlState::INVALID_TRANSACTION_STATE,
             AdapterError::ConcurrentDependencyDrop { .. } => SqlState::UNDEFINED_OBJECT,
             AdapterError::ConcurrentDependencyMutation { .. } => {
                 SqlState::T_R_SERIALIZATION_FAILURE
+            }
+            AdapterError::ReadThenWriteContention => SqlState::T_R_SERIALIZATION_FAILURE,
+            AdapterError::ReadThenWriteTimestampTooFarAhead { .. } => {
+                // An invariant violation in the environment rather than a property of
+                // the statement: the write timeline has run away from the wall clock.
+                // Nothing the client sends can produce or avoid it.
+                SqlState::INTERNAL_ERROR
             }
             AdapterError::CollectionUnreadable { .. } => SqlState::NO_DATA_FOUND,
             AdapterError::NoClusterReplicasAvailable { .. } => SqlState::FEATURE_NOT_SUPPORTED,
@@ -846,6 +953,12 @@ impl AdapterError {
             AdapterError::PlanError(PlanError::ParameterNotAllowed(_)) => {
                 SqlState::UNDEFINED_PARAMETER
             }
+            // `PlanError::Unsupported` is raised (via `bail_unsupported!`) only for
+            // genuinely unsupported features, so it maps to PostgreSQL's
+            // feature-not-supported code rather than internal-error. See SQL-326.
+            AdapterError::PlanError(PlanError::Unsupported { .. }) => {
+                SqlState::FEATURE_NOT_SUPPORTED
+            }
             AdapterError::PlanError(_) => SqlState::INTERNAL_ERROR,
             AdapterError::PreparedStatementExists(_) => SqlState::DUPLICATE_PSTATEMENT,
             AdapterError::ReadOnlyTransaction => SqlState::READ_ONLY_SQL_TRANSACTION,
@@ -861,6 +974,7 @@ impl AdapterError {
             AdapterError::RelationOutsideTimeDomain { .. } => SqlState::INVALID_TRANSACTION_STATE,
             AdapterError::ResourceExhaustion { .. } => SqlState::INSUFFICIENT_RESOURCES,
             AdapterError::ResultSize(_) => SqlState::OUT_OF_MEMORY,
+            AdapterError::SubscribeFellBehind { .. } => SqlState::OUT_OF_MEMORY,
             AdapterError::SafeModeViolation(_) => SqlState::INTERNAL_ERROR,
             AdapterError::SubscribeOnlyTransaction => SqlState::INVALID_TRANSACTION_STATE,
             AdapterError::Optimizer(e) => match e {
@@ -875,6 +989,9 @@ impl AdapterError {
                 }
                 OptimizerError::PlanError(PlanError::ParameterNotAllowed(_)) => {
                     SqlState::UNDEFINED_PARAMETER
+                }
+                OptimizerError::PlanError(PlanError::Unsupported { .. }) => {
+                    SqlState::FEATURE_NOT_SUPPORTED
                 }
                 OptimizerError::PlanError(_) => SqlState::INTERNAL_ERROR,
                 OptimizerError::RecursionLimitError(_) => RECURSION_LIMIT_ERROR_CODE,
@@ -933,6 +1050,13 @@ impl AdapterError {
             AdapterError::ReadOnly => SqlState::READ_ONLY_SQL_TRANSACTION,
             AdapterError::AlterClusterTimeout => SqlState::QUERY_CANCELED,
             AdapterError::AlterClusterWhilePendingReplicas => SqlState::OBJECT_IN_USE,
+            AdapterError::AlterClusterUnmanagedWhileReconfiguring => SqlState::OBJECT_IN_USE,
+            AdapterError::AlterClusterUnmanagedWhileBursting => SqlState::OBJECT_IN_USE,
+            AdapterError::AlterClusterReplicationFactorWhileReconfiguring => {
+                SqlState::OBJECT_IN_USE
+            }
+            AdapterError::AlterClusterScheduleWhileReconfiguring => SqlState::OBJECT_IN_USE,
+            AdapterError::AlterClusterWaitOnScheduledCluster => SqlState::FEATURE_NOT_SUPPORTED,
             AdapterError::ReplacementSchemaMismatch(_) => SqlState::FEATURE_NOT_SUPPORTED,
             AdapterError::AuthenticationError(AuthenticationError::InvalidCredentials) => {
                 SqlState::INVALID_PASSWORD
@@ -1157,6 +1281,14 @@ impl fmt::Display for AdapterError {
                     "invalid selection: operation may only (transitively) refer to non-source, non-system tables"
                 )
             }
+            AdapterError::ReadThenWriteDependencyLimitExceeded {
+                max_rw_dependencies,
+            } => {
+                write!(
+                    f,
+                    "selection has too many transitive dependencies to validate (limit {max_rw_dependencies})"
+                )
+            }
             AdapterError::ReplaceMaterializedViewSealed { name } => {
                 write!(
                     f,
@@ -1180,6 +1312,22 @@ impl fmt::Display for AdapterError {
                 write!(
                     f,
                     "catalog item '{dependency_id}' was concurrently modified"
+                )
+            }
+            AdapterError::ReadThenWriteContention => {
+                write!(
+                    f,
+                    "read-then-write exceeded maximum retry attempts under contention"
+                )
+            }
+            AdapterError::ReadThenWriteTimestampTooFarAhead {
+                target_timestamp,
+                limit,
+            } => {
+                write!(
+                    f,
+                    "read-then-write would have to commit at {target_timestamp}, past the \
+                     highest timestamp the write timeline may be advanced to ({limit})"
                 )
             }
             AdapterError::CollectionUnreadable { id } => {
@@ -1246,6 +1394,20 @@ impl fmt::Display for AdapterError {
                 )
             }
             AdapterError::ResultSize(e) => write!(f, "{e}"),
+            AdapterError::SubscribeFellBehind {
+                buffered_bytes,
+                max_buffered_bytes,
+            } => {
+                use bytesize::ByteSize;
+                let buffered = u64::cast_from(*buffered_bytes);
+                let max = u64::cast_from(*max_buffered_bytes);
+                write!(
+                    f,
+                    "SUBSCRIBE fell behind: the client did not read results fast enough, so its backlog reached {}, exceeding the {} budget",
+                    ByteSize::b(buffered),
+                    ByteSize::b(max),
+                )
+            }
             AdapterError::SafeModeViolation(feature) => {
                 write!(f, "cannot create {} in safe mode", feature)
             }
@@ -1369,6 +1531,36 @@ impl fmt::Display for AdapterError {
             }
             AdapterError::AlterClusterWhilePendingReplicas => {
                 write!(f, "cannot alter clusters with pending updates")
+            }
+            AdapterError::AlterClusterUnmanagedWhileReconfiguring => {
+                write!(
+                    f,
+                    "cannot convert cluster to unmanaged while a reconfiguration is in progress"
+                )
+            }
+            AdapterError::AlterClusterUnmanagedWhileBursting => {
+                write!(
+                    f,
+                    "cannot convert cluster to unmanaged while a hydration burst is in progress"
+                )
+            }
+            AdapterError::AlterClusterReplicationFactorWhileReconfiguring => {
+                write!(
+                    f,
+                    "cannot change replication factor while a reconfiguration is in progress"
+                )
+            }
+            AdapterError::AlterClusterScheduleWhileReconfiguring => {
+                write!(
+                    f,
+                    "cannot change the cluster schedule while a reconfiguration is in progress"
+                )
+            }
+            AdapterError::AlterClusterWaitOnScheduledCluster => {
+                write!(
+                    f,
+                    "WAIT is not supported when the cluster SCHEDULE is not MANUAL"
+                )
             }
             AdapterError::ReplacementSchemaMismatch(_) => {
                 write!(f, "replacement schema differs from target schema")

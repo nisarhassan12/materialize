@@ -2,6 +2,35 @@
 
 ## Unreleased
 
+* Fix the deployment timestamp in the schema comment `deploy_promote` leaves
+  behind. It read the second row of the first column instead of the second
+  column of the only row, so every tag said `Deployment by <user> on ` with
+  nothing after it.
+
+* Fix `deploy_init` when the `CI_TAG` environment variable is set. The
+  deployment schema was tagged without passing the schema name, so the
+  operation failed with `COMMENT ON SCHEMA ""`. The deployment schema is
+  now also created with a quoted name, matching how it is dropped and how its
+  grants and default privileges are copied.
+
+## 1.9.11 - 2026-07-26
+
+* Add support for the [`AUTO SCALING STRATEGY`](https://materialize.com/docs/sql/create-cluster/#autoscaling)
+  cluster option (hydration burst), which lets a managed cluster temporarily
+  burst to a larger size while it has un-hydrated objects. The `create_cluster`
+  operation accepts a new `auto_scaling_strategy` argument, and the new
+  `alter_cluster_auto_scaling_strategy` operation sets or removes the strategy
+  on an existing cluster:
+
+  ```bash
+  dbt run-operation alter_cluster_auto_scaling_strategy --args '{cluster_name: quickstart, auto_scaling_strategy: {on_hydration: {hydration_size: "800cc", linger_duration: "15s"}}}'
+  ```
+
+  During blue/green deployments, `deploy_init` now copies the production
+  cluster's autoscaling strategy to the deployment cluster, so the deployment
+  environment bursts to the configured hydration size while it hydrates ahead
+  of the cutover.
+
 ## 1.9.10 - 2026-05-20
 
 * Support unmanaged clusters in `deploy_init`. The deployment cluster

@@ -4,6 +4,7 @@ description: "Declare how collections are stored."
 aliases:
   - /guides/partition-by/
   - /sql/patterns/partition-by/
+  - /self-managed/v25.2/transform-data/patterns/partition-by/
 menu:
   main:
     parent: 'sql-patterns'
@@ -30,7 +31,7 @@ If you want to return results in a specific order, use an `ORDER BY` clause on y
 
 ## Syntax
 
-The option `PARTITION BY <column list>` declares that a [materialized view](/sql/create-materialized-view/#syntax) or [table](/sql/create-table/#syntax) should be partitioned by the listed columns.
+The option `PARTITION BY <column list>` declares that a [materialized view](/sql/create-materialized-view/#syntax) or [table](/sql/create-table/) should be partitioned by the listed columns.
 For example, a table that stores an append-only collection of events may want to partition the data by time:
 
 ```mzsql

@@ -11,6 +11,14 @@
 use proptest_derive::Arbitrary;
 use serde::{Deserialize, Serialize};
 use serde_repr::{Deserialize_repr, Serialize_repr};
+use uuid::Uuid;
+
+/// A proptest strategy for [`Uuid`]s, which don't implement `Arbitrary`.
+#[cfg(any(test, feature = "proptest"))]
+fn any_uuid() -> impl proptest::strategy::Strategy<Value = Uuid> {
+    use proptest::strategy::Strategy;
+    proptest::arbitrary::any::<u128>().prop_map(Uuid::from_u128)
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[cfg_attr(any(test, feature = "proptest"), derive(Arbitrary))]
@@ -237,6 +245,13 @@ pub struct ItemValue {
     pub oid: u32,
     pub global_id: GlobalId,
     pub extra_versions: Vec<ItemVersion>,
+    /// `Some(uuid)` marks a temporary item owned by, and only visible to, the
+    /// session with that UUID. `None` is a normal durable item.
+    #[cfg_attr(
+        any(test, feature = "proptest"),
+        proptest(strategy = "proptest::option::of(any_uuid())")
+    )]
+    pub ephemeral_owner_session: Option<Uuid>,
 }
 
 #[derive(
@@ -416,6 +431,7 @@ pub enum CommentObject {
     MaterializedView(CatalogItemId),
     Source(CatalogItemId),
     Sink(CatalogItemId),
+    MetricSink(CatalogItemId),
     Index(CatalogItemId),
     Func(CatalogItemId),
     Connection(CatalogItemId),
@@ -923,12 +939,13 @@ pub struct ManagedCluster {
     pub replication_factor: u32,
     pub availability_zones: Vec<String>,
     pub logging: ReplicaLogging,
+    pub arrangement_compression: bool,
     pub optimizer_feature_overrides: Vec<OptimizerFeatureOverride>,
     pub schedule: ClusterSchedule,
     /// User-configured autoscaling policy, distinct from the in-flight runtime
     /// records below.
     pub auto_scaling_strategy: Option<AutoScalingStrategy>,
-    /// In-flight graceful reconfiguration the controller is converging on.
+    /// Latest graceful reconfiguration record, if one has been written.
     pub reconfiguration: Option<ReconfigurationState>,
     /// In-flight hydration burst the controller is running.
     pub burst: Option<BurstState>,
@@ -951,8 +968,8 @@ pub struct OnHydration {
     pub linger_duration: Option<Duration>,
 }
 
-/// An in-flight graceful reconfiguration: the config shape the cluster is
-/// moving to plus the deadline by which it must complete.
+/// Latest graceful reconfiguration record, including the target shape, deadline,
+/// timeout action, and lifecycle status.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[cfg_attr(any(test, feature = "proptest"), derive(Arbitrary))]
 pub struct ReconfigurationState {
@@ -961,10 +978,40 @@ pub struct ReconfigurationState {
     pub deadline: u64,
     /// What to do if the deadline passes before the target hydrates.
     pub on_timeout: OnTimeoutAction,
+    pub status: ReconfigurationStatus,
+}
+
+/// The lifecycle status of the latest graceful reconfiguration.
+///
+/// NOTE: the serde serialization of these variant names is what the
+/// `mz_internal.mz_cluster_reconfigurations` builtin view matches on. When
+/// adding a variant, extend that view's `status` CASE mapping, or the new
+/// variant surfaces verbatim (`SomeNewStatus`) instead of snake_case.
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Serialize,
+    Deserialize
+)]
+#[cfg_attr(any(test, feature = "proptest"), derive(Arbitrary))]
+pub enum ReconfigurationStatus {
+    InProgress,
+    Finalized,
+    TimedOut,
+    Cancelled,
+    ResourceExhausted,
 }
 
 /// The action a graceful reconfiguration applies if its deadline passes before
 /// the target replicas hydrate. Mirrors `mz_sql::plan::OnTimeoutAction`.
+///
+/// NOTE: like `ReconfigurationStatus`, the serde variant names feed the
+/// `on_timeout` CASE mapping in `mz_internal.mz_cluster_reconfigurations`.
 #[derive(
     Clone,
     Copy,
@@ -978,10 +1025,9 @@ pub struct ReconfigurationState {
 )]
 #[cfg_attr(any(test, feature = "proptest"), derive(Arbitrary))]
 pub enum OnTimeoutAction {
-    /// Cut over to the (not-yet-hydrated) target anyway and clear the record.
+    /// Cut over to the (not-yet-hydrated) target anyway.
     Commit,
-    /// Drop the target replica set, reverting to the pre-reconfiguration shape,
-    /// and retain the record as a tombstone.
+    /// Drop the target replica set, reverting to the pre-reconfiguration shape.
     Rollback,
 }
 
@@ -994,6 +1040,7 @@ pub struct ReconfigurationTarget {
     pub replication_factor: u32,
     pub availability_zones: Vec<String>,
     pub logging: ReplicaLogging,
+    pub arrangement_compression: bool,
 }
 
 /// An active hydration burst.
@@ -1012,6 +1059,7 @@ pub struct BurstState {
 pub struct ReplicaConfig {
     pub logging: ReplicaLogging,
     pub location: ReplicaLocation,
+    pub arrangement_compression: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -1349,6 +1397,10 @@ pub mod audit_log_event_v1 {
         pub cluster_id: String,
         pub cluster_name: String,
         pub transition: ReconfigurationLifecycleV1,
+        /// On a `finalized` transition: whether the cut-over was forced by `ON
+        /// TIMEOUT COMMIT` at the deadline rather than reached by hydration.
+        #[serde(default)]
+        pub forced: Option<bool>,
         pub target_size: String,
         pub target_replication_factor: u32,
         pub target_availability_zones: Vec<String>,
@@ -1379,6 +1431,7 @@ pub mod audit_log_event_v1 {
             Finalized(Empty),
             TimedOut(Empty),
             Cancelled(Empty),
+            ResourceExhausted(Empty),
         }
     }
 
@@ -1388,6 +1441,9 @@ pub mod audit_log_event_v1 {
         pub cluster_id: String,
         pub cluster_name: String,
         pub transition: HydrationBurstLifecycleV1,
+        /// On a `finished` transition: why the burst tore down.
+        #[serde(default)]
+        pub finish_cause: Option<BurstFinishCauseV1>,
         pub burst_size: String,
     }
 
@@ -1405,6 +1461,23 @@ pub mod audit_log_event_v1 {
         pub enum Transition {
             Started(Empty),
             Finished(Empty),
+        }
+    }
+
+    #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+    #[cfg_attr(any(test, feature = "proptest"), derive(Arbitrary))]
+    pub struct BurstFinishCauseV1 {
+        pub cause: burst_finish_cause_v1::Cause,
+    }
+
+    pub mod burst_finish_cause_v1 {
+        use super::*;
+
+        #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+        #[cfg_attr(any(test, feature = "proptest"), derive(Arbitrary))]
+        pub enum Cause {
+            LingerElapsed(Empty),
+            NoLongerWarranted(Empty),
         }
     }
 
@@ -1864,6 +1937,7 @@ pub mod audit_log_event_v1 {
         System = 16,
         ContinualTask = 17,
         NetworkPolicy = 18,
+        MetricSink = 19,
     }
 
     #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -2177,6 +2251,7 @@ pub enum CatalogItemType {
     Func = 8,
     Secret = 9,
     Connection = 10,
+    MetricSink = 11,
 }
 
 #[derive(
@@ -2211,4 +2286,5 @@ pub enum ObjectType {
     Schema = 14,
     Func = 15,
     NetworkPolicy = 17,
+    MetricSink = 18,
 }

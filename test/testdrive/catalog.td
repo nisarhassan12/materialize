@@ -147,11 +147,11 @@ materialize ""
 
 # ...and also in `\l`
 $ psql-execute command="\l"
-\                                                   List of databases
-    Name     |    Owner    | Encoding | Locale Provider | Collate | Ctype | ICU Locale | ICU Rules | Access privileges
--------------+-------------+----------+-----------------+---------+-------+------------+-----------+-------------------
- d           | materialize | UTF8     | libc            | C       | C     |            |           |
- materialize | mz_system   | UTF8     | libc            | C       | C     |            |           |
+\                                                 List of databases
+    Name     |    Owner    | Encoding | Locale Provider | Collate | Ctype | Locale | ICU Rules | Access privileges
+-------------+-------------+----------+-----------------+---------+-------+--------+-----------+-------------------
+ d           | materialize | UTF8     | libc            | C       | C     |        |           |
+ materialize | mz_system   | UTF8     | libc            | C       | C     |        |           |
 
 
 
@@ -289,7 +289,7 @@ public.bool
 > DROP DATABASE foo
 
 ! DROP OBJECT v1
-contains:Expected one of TABLE or VIEW or MATERIALIZED or SOURCE or SINK or INDEX or TYPE or ROLE or USER or CLUSTER or SECRET or CONNECTION or DATABASE or SCHEMA or FUNCTION or NETWORK, found identifier
+contains:Expected one of TABLE or VIEW or MATERIALIZED or SOURCE or SINK or METRIC or INDEX or TYPE or ROLE or USER or CLUSTER or SECRET or CONNECTION or DATABASE or SCHEMA or FUNCTION or NETWORK, found identifier
 
 > SHOW OBJECTS
 name        type        comment
@@ -511,28 +511,18 @@ mz_cluster_replica_frontiers                 source  <null>   ""
 name                           comment
 --------------------------------------
 mz_array_types                 ""
-mz_audit_events                ""
-mz_aws_privatelink_connections ""
 mz_base_types                  ""
 mz_cluster_replica_sizes       ""
 mz_columns                     ""
 mz_egress_ips                  ""
 mz_functions                   ""
-mz_iceberg_sinks               ""
 mz_index_columns               ""
-mz_kafka_connections           ""
-mz_kafka_sinks                 ""
-mz_kafka_sources               ""
 mz_list_types                  ""
 mz_map_types                   ""
 mz_operators                   ""
 mz_pseudo_types                ""
 mz_role_auth                   ""
-mz_sinks                       ""
-mz_ssh_tunnel_connections      ""
-mz_tables                      ""
 mz_types                       ""
-mz_views                       ""
 
 > SHOW VIEWS FROM mz_catalog
 name                       comment
@@ -547,20 +537,30 @@ mz_timezone_names          ""
 > SHOW MATERIALIZED VIEWS FROM mz_catalog
 name                  cluster             comment
 --------------------------------------------------
+mz_audit_events       mz_catalog_server   ""
+mz_aws_privatelink_connections mz_catalog_server ""
 mz_clusters           mz_catalog_server   ""
 mz_cluster_replicas   mz_catalog_server   ""
 mz_connections        mz_catalog_server   ""
 mz_databases          mz_catalog_server   ""
 mz_default_privileges mz_catalog_server   ""
+mz_iceberg_sinks      mz_catalog_server   ""
 mz_indexes            mz_catalog_server   ""
+mz_kafka_connections  mz_catalog_server   ""
+mz_kafka_sinks        mz_catalog_server   ""
+mz_kafka_sources      mz_catalog_server   ""
 mz_role_members       mz_catalog_server   ""
 mz_role_parameters    mz_catalog_server   ""
 mz_roles              mz_catalog_server   ""
 mz_schemas            mz_catalog_server   ""
 mz_secrets            mz_catalog_server   ""
+mz_sinks              mz_catalog_server   ""
 mz_sources            mz_catalog_server   ""
+mz_ssh_tunnel_connections mz_catalog_server ""
 mz_system_privileges  mz_catalog_server   ""
 mz_materialized_views mz_catalog_server   ""
+mz_tables             mz_catalog_server   ""
+mz_views              mz_catalog_server   ""
 
 # Check default sources, tables, and views in mz_catalog_unstable.
 
@@ -603,23 +603,17 @@ mz_wallclock_lag_history                     source  <null>     ""
 name                                     comment
 ------------------------------------------------
 mz_aggregates                            ""
-mz_aws_connections                       ""
 mz_cluster_replica_size_internal         ""
 mz_history_retention_strategies          ""
-mz_kafka_source_tables                   ""
 mz_license_keys                          ""
 mz_materialized_view_refresh_strategies  ""
-mz_mysql_source_tables                   ""
 mz_object_arrangement_size_history       ""
 mz_object_dependencies                   ""
 mz_object_global_ids                     ""
 mz_optimizer_notices                     ""
-mz_postgres_sources                      ""
-mz_postgres_source_tables                ""
 mz_replacements                          ""
 mz_sessions                              ""
 mz_source_references                     ""
-mz_sql_server_source_tables              ""
 mz_storage_usage_by_shard                ""
 mz_subscriptions                         ""
 mz_type_pg_metadata                      ""
@@ -631,6 +625,8 @@ name                                     comment
 mz_activity_log_thinned                  ""
 mz_builtin_materialized_views            ""
 mz_builtin_sources                       ""
+mz_builtin_tables                        ""
+mz_builtin_views                         ""
 mz_cluster_deployment_lineage            ""
 mz_cluster_replica_history               ""
 mz_cluster_replica_metrics               ""
@@ -652,6 +648,7 @@ mz_mcp_data_products                     ""
 mz_notices                               ""
 mz_notices_redacted                      ""
 mz_object_fully_qualified_names          ""
+mz_object_graph_edges                    ""
 mz_object_history                        ""
 mz_object_lifetimes                      ""
 mz_object_oid_alias                      ""
@@ -722,16 +719,24 @@ pg_authid_core                           ""
 > SHOW MATERIALIZED VIEWS FROM mz_internal
 name                   cluster             comment
 ----------------------------------------------------
+mz_aws_connections             mz_catalog_server   ""
+mz_cluster_auto_scaling_strategies    mz_catalog_server   ""
+mz_cluster_reconfigurations    mz_catalog_server   ""
 mz_cluster_schedules           mz_catalog_server   ""
 mz_cluster_system_parameters   mz_catalog_server   ""
 mz_cluster_workload_classes    mz_catalog_server   ""
 mz_comments                    mz_catalog_server   ""
 mz_internal_cluster_replicas   mz_catalog_server   ""
+mz_kafka_source_tables         mz_catalog_server   ""
+mz_mysql_source_tables         mz_catalog_server   ""
 mz_network_policies            mz_catalog_server   ""
 mz_network_policy_rules        mz_catalog_server   ""
 mz_overridden_system_parameters mz_catalog_server   ""
 mz_pending_cluster_replicas    mz_catalog_server   ""
+mz_postgres_source_tables      mz_catalog_server   ""
+mz_postgres_sources            mz_catalog_server   ""
 mz_replica_system_parameters   mz_catalog_server   ""
+mz_sql_server_source_tables    mz_catalog_server   ""
 
 # Check default sources, tables, and views in mz_introspection.
 
@@ -828,11 +833,11 @@ test_table ""
 
 # `SHOW TABLES` and `mz_tables` should agree.
 > SELECT COUNT(*) FROM mz_tables WHERE id LIKE 's%'
-45
+29
 
 # There is one entry in mz_indexes for each field_number/expression of the index.
 > SELECT COUNT(id) FROM mz_indexes WHERE id LIKE 's%'
-270
+273
 
 # Create a second schema with the same table name as above
 > CREATE SCHEMA tester2

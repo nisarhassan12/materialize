@@ -1,4 +1,1 @@
-<svg focusable="false" viewBox="0 0 16 16" xmlns="http://www.w3.org/2000/svg">
-<rect height="1.33333" rx="0.666667" width="16" y="3"/>
-<rect height="1.33333" rx="0.666667" width="16" y="7.33333"/>
-<rect height="1.33333" rx="0.666667" width="16" y="11.6667"/></svg>
+<svg xmlns="http://www.w3.org/2000/svg" focusable="false" viewBox="0 0 16 16"><rect width="16" height="1.333" y="3" rx=".667"/><rect width="16" height="1.333" y="7.333" rx=".667"/><rect width="16" height="1.333" y="11.667" rx=".667"/></svg>
